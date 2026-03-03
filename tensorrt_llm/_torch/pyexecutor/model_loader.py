@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -36,7 +37,12 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
                                            mamba_ssm_cache_dtype: str) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
+                           None)
+        if hf_dtype is not None:
+            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
+        else:
+            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
@@ -212,6 +218,40 @@ class ModelLoader:
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
 
+    @staticmethod
+    def load_config_and_apply_defaults(
+            checkpoint_dir: str, llm_args: TorchLlmArgs,
+            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+        """Load model config and apply model-specific defaults to llm_args."""
+        if checkpoint_loader is None:
+            return llm_args
+
+        config_kwargs = {
+            'trust_remote_code': True,
+            'mm_encoder_only': llm_args.mm_encoder_only,
+        }
+        if llm_args.parallel_config:
+            config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
+
+        if llm_args.speculative_config:
+            config_kwargs['spec_config'] = llm_args.speculative_config
+
+        config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        model_cls = AutoModelForCausalLM._resolve_class(config)
+
+        # model_cls is None when the architecture is unknown/unsupported.
+        if model_cls and hasattr(model_cls, 'get_model_defaults'):
+            model_defaults = model_cls.get_model_defaults(llm_args)
+            if model_defaults:
+                applied_defaults = apply_model_defaults_to_llm_args(
+                    llm_args, model_defaults)
+                if applied_defaults:
+                    logger.info("Applied model defaults for %s: %s",
+                                model_cls.__name__, applied_defaults)
+
+        return llm_args
+
     def load(
         self,
         checkpoint_dir: str,
@@ -256,6 +296,9 @@ class ModelLoader:
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
+            finally:
+                if 'memo' in locals():
+                    del memo
 
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
@@ -278,7 +321,7 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir,
+                        self.spec_config.speculative_model,
                         mapping=self.mapping)
 
                     draft_model_arch = model.draft_config.pretrained_config.architectures[
@@ -338,8 +381,8 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
-        config = checkpoint_loader.load_config(
-            checkpoint_dir,
+        load_config_kwargs = dict(
+            checkpoint_dir=checkpoint_dir,
             trust_remote_code=True,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
@@ -361,7 +404,18 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends)
+            allowed_backends,
+            use_cute_dsl_blockscaling_mm=self.llm_args.
+            use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_bmm=self.llm_args.
+            use_cute_dsl_blockscaling_bmm,
+        )
+
+        # Only pass model_kwargs if it's explicitly set (not None)
+        if self.llm_args.model_kwargs is not None:
+            load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
+
+        config = checkpoint_loader.load_config(**load_config_kwargs)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
@@ -373,9 +427,13 @@ class ModelLoader:
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
         # Allow overriding the number of layers via environment variable
+        # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
                                                  "0"))
         if num_layers_override > 0:
+            logger.warning(
+                f"TLLM_OVERRIDE_LAYER_NUM is deprecated. Use model_kwargs instead: "
+                f"model_kwargs={{'num_hidden_layers': {num_layers_override}}}")
             config.pretrained_config.num_hidden_layers = num_layers_override
             for sub_config in ["text_config", "vision_config"]:
                 if hasattr(config.pretrained_config, sub_config):

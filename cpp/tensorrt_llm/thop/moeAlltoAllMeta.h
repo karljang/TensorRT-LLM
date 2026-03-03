@@ -16,10 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -39,8 +43,9 @@ enum MoeA2AMetaInfoIndex : int64_t
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = 5,
     TOPK_TARGET_RANKS_OFFSET_INDEX = 6,
     TOPK_SEND_INDICES_OFFSET_INDEX = 7,
-    PAYLOAD_DATA_OFFSET_INDEX = 8,
-    NUM_METAINFO_FIELDS = 9
+    EPLB_GATHERED_STATS_OFFSET_INDEX = 8,
+    PAYLOAD_DATA_OFFSET_INDEX = 9,
+    NUM_METAINFO_FIELDS = 10
 };
 
 using MoeA2ADataOffsets = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -56,6 +61,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", COMBINE_COMPLETION_FLAGS_OFFSET_INDEX},
         {"MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX", TOPK_TARGET_RANKS_OFFSET_INDEX},
         {"MOE_A2A_TOPK_SEND_INDICES_OFFSET_INDEX", TOPK_SEND_INDICES_OFFSET_INDEX},
+        {"MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX", EPLB_GATHERED_STATS_OFFSET_INDEX},
         {"MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX", PAYLOAD_DATA_OFFSET_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
     };
@@ -63,3 +69,5 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
 
 } // namespace moe_comm
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

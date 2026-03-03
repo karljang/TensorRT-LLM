@@ -176,7 +176,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+            mm_handles: List of multimodal embedding handles.
 
         Returns:
             Tuple[List[int], List[int], List[int]]:
@@ -192,12 +192,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         if not isinstance(mm_handles, list):
             raise ValueError("mm_handles must be a list")
 
-        if len(mm_handles) != 1:
-            # TODO: only support single multimodal item within a request for now
-            raise NotImplementedError(
-                "Only one mm_handle is supported for LlavaNext for now")
-        hidden_size = mm_handles[0]['tensor_size'][1]
-        assert hidden_size == self.config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        expected_hidden_size = self.config.text_config.hidden_size
+        for i, mm_handle in enumerate(mm_handles):
+            hidden_size = mm_handle['tensor_size'][1]
+            if hidden_size != expected_hidden_size:
+                raise RuntimeError(
+                    f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
+                )
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
 
@@ -527,6 +528,8 @@ class LlavaNextModel(PreTrainedModel):
             return
         if not DISAGG:
             self.mm_encoder = LlavaNextVisionModel(model_config)
+        else:
+            self.mm_encoder = None
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
@@ -545,7 +548,8 @@ class LlavaNextModel(PreTrainedModel):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        self.mm_encoder.load_weights(weights)
+        if self.mm_encoder is not None:
+            self.mm_encoder.load_weights(weights)
 
         def filter_weights(weights: Dict):
             transformed_weights = {}

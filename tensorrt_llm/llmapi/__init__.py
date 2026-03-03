@@ -1,5 +1,5 @@
 from .._torch.async_llm import AsyncLLM
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
@@ -10,27 +10,32 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
-                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, RocketSparseAttentionConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       PARDDecodingConfig, RocketSparseAttentionConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
+                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
+from .visual_gen import VisualGen, VisualGenParams
 
 __all__ = [
     'LLM',
     'AsyncLLM',
+    'VisualGen',
+    'VisualGenParams',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',
     'SamplingParams',
     'DisaggregatedParams',
+    'DisaggScheduleStyle',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
     'CudaGraphConfig',
@@ -38,6 +43,7 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',
+    'Eagle3DecodingConfig',
     'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
@@ -54,6 +60,7 @@ __all__ = [
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
+    'PARDDecodingConfig',
     'UserProvidedDecodingConfig',
     'TorchCompileConfig',
     'DraftTargetDecodingConfig',
@@ -66,4 +73,5 @@ __all__ = [
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
+    'SkipSoftmaxAttentionConfig',
 ]

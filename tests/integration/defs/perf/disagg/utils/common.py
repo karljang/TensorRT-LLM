@@ -1,41 +1,43 @@
 """Disaggregated Benchmark Configuration."""
 
 import os
-from datetime import datetime
 
-SESSION_COLLECT_CMD_TYPE = "session_collect"
-
-# GPU resource configuration
-# Simplified - only fields actually used in the codebase
+# GPU resource configuration - centralized config for all GPU-specific parameters
 GPU_RESOURCE_CONFIG = {
-    # OCI GB200
-    "GB200": {
-        "gres_gpu": 4,  # srun --gres parameter (None = not required)
-        "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
-        "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
+    "GB200": {  # OCI GB200
+        "slurm_extra_args": "--gres=gpu:4",
+        "set_segment": True,
+        "lock_freq_graphics_mhz": 2062,
+        "lock_freq_memory_mhz": 3996,
     },
-    # OCI GB300
-    "GB300": {
-        "gres_gpu": None,  # GB300 does not require gres
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
+    "GB200_LYRIS": {  # Lyris GB200
+        "slurm_extra_args": "",
+        "set_segment": True,
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # H100
+    "GB300": {  # Lyris GB300
+        "slurm_extra_args": "",
+        "set_segment": True,
+        "lock_freq_graphics_mhz": None,
+        "lock_freq_memory_mhz": None,
+    },
     "H100": {
-        "gres_gpu": None,  # H100 does not require gres
-        "lock_freq_graphics_mhz": None,  # TODO: Set H100 lock frequency
+        "slurm_extra_args": "",
+        "set_segment": False,
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # B200
-    "B200": {
-        "gres_gpu": 4,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B200 lock frequency
+    "B200": {  # OCI B200
+        "slurm_extra_args": "--gres=gpu:4",
+        "set_segment": False,
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # B300
-    "B300": {
-        "gres_gpu": 4,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B300 lock frequency
+    "B300": {  # OCI B300
+        "slurm_extra_args": "--gres=gpu:4",
+        "set_segment": False,
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
 }
@@ -58,13 +60,49 @@ class EnvManager:
 
     @staticmethod
     def get_slurm_job_name() -> str:
-        return os.getenv("SLURM_JOB_NAME", "unified-benchmark")
+        """Get SLURM job name: {SLURM_ACCOUNT}-{base}.
+
+        Example: myaccount-unified.benchmark
+        Customize base via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
+        """
+        account = EnvManager.get_slurm_account()
+        base = os.getenv("SLURM_JOB_BASE_NAME", "unified.benchmark")
+
+        # Only use account as prefix if it's set and not a placeholder
+        if account and not account.startswith("<"):
+            return f"{account}-{base}"
+        return base
 
     @staticmethod
     def get_slurm_set_segment() -> bool:
+        """Get whether to use SLURM segment parameter based on GPU type.
+
+        Returns:
+            bool: True if GPU type requires --segment parameter, False otherwise
+        """
         gpu_type = EnvManager.get_gpu_type()
-        gpu_type_support_segment = {"GB200": True, "GB300": False}
-        return gpu_type_support_segment.get(gpu_type, False)
+        gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type, {})
+        return gpu_config.get("set_segment", False)
+
+    @staticmethod
+    def get_slurm_extra_args() -> str:
+        """Get SLURM extra arguments based on GPU configuration.
+
+        Returns extra SLURM arguments from GPU_RESOURCE_CONFIG.
+        This allows flexible configuration of GPU-specific SLURM parameters
+        like --gres, --constraint, etc.
+
+        Returns:
+            str: Extra SLURM arguments (e.g., "--gres=gpu:4" or "")
+
+        Examples:
+            GB200: "--gres=gpu:4"
+            GB300: ""
+            Custom: "--gres=gpu:4 --constraint=v100"
+        """
+        gpu_type = EnvManager.get_gpu_type()
+        gpu_config = GPU_RESOURCE_CONFIG.get(gpu_type, {})
+        return gpu_config.get("slurm_extra_args", "")
 
     @staticmethod
     def get_container_image() -> str:
@@ -93,6 +131,10 @@ class EnvManager:
     @staticmethod
     def get_dataset_dir() -> str:
         return os.getenv("DATASET_DIR", "<Your dataset directory>")
+
+    @staticmethod
+    def get_hf_home_dir() -> str:
+        return os.getenv("HF_HOME_DIR", "<Your HF home directory>")
 
     @staticmethod
     def get_output_path() -> str:
@@ -147,6 +189,94 @@ class EnvManager:
     def get_debug_job_id() -> str:
         return os.getenv("DEBUG_JOB_ID", "908390")
 
+    # ========== CI/CD Environment Variables ==========
+    @staticmethod
+    def get_trtllm_branch() -> str:
+        return os.getenv("TRT_LLM_BRANCH", "default")
+
+    @staticmethod
+    def get_trtllm_repo() -> str:
+        return os.getenv("TRT_LLM_REPO", "NVIDIA/TensorRT-LLM")
+
+    @staticmethod
+    def get_trtllm_version() -> str:
+        return os.getenv("TRT_LLM_VERSION", "default")
+
+    @staticmethod
+    def get_commit_hash() -> str:
+        return os.getenv("COMMIT_HASH", "default")
+
+    @staticmethod
+    def get_commit_time() -> str:
+        return os.getenv("COMMIT_TIME", "default")
+
+    @staticmethod
+    def get_docker_image() -> str:
+        return os.getenv("DOCKER_IMAGE", "default")
+
+    @staticmethod
+    def get_wheel_url() -> str:
+        return os.getenv("WHEEL_URL", "")
+
+    @staticmethod
+    def get_cluster_llm_data() -> str:
+        return os.getenv("CLUSTER_LLM_DATA", "")
+
+    @staticmethod
+    def get_artifacts_user() -> str:
+        return os.getenv("ARTIFACTORY_USER", "")
+
+    @staticmethod
+    def get_artifacts_token() -> str:
+        return os.getenv("ARTIFACTORY_TOKEN", "")
+
+    @staticmethod
+    def get_pipeline_id() -> str:
+        return os.getenv("PIPELINE_ID", "")
+
+    @staticmethod
+    def get_artifactory_repo_name() -> str:
+        return os.getenv("ARTIFACTORY_REPO_NAME", "sw-tensorrt-llm-qa-generic-local")
+
+
+class InfoPrinter:
+    """Print environment information for CI/CD and debugging."""
+
+    @staticmethod
+    def print(test_config=None):
+        """Print environment information and optional reproduce command.
+
+        Args:
+            test_config: TestConfig object containing test configuration information
+        """
+        from utils.logger import logger
+
+        logger.info(f"TRT_LLM_REPO:      {EnvManager.get_trtllm_repo()}")
+        logger.info(f"TRT_LLM_BRANCH:    {EnvManager.get_trtllm_branch()}")
+        logger.info(f"TRT_LLM_VERSION:   {EnvManager.get_trtllm_version()}")
+        logger.info(f"COMMIT_HASH:       {EnvManager.get_commit_hash()}")
+        logger.info(f"COMMIT_TIME:       {EnvManager.get_commit_time()}")
+        logger.info(f"DOCKER_IMAGE:      {EnvManager.get_docker_image()}")
+        logger.info(f"INSTALL_MODE:      {EnvManager.get_install_mode()}")
+        logger.info(f"WHEEL_URL:         {EnvManager.get_wheel_url()}")
+        logger.info(f"GPU_TYPE:          {EnvManager.get_gpu_type()}")
+        logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
+        logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
+        logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
+        logger.info(f"PIPELINE_ID:       {EnvManager.get_pipeline_id()}")
+
+        if test_config:
+            config_path = test_config.config_path
+            relative_config_path = config_path[
+                config_path.find("tests/integration/defs/perf/disagg/test_configs/") :
+            ]
+            reproduce_cmd = (
+                f"Reproduce Steps: cd [TensorRT-LLM] && "
+                f"python3 examples/disaggregated/slurm/benchmark/submit.py "
+                f"-c {relative_config_path} --log-dir [YOUR_OUTPUT_DIR]"
+            )
+            logger.info(reproduce_cmd)
+
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
 
@@ -165,6 +295,9 @@ def extract_config_fields(config_data: dict) -> dict:
     gen_batch_size = config_data["worker_config"]["gen"]["max_batch_size"]
     gen_enable_dp = config_data["worker_config"]["gen"]["enable_attention_dp"]
     streaming = config_data["benchmark"]["streaming"]
+    concurrency_list = [
+        int(x.strip()) for x in config_data["benchmark"]["concurrency_list"].split() if x.strip()
+    ]
     cache_transceiver_backend = config_data["worker_config"]["gen"]["cache_transceiver_config"][
         "backend"
     ]
@@ -185,15 +318,6 @@ def extract_config_fields(config_data: dict) -> dict:
     if "speculative_config" in gen_config:
         mtp_size = gen_config["speculative_config"].get("num_nextn_predict_layers", 0)
 
-    # Generate derived fields
-    dep_flag = "dep" if gen_enable_dp else "tep"
-    date_prefix = datetime.now().strftime("%Y%m%d")
-    log_base = f"{date_prefix}/{isl}-{osl}"
-    context_dir = (
-        f"ctx{ctx_num}_gen{gen_num}_{dep_flag}{gen_tp_size}_"
-        f"batch{gen_batch_size}_eplb{eplb_slots}_mtp{mtp_size}"
-    )
-
     return {
         "isl": isl,
         "osl": osl,
@@ -204,13 +328,11 @@ def extract_config_fields(config_data: dict) -> dict:
         "gen_enable_dp": gen_enable_dp,
         "eplb_slots": eplb_slots,
         "mtp_size": mtp_size,
-        "dep_flag": dep_flag,
         "cache_transceiver_backend": cache_transceiver_backend,
-        "log_base": log_base,
-        "context_dir": context_dir,
         "gen_max_tokens": gen_max_tokens,
         "gen_max_batch_size": gen_max_batch_size,
         "streaming": streaming,
+        "concurrency_list": concurrency_list,
         "ctx_max_seq_len": ctx_max_seq_len,
         "gen_max_seq_len": gen_max_seq_len,
     }

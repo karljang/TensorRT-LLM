@@ -14,11 +14,17 @@
 # limitations under the License.
 # # Force resource release after test
 import os
+import signal
 import sys
 import traceback
 import warnings
 from functools import partial
-from typing import Any
+from typing import Any, Generator
+
+try:
+    import ray
+except ModuleNotFoundError:
+    from tensorrt_llm import ray_stub as ray
 
 import _pytest.outcomes
 import pytest
@@ -28,13 +34,22 @@ from mpi4py.futures import MPIPoolExecutor
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.util import get_current_process_gpu_memory
 
+from tensorrt_llm._utils import print_all_stacks
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+
+
+def dump_threads(signum, frame):
+    print_all_stacks()
 
 
 def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+
+    # Dump all threads' stacks when SIGALRM is received
+    signal.signal(signal.SIGALRM, dump_threads)
 
 
 @pytest.hookimpl(wrapper=True)
@@ -344,3 +359,26 @@ def process_gpu_memory_info_available():
         return False
 
     return True
+
+
+@pytest.fixture(scope="function")
+def setup_ray_cluster() -> Generator[int, None, None]:
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
+    ray_init_args = {
+        "include_dashboard": False,
+        "namespace": "test",
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
+    }
+    try:
+        ray.init(address="local", **ray_init_args)
+        gcs_addr = ray.get_runtime_context().gcs_address
+        port = int(gcs_addr.split(":")[1])
+        yield port
+    finally:
+        if ray.is_initialized():
+            ray.shutdown()

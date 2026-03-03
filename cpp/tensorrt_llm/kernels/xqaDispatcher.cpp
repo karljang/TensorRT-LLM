@@ -15,6 +15,7 @@
  */
 
 #include "xqaDispatcher.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -38,7 +39,9 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace
@@ -82,6 +85,8 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.spec_decoding_position_offsets
         = params.cross_attention ? nullptr : params.spec_decoding_position_offsets;
     preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
+    preprocessingParms.helix_position_offsets = params.helix_position_offsets;
+    preprocessingParms.helix_is_inactive_rank = params.helix_is_inactive_rank;
     // Scalar parameters.
     preprocessingParms.batch_size = int(batch_beam_size);
     preprocessingParms.max_input_seq_len = params.generation_input_length;
@@ -275,7 +280,7 @@ bool XqaDispatcher::isSupported()
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = mFixedParams.isPagedKv ? QkvLayout::PagedKv : QkvLayout::ContiguousKv;
         tllmRunnerParams.mMaskType
-            = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+            = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
@@ -457,10 +462,13 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
         // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
-        tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
-            ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
-            : nullptr;
+        if (mQDataType == DATA_TYPE_E4M3)
+        {
+            tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
+            tllmRunnerParams.scaleSoftmaxLog2Ptr = launchParams.bmm1_scale_ptr
+                ? reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr)
+                : nullptr;
+        }
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
 
         tllmRunnerParams.oPtr = params.output;
@@ -491,13 +499,15 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
         tllmRunnerParams.mIsSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
         tllmRunnerParams.mMaskType
-            = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Dense;
+            = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
+        tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = params.skip_softmax_threshold_scale_factor;
+        tllmRunnerParams.softmaxStatsPtr = params.softmax_stats;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else
@@ -538,4 +548,6 @@ void XqaDispatcher::run(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

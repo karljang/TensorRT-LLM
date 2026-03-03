@@ -49,24 +49,14 @@ def CONFIG_LINUX_AARCH64 = "linux_aarch64"
 @Field
 def CONFIG_LINUX_AARCH64_LLVM = "linux_aarch64_LLVM"
 
-@Field
-def CONFIG_LINUX_X86_64_PYBIND = "linux_x86_64_Pybind"
-
-@Field
-def CONFIG_LINUX_AARCH64_PYBIND = "linux_aarch64_Pybind"
 
 @Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
-  ],
-  (CONFIG_LINUX_X86_64_PYBIND) : [
-    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
-    (TARNAME) : "pybind-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
@@ -80,22 +70,16 @@ def BUILD_CONFIGS = [
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64): [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl",
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
-  ],
-  (CONFIG_LINUX_AARCH64_PYBIND): [
-    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl",
-    (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
 
@@ -407,7 +391,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -454,7 +438,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
     // Get triton tag from docker/dockerfile.multi
-    def tritonShortTag = "r25.10"
+    def tritonShortTag = "r25.12"
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${buildJobs} install"
 
     // Step 3: packaging wheels into tarfile
@@ -472,6 +456,12 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
+
+    // Step 6: packaging attribution files into tarfile when they exist
+    sh "mkdir -p TensorRT-LLM/attribution"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/file_mappings.json TensorRT-LLM/attribution/ || true"
 
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
@@ -492,7 +482,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
     // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -549,8 +539,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
-        "Build TRT-LLM Pybind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_PYBIND : CONFIG_LINUX_X86_64_PYBIND),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {
@@ -585,7 +573,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
-        def key = "Build with build type Debug"
+        def key = "Build With Build Type Debug"
         parallelJobs += [
         (key): {
             script {
@@ -628,7 +616,7 @@ pipeline {
         HF_DATASETS_OFFLINE=1
     }
     stages {
-        stage("BuildJob") {
+        stage("Build Job") {
             steps {
                 launchStages(this, params.targetArch, params.enableFailFast, globalVars)
             }

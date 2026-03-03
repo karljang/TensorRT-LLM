@@ -1,5 +1,6 @@
 """Interface to initialize and load HF models."""
 
+import json
 import os
 import re
 import types
@@ -7,6 +8,7 @@ from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import safetensors.torch
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights, load_checkpoint_in_model
@@ -33,7 +35,6 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import (
@@ -121,7 +122,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
         self.model_kwargs = deep_merge_dicts(
             self._model_defaults,
-            self.model_kwargs,
+            self.model_kwargs or {},
         )
 
         # set sharding config source to huggingface
@@ -140,13 +141,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
-
-    @property
-    def chunk_size(self) -> Optional[int]:
-        """Returns the chunk size for this model."""
-        model_config, _ = self._get_model_config()
-        # chunk_size is an input to a custom op, so it can not be none. We set it to a default value of 128.
-        return getattr(model_config, "chunk_size", 128)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -246,7 +240,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         else:
             model.to(device)
 
-        # if present, initialize sharding config. We need head_dim for colwise sharding.
+        # if present, initialize sharding config.
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
@@ -259,17 +253,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
         """Set the sharding config for the model."""
-        self._sharding_config["head_dim"] = 1
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
-        if hasattr(model_config, "head_dim") and model_config.head_dim is not None:
-            self._sharding_config["head_dim"] = model_config.head_dim
-        elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
-            self._sharding_config["head_dim"] = (
-                model_config.hidden_size // model_config.num_attention_heads
-            )
-        if hasattr(model_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
@@ -277,18 +262,16 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             return self._quant_config_reader.get_config()
         return {}
 
-    def get_cache_config(self):
-        """Return kv cache dtype configuration."""
+    def get_cache_config_updates(self):
+        """Return kv cache dtype updates."""
         if not self._quant_config_reader:
-            return CacheConfig(dtype=None)
+            return {}
 
-        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
-        torch_dtype = torch.float8_e4m3fn if kv_cache_dtype == "float8_e4m3fn" else None
-        assert torch_dtype in (torch.float8_e4m3fn, None), (
-            f"Unsupported dtype: {torch_dtype}. Only torch.float8_e4m3fn is supported."
+        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype", "auto")
+        assert kv_cache_dtype in ("fp8", "auto"), (
+            f"Unsupported dtype: {kv_cache_dtype}. Only fp8 and auto are supported."
         )
-
-        return CacheConfig(dtype=torch_dtype)
+        return {"dtype": kv_cache_dtype}
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -438,7 +421,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return fetched_dir
 
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
@@ -453,19 +438,110 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # Ensure it's the first one.
         model._state_dict_hooks.move_to_end(key=get_handle.id, last=False)
 
-        # reuse the load checkpoint utility from accelerate
         try:
-            with hf_load_state_dict_with_device(device):
-                # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-                # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-                # which collects local model params, syncs weights from checkpoint, and applies them via
-                # model.load_state_dict.
-                # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-                # model-transformed weights,leading to unexpected key mismatches or format issues.
-                load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+            if disable_preload:
+                # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
+                ad_logger.info(
+                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                )
+                with hf_load_state_dict_with_device(device):
+                    load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+            else:
+                # Preload checkpoint files to CPU
+                ad_logger.info("Preloading checkpoint files to CPU")
+                self._load_checkpoint_with_preload(model, ckpt_file, device)
         finally:
             load_handle.remove()
             get_handle.remove()
+
+    def _load_checkpoint_with_preload(
+        self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
+    ):
+        all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+
+        ad_logger.info(f"Loading weights into model (device: {device})...")
+        model.load_state_dict(all_weights, strict=False)
+
+        ad_logger.info("Checkpoint loading completed")
+
+    def _load_full_checkpoint_to_cpu(self, checkpoint: str) -> dict:
+        """Load the full checkpoint to CPU memory.
+
+        Args:
+            checkpoint: Can be:
+                - a path to a file containing a whole model state dict
+                - a path to a `.json` file containing the index to a sharded checkpoint
+                - a path to a folder containing a unique `.index.json` file and the shards
+                - a path to a folder containing a unique pytorch_model.bin or model.safetensors
+        """
+        checkpoint_files = None
+        index_filename = None
+
+        # Fast path: Direct .index.json file (most common case for sharded checkpoints)
+        if os.path.isfile(checkpoint):
+            if checkpoint.endswith(".index.json"):
+                index_filename = checkpoint
+            else:
+                checkpoint_files = [checkpoint]
+        elif os.path.isdir(checkpoint):
+            # Check if the whole state dict is present (priority order matches accelerate)
+            potential_state_bin = [f for f in os.listdir(checkpoint) if f == WEIGHTS_NAME]
+            potential_state_safetensor = [
+                f for f in os.listdir(checkpoint) if f == SAFE_WEIGHTS_NAME
+            ]
+
+            # Case 1: pytorch_model.bin (WEIGHTS_NAME)
+            if len(potential_state_bin) == 1:
+                checkpoint_files = [os.path.join(checkpoint, potential_state_bin[0])]
+            # Case 2: model.safetensors (SAFE_WEIGHTS_NAME)
+            elif len(potential_state_safetensor) == 1:
+                checkpoint_files = [os.path.join(checkpoint, potential_state_safetensor[0])]
+            else:
+                # Case 3: Otherwise check for sharded checkpoints
+                potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
+                if len(potential_index) == 0:
+                    raise ValueError(
+                        f"{checkpoint} is not a folder containing a `.index.json` file or a "
+                        f"{WEIGHTS_NAME} or a {SAFE_WEIGHTS_NAME} file"
+                    )
+                elif len(potential_index) == 1:
+                    index_filename = os.path.join(checkpoint, potential_index[0])
+                else:
+                    raise ValueError(
+                        f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+                    )
+        else:
+            raise ValueError(
+                f"`checkpoint` should be the path to a file containing a whole state dict, or the index of a sharded "
+                f"checkpoint, or a folder containing a sharded checkpoint or the whole state dict, but got "
+                f"{checkpoint}."
+            )
+
+        # Load checkpoint files from index if needed
+        if index_filename is not None:
+            checkpoint_folder = os.path.dirname(index_filename)
+            with open(index_filename, "r") as f:
+                index = json.load(f)
+
+            if "weight_map" in index:
+                index = index["weight_map"]
+            checkpoint_files = list(set(index.values()))
+            checkpoint_files = [os.path.join(checkpoint_folder, f) for f in checkpoint_files]
+
+        # Load all weights
+        all_weights = {}
+        for checkpoint_file in checkpoint_files:
+            ad_logger.info(f"Loading weight file: {checkpoint_file}")
+            if checkpoint_file.endswith(".safetensors"):
+                file_weights = safetensors.torch.load_file(checkpoint_file, device="cpu")
+            elif checkpoint_file.endswith((".bin", ".pth")):
+                file_weights = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+            else:
+                raise ValueError(f"Unsupported checkpoint format: {checkpoint_file}")
+
+            all_weights.update(file_weights)
+
+        return all_weights
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
@@ -649,10 +725,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             text_config = model_config.text_config
             if hasattr(text_config, "base_model_tp_plan"):
                 self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-            if hasattr(text_config, "head_dim"):
-                self._sharding_config["head_dim"] = text_config.head_dim
-            if hasattr(text_config, "num_hidden_layers"):
-                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:

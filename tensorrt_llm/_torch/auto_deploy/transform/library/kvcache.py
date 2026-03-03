@@ -1,7 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
+import inspect
 import operator
-from typing import Dict, List, Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -11,15 +28,14 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionRegistry,
-    CacheConfig,
     Constant,
+    PrepareMetadataCallable,
 )
-from ...distributed.common import all_gather_object, get_world_size
-from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
-from ...utils.node_utils import get_all_input_output_nodes, is_op
+from ...utils.cuda_mem_tracker import get_mem_info
+from ...utils.node_utils import is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -29,57 +45,14 @@ from ..interface import (
 )
 
 
-@TransformRegistry.register("update_in_out_nodes")
-class UpdateInOutNodes(BaseTransform):
-    """Modify the graph module by adding new input nodes.
-
-    The new input nodes correspond to the extra arguments needed for cached and flattened attention.
-
-    Args:
-        egm: The graph module to analyze and modify.
-        cm: Cached sequence interface containing extra argument information.
-    """
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        # loop through nodes to get input, output, and get_attr nodes
-        input_nodes, output_nodes = get_all_input_output_nodes(gm.graph)
-
-        # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
-        # Later on, we can revisit how to support returning hidden states.
-        assert len(output_nodes) == 1, "Expected exactly one output node!"
-        assert len(output_nodes[0].all_input_nodes) == 1, (
-            "Expected to only return final tensor output!"
-        )
-
-        # Activate and add extra argument nodes
-        new_args = cm.info.switch_to_cached_attn_inputs()
-        for name in new_args:
-            input_nodes.append(add_graph_input(gm, name))
-
-        info = TransformInfo(skipped=False, num_matches=1, is_clean=False, has_valid_shapes=False)
-
-        return gm, info
-
-
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
     backend: Optional[str] = Field(default=None, description="The attention backend to use.")
-    cache_config: CacheConfig = Field(
-        default_factory=CacheConfig, description="The custom cache configuration to use."
-    )
 
 
-@TransformRegistry.register("insert_cached_attention")
-class InsertCachedAttention(BaseTransform):
-    """
-    A transform to insert cached attention into the graph module."""
+class _InsertCachedOperator(BaseTransform):
+    """A generic base transform to insert cached operators into the graph module."""
 
     config: InsertCachedAttentionConfig
 
@@ -91,26 +64,70 @@ class InsertCachedAttention(BaseTransform):
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
         return AttentionRegistry.get(self.config.backend)
 
-    def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
+    def _process_metadata_std(self, gm: GraphModule, cm: CachedSequenceInterface) -> List[Node]:
+        """Process the standard metadata nodes."""
+        return [
+            self._add_or_retrieve_input(gm, cm, arg_name)
+            for arg_name in self.attn_descriptor.get_standard_metadata_args()
+        ]
+
+    def _insert_extra_metadata_op(
+        self,
+        gm: GraphModule,
+        prep_meta_op: PrepareMetadataCallable,
+        inputs_for_prep_meta: List[Node],
+        const_args: List[Constant],
+        num_meta_out: int,
+    ) -> List[Node]:
+        # add the computed extra metadata nodes to the graph and add to meta for cached attention op
+        meta_nodes_extra = []
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+        with gm.graph.inserting_before(node_last_input.next):
+            ret_node = gm.graph.call_function(
+                prep_meta_op, args=(*inputs_for_prep_meta, *const_args)
+            )
+            for idx in range(num_meta_out):
+                meta_extra_node = gm.graph.call_function(operator.getitem, args=(ret_node, idx))
+                meta_nodes_extra.append(meta_extra_node)
+
+        return meta_nodes_extra
+
+    def _process_metadata_extra(
+        self, gm: GraphModule, cm: CachedSequenceInterface, any_source_attn_node: Node
     ) -> List[Node]:
         """Process the get_metadata function into an op and return node references."""
-        # retrieve input nodes
-        input_nodes, _ = get_all_input_output_nodes(gm.graph)
-        input_nodes_mapping = {n.target: n for n in input_nodes}
+        # get the metadata op for extra metadata and number of return values
+        prep_meta_op, num_meta_out, const_args = (
+            self.attn_descriptor.get_prepare_extra_metadata_info(any_source_attn_node)
+        )
 
-        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        inputs_from_info = [input_nodes_mapping[k] for k in m_args]
+        # if there is no extra metadata op or no return values, we can return early
+        if prep_meta_op is None or num_meta_out == 0:
+            return []
 
-        # insert metadata computation and extract each argument as a node
-        get_metadata, num_metadata = self.attn_descriptor.get_prepare_metadata_op()
-        with gm.graph.inserting_before(input_nodes[-1].next):
-            ret_node = gm.graph.call_function(get_metadata, args=(*inputs_from_info, *const_args))
-            metadata_nodes = [
-                gm.graph.call_function(operator.getitem, args=(ret_node, idx))
-                for idx in range(num_metadata)
-            ]
-        return metadata_nodes
+        # check what inputs the extra metadata op expects
+        inputs_for_prep_meta = [
+            self._add_or_retrieve_input(gm, cm, arg.name)
+            for arg in prep_meta_op._schema.arguments
+            if arg.name in cm.info.available_args
+        ]
+
+        return self._insert_extra_metadata_op(
+            gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
+        )
+
+    def _process_metadata_host(self, cm: CachedSequenceInterface):
+        """Process the host-side prepare metadata function."""
+        prep_meta_host_op = self.attn_descriptor.get_host_prepare_metadata_function()
+        if prep_meta_host_op is None:
+            return
+
+        # Register the host-side prepare metadata function with SequenceInfo.
+        # Arg availability is validated by require_copy() inside register_host_prepare.
+        sig = inspect.signature(prep_meta_host_op)
+        cm.info.register_host_prepare_for_attention_forward(
+            prep_meta_host_op, list(sig.parameters.keys())
+        )
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
@@ -121,16 +138,22 @@ class InsertCachedAttention(BaseTransform):
         gm: GraphModule,
         attn_node: Node,
         qkv_nodes: List[Node],
-        meta_nodes: List[Node],
+        meta_nodes_std: List[Node],
+        meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        buffer_nodes: List[Node],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
                 self.attn_descriptor.get_cached_attention_op(),
-                args=(*qkv_nodes, *meta_nodes, *cache_nodes, *buffer_nodes, *constants),
+                args=(
+                    *qkv_nodes,
+                    *meta_nodes_std,
+                    *meta_nodes_extra,
+                    *cache_nodes,
+                    *constants,
+                ),
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -145,10 +168,6 @@ class InsertCachedAttention(BaseTransform):
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.attn_descriptor
 
-        # run field-wise or to combine the cache config from the transform and the factory
-        # the transform config takes precedence over the factory config
-        cache_config = self.config.cache_config | factory.get_cache_config()
-
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
 
@@ -161,16 +180,14 @@ class InsertCachedAttention(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Sanity check
-        if cm.info.is_paged:
-            assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
+        # get standard metadata nodes for all source attention nodes
+        meta_nodes_std = self._process_metadata_std(gm, cm)
 
         # insert metadata computation and extract each argument as a node
-        metadata_nodes = self._process_get_metadata(
-            gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
-        )
+        meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
 
-        buffer_in_lookup: Dict[str, Node] = {}
+        # Register host-side prepare_metadata function for attention descriptor.
+        self._process_metadata_host(cm)
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
@@ -180,29 +197,27 @@ class InsertCachedAttention(BaseTransform):
 
             # setup + store cache initializers and caches as input nodes
             cache_in_nodes = []
-            for k, get_cache in attn_descriptor.get_cache_initializers(
-                attn_node, cache_config
+            for k, resource_handler in attn_descriptor.get_cache_initializers(
+                attn_node, cm.kv_cache_config
             ).items():
                 k_indexed = f"{k}_{idx}"
-                cm.add_cache(k_indexed, get_cache)
+                cm.add_resource(k_indexed, resource_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
-
-            # setup + store global buffer initializers and buffers as input nodes
-            # NOTE: we have to check against existing keys to make sure nothing is registered twice...
-            buffer_in_nodes = []
-            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
-                if k not in buffer_in_lookup:
-                    cm.add_cache(k, get_buffer)
-                    buffer_in_lookup[k] = self._process_cache_node(gm, k)
-                buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
-                gm, attn_node, qkv, metadata_nodes, cache_in_nodes, buffer_in_nodes, constants
+                gm,
+                attn_node,
+                qkv,
+                meta_nodes_std,
+                meta_nodes_extra,
+                cache_in_nodes,
+                constants,
             )
+
             num_cached_attn_replacements += 1
 
         info = TransformInfo(
@@ -215,37 +230,32 @@ class InsertCachedAttention(BaseTransform):
         return gm, info
 
 
+@TransformRegistry.register("insert_cached_attention")
+class InsertCachedAttention(_InsertCachedOperator):
+    """A transform to insert cached attention into the graph module."""
+
+    def _apply(self, *args, **kwargs):
+        if self.config.backend == "triton":
+            self._log_warning(
+                "'triton' backend only supports GREEDY sampling (top_k=1). "
+                "Please set top_k=1 in the sampling parameters to ensure cohesive output."
+            )
+        return super()._apply(*args, **kwargs)
+
+
 @TransformRegistry.register("insert_cached_mla_attention")
-class InsertCachedMLAAttention(InsertCachedAttention):
-    """
-    A transform to insert cached MLA attention into the graph module.
-
-    This class is identical to InsertCachedAttention and inherits all its behavior.
-    """
-
-    pass
-
-
-class ResizeKVCacheConfig(TransformConfig):
-    """Configuration for the resize kv cache transform."""
-
-    free_mem_ratio: float = Field(
-        default=0.0, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
-    )
+class InsertCachedMLAAttention(_InsertCachedOperator):
+    """A transform to insert cached MLA attention into the graph module."""
 
 
 @TransformRegistry.register("resize_kv_cache")
 class ResizeKVCache(BaseTransform):
-    """Inflate the kv cache to occupy the available GPU memory.
+    """Resize the KV cache to occupy available GPU memory.
 
-    free_mem_ratio specifies the fraction of available memory to occupy.
+    This implements the two-phase approach:
+    1. Run a forward pass to allocate intermediate memory (activations, workspaces, etc.)
+    2. Call resize_kv_cache_manager() to recreate KVCacheManager with optimal capacity
     """
-
-    config: ResizeKVCacheConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return ResizeKVCacheConfig
 
     def _apply_to_full_model(
         self,
@@ -254,82 +264,29 @@ class ResizeKVCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        free_mem_ratio = self.config.free_mem_ratio
-
-        def _get_mem_info_in_mb():
-            free_mem, total_mem = torch.cuda.mem_get_info()
-            return free_mem // 1024**2, total_mem // 1024**2
-
-        free_mem, total_mem = _get_mem_info_in_mb()
-        self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
-        current_cache_size = cm.current_cache_size_bytes()
-        current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
-        current_kv_cache_size = (
-            current_kv_cache_size() if callable(current_kv_cache_size) else current_cache_size
-        )
-        current_num_pages = cm.info.num_pages
-        self._log_info(
-            f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
-            f"Current num pages: {current_num_pages}"
-        )
-        if current_kv_cache_size != current_cache_size:
-            self._log_info(
-                f"Current KV-only cache size (MB): {current_kv_cache_size // 1024 // 1024}"
-            )
-
-        if free_mem_ratio == 0.0:
-            self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
+        # check if we need a resize or not
+        if not cm.needs_resize():
             return mod, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # TODO: the manual PyTorch workflow respects max_num_tokens if set and does _NOT_ resize
-        # the cache in this case. Should we do the same here?
-
-        # Let's run a forward pass to get the memory usage
+        # Run a forward pass to get the extra memory usage
         cm.info.set_max_num_tokens_sample()
-        free_mem_pre, _ = _get_mem_info_in_mb()
-        self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
+        try:
+            mod(**cm.named_args)
+        except torch.OutOfMemoryError as e:
+            self._log_info(
+                f"OutOfMemoryError in forward pass while trying to resize the kv-cache:\n{e}"
+            )
+            raise e
 
-        mod(**cm.named_args)
+        # NOTE: use fragmented memory without empty cache (peak forward memory + fragmented memory)
+        # as a proxy for the memory reserved for the forward pass. This is a rough estimate and
+        # may not be accurate.
+        *_, mem_reserved_for_forward = get_mem_info(empty_cache=False, unit="B")
 
-        free_mem_post, _ = _get_mem_info_in_mb()
-        self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
-
-        memory_for_forward_pass = free_mem_pre - free_mem_post
-        self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
-
-        # Compute new pages using KV-only bytes to avoid SSM/conv inflating per-page cost
-        # Reserve headroom to avoid OOM from other allocations (workspaces, cudagraph pools, etc.)
-        reserve_mb = max(1024, (total_mem * 5) // 100)  # at least 1 GiB or 5% of total
-        available_mb = max(0, free_mem_post - reserve_mb)
-
-        new_kv_total_bytes = int(
-            available_mb * 1024 * 1024 * free_mem_ratio + current_kv_cache_size
-        )
-        per_page_bytes = max(1, current_kv_cache_size // max(1, current_num_pages))
-        new_num_pages = int(new_kv_total_bytes // per_page_bytes)
-
-        # Need to sync all the GPUs if distributed group is initialized
-        log_msg = f"Using local new_num_pages: {new_num_pages}"
-        if is_distributed_initialized():
-            gathered_num_pages = [None] * get_world_size()
-            all_gather_object(gathered_num_pages, new_num_pages)
-            new_num_pages = min(gathered_num_pages)
-            log_msg = f"After all_gather - new_num_pages: {new_num_pages}"
-
-        self._log_info(log_msg)
-        cm.resize_cache(new_num_pages)
-
-        # Log the final cache size for performance measurement, do not remove this log.
-        final_cache_size_bytes = cm.current_cache_size_bytes()
-        final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
-        self._log_info(
-            f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
-        )
-
-        # Free memory
-        torch.cuda.empty_cache()
+        # Resize - KVCacheManager will compute optimal capacity based on free memory
+        cm.resize_kv_cache_manager(mem_reserved_for_forward)
 
         info = TransformInfo(
             skipped=False,
@@ -343,6 +300,13 @@ class ResizeKVCache(BaseTransform):
 
 @TransformRegistry.register("initialize_cache")
 class InitializeCache(BaseTransform):
+    """Initialize KV caches using KVCacheManager.
+
+    Gets kv_cache_config from shared_config.ad_config and creates the KVCacheManager
+    in estimation mode with conservative capacity. The ResizeKVCache transform will
+    later recreate it with optimal capacity after measuring memory usage.
+    """
+
     def _apply_to_full_model(
         self,
         mod: nn.Module,
@@ -350,8 +314,9 @@ class InitializeCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        num_caches = cm.initialize_caches()
-        self._log_info(f"Initialized {num_caches} caches for cached attention")
+        # Initialize with estimation mode
+        # This allows resize_kv_cache to recreate with correct capacity after measuring memory
+        num_caches = cm.initialize_resources()
 
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True

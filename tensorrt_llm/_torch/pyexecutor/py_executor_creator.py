@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           GuidedDecodingConfig, LoadFormat,
@@ -24,10 +24,11 @@ from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
-from ..distributed import MPIDist, TorchDist
+from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import ExecutorMemoryType, RestoreMode
@@ -35,10 +36,11 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_mla
+from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
+from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 
@@ -221,6 +223,32 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
+    """Create and initialize a PyExecutor instance from the given LLM arguments.
+
+    Loads model configuration, applies model-specific defaults, constructs the
+    resource manager, model engine, scheduler, and decoder, then returns a fully
+    initialized PyExecutor ready for inference.
+
+    Args:
+        llm_args: Configuration arguments for the PyTorch-based LLM executor.
+        checkpoint_dir: Path to the model checkpoint directory. If None, uses
+            the path specified in llm_args.
+        tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
+        profiling_stage_data: Optional dict for collecting per-stage memory
+            profiling data during executor construction.
+
+    Returns:
+        A fully initialized PyExecutor instance.
+    """
+
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    torch.cuda.set_per_process_memory_fraction(1.0)
+    # Apply model-specific defaults early, before destructuring llm_args fields
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -240,6 +268,19 @@ def create_py_executor(
         kv_cache_config.enable_partial_reuse = False
 
     decoding_config = llm_args.decoding_config
+
+    # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
+    # failures with trust_remote_code models.  Reload it from the checkpoint
+    # when guided decoding needs it.
+    if (tokenizer is None and llm_args.guided_decoding_backend is not None
+            and checkpoint_dir is not None):
+        logger.info(
+            "Tokenizer not provided; loading from checkpoint for guided decoding"
+        )
+        from tensorrt_llm.tokenizer import TransformersTokenizer
+        tokenizer = TransformersTokenizer.from_pretrained(
+            checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
 
@@ -281,6 +322,13 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine(
+    ) and not spec_config.allow_advanced_sampling:
+        logger.warning(
+            f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+            "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+        )
+
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
         llm_args.disable_overlap_scheduler = True
@@ -292,10 +340,7 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    if mpi_disabled():
-        dist = TorchDist(mapping=mapping)
-    else:
-        dist = MPIDist(mapping=mapping)
+    dist = Distributed.get(mapping)
 
     vm_pools = {}
     enable_sleep = llm_args.enable_sleep
@@ -307,6 +352,12 @@ def create_py_executor(
     if spec_config is not None:
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
+
+        # WAR for https://nvbugs/5807902
+        # Disable separate draft KV cache in disaggregated mode
+        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
+        if cache_transceiver_config is not None:
+            spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -342,9 +393,19 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            checkpoint_loader=checkpoint_loader,
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+
+    calibrator = get_calibrator()
+    layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
+    calibrator.init(layer_wise_benchmarks_config.calibration_mode,
+                    layer_wise_benchmarks_config.calibration_file_path,
+                    layer_wise_benchmarks_config.calibration_layer_indices,
+                    mapping=mapping,
+                    dist=dist)
+    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
@@ -373,12 +434,12 @@ def create_py_executor(
                     if use_tree_drafter:
                         return TreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, max_batch_size,
+                            spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, model)
+                            spec_config.tokens_per_gen_step - 1, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -387,7 +448,7 @@ def create_py_executor(
                 draft_llm_args.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=spec_config.speculative_model,
                 llm_args=draft_llm_args,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
@@ -417,14 +478,12 @@ def create_py_executor(
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
-    if not llm_args.disable_overlap_scheduler:
-        model_engine_max_seq_len = model_engine.max_seq_len + 1
-        if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_total_draft_tokens
+    if not llm_args.disable_overlap_scheduler and spec_config is not None:
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
@@ -434,6 +493,10 @@ def create_py_executor(
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
@@ -497,11 +560,12 @@ def create_py_executor(
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
                     "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                    "vocab_size_padded": model_engine.model.vocab_size_padded,
+                    "rank": mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[
-                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
+                        "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
@@ -545,9 +609,14 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
-        elif spec_config is not None:
+
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is not None and len(
+                set(max_attention_window)) > 1:
             raise NotImplementedError(
-                "KV connector is not supported with speculative decoding.")
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -590,8 +659,27 @@ def create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+
+    # Create the execution stream for model forward operations
+    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
+    execution_stream = torch.cuda.Stream()
+    logger.info(
+        f"[create_py_executor] Created execution_stream: {execution_stream}")
+
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
+
+        # Disagg for hybrid models is currently only supported with C++ RnnStateManager
+        config = model_engine.model.model_config.pretrained_config
+        if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
+            if is_nemotron_hybrid(config) or is_qwen3_next(config):
+                logger.info("Disaggregated serving with hybrid model detected. "
+                            "Enabling C++ MambaCacheManager automatically.")
+                os.environ['TRTLLM_USE_CPP_MAMBA'] = '1'
+
+        # Get draft config for one-engine speculative decoding if available
+        draft_config = getattr(model_engine.model, 'draft_config', None)
+
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
@@ -608,8 +696,13 @@ def create_py_executor(
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
+            execution_stream=execution_stream,
+            draft_config=draft_config,
+            skip_est=skip_est,
         )
+
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
                 ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
@@ -642,6 +735,8 @@ def create_py_executor(
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
             ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):
+        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -665,7 +760,9 @@ def create_py_executor(
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+            execution_stream=execution_stream,
         )
+
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
@@ -696,7 +793,6 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
-
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
 
@@ -725,6 +821,7 @@ def create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 virtual_memory_pools=vm_pools,
+                execution_stream=execution_stream,
             )
 
     _adjust_torch_mem_fraction()
@@ -732,7 +829,6 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    logger.info(f"{llm_args}")
-
     py_executor.start_worker()
+
     return py_executor

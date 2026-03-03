@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +21,14 @@ import math
 import os
 import socket
 import struct
+import sys
 import tempfile
+import threading
 import trace
+import traceback
 import weakref
 from contextlib import contextmanager
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -206,6 +210,12 @@ def binding_to_str_dtype(binding_dtype) -> str:
     ret = _binding_to_str_dtype.get(binding_dtype)
     assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
     return ret
+
+
+def binding_to_torch_dtype(binding_dtype) -> torch.dtype:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return str_dtype_to_torch(ret)
 
 
 def binding_dtype_size(dtype: DataType):
@@ -430,6 +440,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
+    torch.uint8: "|u1",
 }
 
 
@@ -473,10 +484,20 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
-def get_free_port():
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+def get_free_port() -> int:
+    return get_free_ports(1)[0]
+
+
+def get_free_ports(num=1) -> List[int]:
+    sockets = [
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(num)
+    ]
+    for s in sockets:
+        s.bind(('', 0))
+    ports = [s.getsockname()[1] for s in sockets]
+    for s in sockets:
+        s.close()
+    return ports
 
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
@@ -490,7 +511,17 @@ def set_mpi_comm(new_comm):
     comm = new_comm
 
 
+thread_local_comm = threading.local()
+
+
+def set_thread_local_mpi_comm(new_comm):
+    thread_local_comm.value = new_comm
+
+
 def mpi_comm():
+    if hasattr(thread_local_comm,
+               "value") and thread_local_comm.value is not None:
+        return thread_local_comm.value
     return comm
 
 
@@ -551,7 +582,15 @@ def mpi_world_size():
 
 
 def local_mpi_rank():
-    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    if mpi_disabled():
+        # For Ray/non-MPI: the device was already set during worker init
+        # torch.cuda.current_device() returns the correct local device ID
+        try:
+            return torch.cuda.current_device()
+        except ValueError:
+            return 0
+    return mpi_comm().Get_rank() % torch.cuda.device_count(
+    ) if ENABLE_MULTI_DEVICE else 0
 
 
 def local_mpi_size():
@@ -740,6 +779,13 @@ def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
     return sm_version == 100 or sm_version == 103
+
+
+def print_all_stacks():
+    """Print stack traces for all threads"""
+    for thread_id, frame in sys._current_frames().items():
+        logger.error(f"Thread {thread_id} stack trace:\n" +
+                     "".join(traceback.format_stack(frame)))
 
 
 def is_trace_enabled(env_var: str):
@@ -961,7 +1007,7 @@ class TensorWrapper:
     def __init__(
         self,
         data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
+        dtype: Union[torch.dtype, str, np.dtype, trt.DataType, DataType],
         shape: Sequence[int],
         strides: Optional[Sequence[int]] = None,
     ):
@@ -983,7 +1029,8 @@ class TensorWrapper:
         return getattr(self, "_shape", None)
 
     @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType,
+                                 DataType]):
         if isinstance(dtype, torch.dtype):
             self._dtype = dtype
         elif isinstance(dtype, str):
@@ -992,6 +1039,8 @@ class TensorWrapper:
             self._dtype = np_dtype_to_torch(dtype)
         elif isinstance(dtype, trt.DataType):
             self._dtype = trt_dtype_to_torch(dtype)
+        elif isinstance(dtype, DataType):
+            self._dtype = binding_to_torch_dtype(dtype)
         else:
             raise TypeError(f"Unsupported dtype: {dtype}")
 
@@ -1117,7 +1166,9 @@ class KVCacheEventSerializer:
             "cache_level":
             data.cache_level,
             "priority":
-            data.priority
+            data.priority,
+            "mm_keys":
+            KVCacheEventSerializer._mm_keys_to_json(data)
         }
 
     @staticmethod
@@ -1139,6 +1190,8 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _event_diff_to_json(data):
+        if data is None:
+            return None
         return {
             "type": "event_diff",
             "new_value": data.new_value,
@@ -1152,6 +1205,40 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+    @staticmethod
+    def _mm_key_to_json(data):
+        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
+        # where uuid is optional (None if content-hashed)
+        if len(data) == 3:
+            hash_array, start_offset, uuid = data
+        else:
+            # Backward compatibility: old format (hash_array, start_offset)
+            hash_array, start_offset = data
+            uuid = None
+
+        # Convert array to hex string
+        hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+
+        # Use UUID from C++ if available, otherwise use hash_hex
+        hash_or_uuid = uuid if uuid is not None else hash_hex
+
+        return {
+            "type": "mm_key",
+            "hash": hash_or_uuid,
+            "start_offset": start_offset
+        }
+
+    @staticmethod
+    def _mm_keys_to_json(data):
+        # MmKeys is a list of MmKey
+        if hasattr(data, 'mm_keys') and data.mm_keys:
+            return [
+                KVCacheEventSerializer._mm_key_to_json(mm_key)
+                for mm_key in data.mm_keys
+            ]
+        else:
+            return []
 
 
 def set_prometheus_multiproc_dir() -> object:
@@ -1173,24 +1260,27 @@ def confidential_compute_enabled() -> bool:
     Query NVML for the confidential compute state
     """
 
+    try:
+        import pynvml
+    except ImportError:
+        logger.error("pynvml not available; assuming CC=off")
+        return False
+
     cc_enabled = False
 
     try:
-        # Init
-        import pynvml
         pynvml.nvmlInit()
 
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
-            cc_enabled = (cc_settings.ccFeature
-                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode
+            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
@@ -1210,6 +1300,32 @@ def confidential_compute_enabled() -> bool:
             pass
 
     return cc_enabled
+
+
+@lru_cache(maxsize=None)
+def prefer_pinned() -> bool:
+    """
+    Returns whether pinned memory is beneficial for performance.
+
+    While pinned memory is typically preferred for H2D and D2H transfers, it
+    offers no advantage when Confidential Compute (CC) is enabled. In fact, CC
+    forces most transfers to be synchronous. The exception is pageable H2D
+    copies smaller than 2MB, which remain asynchronous.
+
+    Since input preparation relies heavily on these small H2D copies, usage of
+    pageable (and not pinned) memory across the board is preferred in CC mode
+    to maintain asynchronous execution.
+    """
+    return not confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    """
+    if prefer_pinned():
+        return tensor.pin_memory()
+    return tensor
 
 
 P = ParamSpec("P")

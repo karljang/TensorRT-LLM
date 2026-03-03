@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -48,7 +48,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert self.page_size == next_power_of_2(
             self.page_size), "Page size must be a power of 2"
 
-        capture_graph = torch.cuda.is_current_stream_capturing()
+        capture_graph = self.is_cuda_graph
 
         # Cumulative valid sequence lengths for query and key
         self.q_cu_seqlens_cuda = self.get_empty(
@@ -143,7 +143,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         # Number of KT tokens for each sequence
@@ -594,7 +594,7 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
     def prepare(self) -> None:
@@ -974,6 +974,7 @@ class RocketKVCacheManager(KVCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         num_extra_decoding_steps: int = 0,
+        draft_kv_cache_manager=None,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -984,6 +985,7 @@ class RocketKVCacheManager(KVCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if prepare_resource:
             for req in requests:

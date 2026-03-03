@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Triton implementation of the Fused MOE ops. Inspired by vLLM's triton MOE implementation.
 """
@@ -13,6 +28,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
 
 from ...utils.logger import ad_logger
 
@@ -601,15 +618,13 @@ def triton_fused_moe(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
-    mlp_style: str = "mlp",
-    act_fn: str = "relu2",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Relu2),
 ) -> torch.Tensor:
     """Triton unquantized MoE with 2-layer MLP and ReLU^2 activation."""
 
-    mlp_style = mlp_style.lower()
-    act_fn = act_fn.lower()
-    assert mlp_style == "mlp", "Triton backend only supports mlp style."
-    assert act_fn == "relu2", "Triton backend only supports relu2 activation."
+    assert not is_gated_mlp, "Triton backend only supports non gated MLP style."
+    assert act_fn == ActivationType.Relu2, "Triton backend only supports relu2 activation."
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -655,18 +670,18 @@ def triton_quant_fp8_moe(
     w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
     w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
     w3_weight: torch.Tensor,  # unused for mlp style
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
+    w1_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
+    w2_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
     w3_input_scale: torch.Tensor,  # unused
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
-    if mlp_style != "mlp":
-        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp_style=='mlp' only")
+    if is_gated_mlp:
+        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp only")
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -683,10 +698,11 @@ def triton_quant_fp8_moe(
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
     # Weights are already stacked [E, ...] - just ensure contiguous and extract scales
+    # Input scales are precomputed max values (consistent with trtllm backend)
     w1_q = w1_weight.contiguous()
     w2_q = w2_weight.contiguous()
-    a1_scale = w1_input_scale[0].to(torch.float32).reshape(1).contiguous()
-    a2_scale = w2_input_scale[0].to(torch.float32).reshape(1).contiguous()
+    a1_scale = w1_input_scale.to(torch.float32).reshape(1).contiguous()
+    a2_scale = w2_input_scale.to(torch.float32).reshape(1).contiguous()
     b1_scale = w1_weight_scale.to(torch.float32).contiguous()
     b2_scale = w2_weight_scale.to(torch.float32).contiguous()
 
@@ -747,7 +763,7 @@ def triton_quant_fp8_moe(
 
 
 @triton_quant_fp8_moe.register_fake
-def triton_quant_fp8_moe(
+def triton_quant_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -760,7 +776,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

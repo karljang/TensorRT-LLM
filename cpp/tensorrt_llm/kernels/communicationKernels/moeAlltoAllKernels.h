@@ -15,15 +15,18 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::moe_comm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::moe_comm
 {
 
 // Configuration constants
-static constexpr int kMaxTopK = 16;    // Maximum top-k experts per token
+static constexpr int kMaxTopK = 22;    // Maximum top-k experts per token
 static constexpr int kMaxPayloads = 4; // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;   // Maximum supported EP size
 
@@ -58,6 +61,10 @@ struct DispatchKernelPointers
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int* topk_target_ranks; // target rank per k, -1 for duplicates
     int* topk_send_indices; // dst index per k, -1 for duplicates
+
+    // Optional: Statistics for EPLB
+    int const* eplb_local_stats;         // [eplb_stats_num_experts]
+    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -80,13 +87,13 @@ struct CombineKernelPointers
 // Dispatch phase parameters
 struct MoeA2ADispatchParams
 {
+    // Threading policy
     bool one_block_per_token; // True: one block per token, False: one warp per token
 
-    // Threading policy
     // EP configuration
-    int ep_size;              // Number of EP ranks
-    int ep_rank;              // Current EP rank
-    int num_experts_per_rank; // Number of experts per rank (num_experts / ep_size)
+    int ep_size;     // Number of EP ranks
+    int ep_rank;     // Current EP rank
+    int num_experts; // Total number of experts
 
     // Token configuration
     int local_num_tokens;    // Number of tokens on this rank
@@ -114,6 +121,12 @@ struct MoeA2ADispatchParams
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
+
+    // Optional: Statistics for EPLB
+    bool enable_eplb;                    // Whether to enable EPLB
+    int eplb_stats_num_experts;          // Number of experts for EPLB stats
+    int const* eplb_local_stats;         // [eplb_stats_num_experts]
+    int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
     // CUDA stream
     cudaStream_t stream;
@@ -176,4 +189,6 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::moe_comm
+} // namespace kernels::moe_comm
+
+TRTLLM_NAMESPACE_END

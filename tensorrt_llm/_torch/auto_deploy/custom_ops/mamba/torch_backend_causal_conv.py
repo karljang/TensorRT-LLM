@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Custom op collection for cached causal conv1d in pure PyTorch.
 
 This mirrors the structure used by the cached Mamba/SSM ops:
@@ -16,18 +31,16 @@ import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
+    CausalConvResourceHandler,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
 )
 
 
@@ -138,58 +151,23 @@ def _torch_causal_conv1d_decode(
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_causal_conv_prepare_metadata", mutates_args=())
-def torch_causal_conv_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached causal conv.
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-    use_initial_states = input_pos > 0
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
-
-
-@torch_causal_conv_prepare_metadata.register_fake
-def torch_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
-):
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-    )
-
-
+# TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+# reference implementation to support chunked prefill.
+# Returns (seq_len, seq_start, slot_idx)
 @torch.library.custom_op("auto_deploy::torch_cached_causal_conv1d", mutates_args={})
 def _torch_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
-    # METADATA
-    seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
-    slot_idx: torch.Tensor,  # [num_seq]
-    use_initial_states: torch.Tensor,  # [num_seq]
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
     # CONSTANTS
@@ -208,6 +186,14 @@ def _torch_cached_causal_conv1d(
     """
     b, s = input.shape[:2]
     num_seq = seq_len.shape[0]
+
+    # get cleaned up metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch
@@ -270,17 +256,20 @@ def _torch_cached_causal_conv1d(
 
 @_torch_cached_causal_conv1d.register_fake
 def _torch_cached_causal_conv1d_fake(
-    # INPUTS
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    # INPUTS (dense but may be flattened across sequences)
+    input: torch.Tensor,  # [b, s, c_in]
+    weight: torch.Tensor,  # [c_out, c_in/groups, k]
     bias: Optional[torch.Tensor],
-    # METADATA
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
-    use_initial_states: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
-    conv_state_cache: torch.Tensor,
+    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -295,11 +284,6 @@ def _torch_cached_causal_conv1d_fake(
 
 @AttentionRegistry.register("torch_causal_conv")
 class TorchBackendCausalConv(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm nows
-        return True
-
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         # Hidden states follow [b, s, c]
@@ -317,39 +301,31 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_causal_conv1d
+        return torch.ops.auto_deploy.torch_cached_causal_conv1d.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
-        # reference implementation to support chunked prefill.
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info_host", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
 
         in_channels = inp_fake.shape[-1]
         kernel_size = w_fake.shape[-1]
 
-        def _get_conv_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                in_channels,
-                kernel_size,
-                device=si.device,
-                dtype=inp_fake.dtype,
+        # NOTE: torch backend stores kernel_size elements in state (full conv window).
+        # CausalConvResourceHandler.state_shape = (conv_dim, d_conv - 1), so d_conv = kernel_size + 1.
+        return {
+            "conv_state_cache": CausalConvResourceHandler(
+                conv_dim=in_channels,
+                d_conv=kernel_size + 1,  # state_shape[-1] = d_conv - 1 = kernel_size
+                dtype=cls.resolve_cache_dtype("auto", inp_fake.dtype),
             )
-
-        return {"conv_state_cache": _get_conv_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

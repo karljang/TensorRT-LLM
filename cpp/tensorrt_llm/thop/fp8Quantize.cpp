@@ -20,6 +20,8 @@
 
 #include <ATen/cuda/EmptyTensor.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -119,9 +121,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 
     int64_t scaleSizeInBytes = mGemmRunner.getActScaleSize(m, b * n);
     int64_t elementSize = scaleSizeInBytes / torch::elementSize(FP8_BLOCK_SCALING_SF_DTYPE);
-    int m_4_align = (m + 3) / 4 * 4;
-    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, m_4_align, elementSize / b / m_4_align},
-        FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt);
+    at::Tensor scaleFP8SF = at::detail::empty_cuda(
+        {elementSize}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
 
     __nv_fp8_e4m3* act_buffer = reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr());
     float* act_scale_buffer = reinterpret_cast<float*>(scaleFP8SF.data_ptr());
@@ -131,9 +132,18 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
     auto* output_buffer = reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr());
     mGemmRunner.fp8CS1x128Reshape(act_buffer, act_scale_buffer, output_buffer, n, b, m, lda, stream);
 
+    // scaleFP8SF = scaleFP8SF[:, 0:num_n_blocks, 0:m_padded]
+    auto const num_n_blocks = (n + 127) / 128;
+    auto const act_scal_elesize = b * num_n_blocks * m_padded;
+    TORCH_CHECK(act_scal_elesize <= scaleFP8SF.numel(), "Scale tensor size mismatch. Expected at least ",
+        act_scal_elesize, " elements, got ", scaleFP8SF.numel());
+    scaleFP8SF = scaleFP8SF.slice(0, 0, act_scal_elesize).view({b, num_n_blocks, m_padded}).contiguous();
+
     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
 }
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -143,6 +153,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_quantize_1x128", &torch_ext::fp8_quantize_1x128);
-    m.impl("fp8_batched_quantize_1x128_permute102", &torch_ext::fp8_batched_quantize_1x128_permute102);
+    m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
+    m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
 }

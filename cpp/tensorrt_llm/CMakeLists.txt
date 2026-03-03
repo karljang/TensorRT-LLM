@@ -157,6 +157,11 @@ set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+  set(TRANSFER_AGENT_BINDING_TARGET tensorrt_llm_transfer_agent_binding)
+endif()
+
+if(MOONCAKE_ROOT)
+  set(MOONCAKE_WRAPPER_TARGET tensorrt_llm_mooncake_wrapper)
 endif()
 
 add_subdirectory(executor)
@@ -272,6 +277,11 @@ if(TARGET ${NIXL_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
 endif()
 
+if(TARGET ${MOONCAKE_WRAPPER_TARGET})
+  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
+endif()
+
 if(NOT WIN32)
   # Load libraries at $PREFIX/lib from
   # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs
@@ -283,13 +293,7 @@ if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BINDING_TYPE STREQUAL "pybind")
-  add_subdirectory(pybind)
-endif()
-
-if(BINDING_TYPE STREQUAL "nanobind")
-  add_subdirectory(nanobind)
-endif()
+add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)

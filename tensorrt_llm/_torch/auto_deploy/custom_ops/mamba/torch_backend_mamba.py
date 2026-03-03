@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Custom op collection for cached mamba2 ssm transform (linear attention) in pure PyTorch.
 
 This file contains two kinds of functionality:
@@ -12,18 +27,16 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
+from .....llmapi.llm_args import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    SSMResourceHandler,
 )
 from .torch_mamba import _torch_ssm_prefill
 
@@ -111,52 +124,6 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_ssm_prepare_metadata", mutates_args=())
-def _torch_ssm_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached SSM transform.
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    # Determine number of active sequences and compute seq_start boundaries
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    # Truncate slot indices to match active sequences
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-    # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
-    # reference implementation to support chunked prefill.
-    use_initial_states = input_pos > 0
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
-
-
-@_torch_ssm_prepare_metadata.register_fake
-def _torch_ssm_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-):
-    # Use the same sanitization logic to determine sizes in fake mode
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-    )
-
-
 @torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args={})
 def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
@@ -167,11 +134,14 @@ def _torch_cached_ssm(
     D: torch.Tensor,  # [num_heads]
     dt: torch.Tensor,  # [b, s, num_heads]
     dt_bias: torch.Tensor,  # [num_heads]
-    # METADATA
-    seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
-    slot_idx: torch.Tensor,  # [num_seq]
-    use_initial_states: torch.Tensor,  # [num_seq]
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -187,6 +157,14 @@ def _torch_cached_ssm(
     """
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
+
+    # get cleaned up metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
@@ -273,21 +251,24 @@ def _torch_cached_ssm(
 
 @_torch_cached_ssm.register_fake
 def _torch_cached_ssm_fake(
-    # INPUTS
-    hidden_states: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    dt: torch.Tensor,
-    dt_bias: torch.Tensor,
-    # METADATA
+    # INPUTS (dense but may be flattened across sequences)
+    hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
+    A: torch.Tensor,  # [num_heads]
+    B: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    C: torch.Tensor,  # [b, s, n_groups, ssm_state_size]
+    D: torch.Tensor,  # [num_heads]
+    dt: torch.Tensor,  # [b, s, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads]
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
-    ssm_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -301,11 +282,6 @@ def _torch_cached_ssm_fake(
 
 @AttentionRegistry.register("torch_ssm")
 class TorchBackendSSM(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm now
-        return True
-
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         # Hidden states follow [b, s, n, d]
@@ -322,17 +298,16 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_ssm
+        return torch.ops.auto_deploy.torch_cached_ssm.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info_host", "seq_len", "cu_seqlen", "slot_idx", "use_initial_states"]
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         B_fake: torch.Tensor = source_attn_node.args[2].meta["val"]
@@ -349,23 +324,16 @@ class TorchBackendSSM(AttentionDescriptor):
             ssm_state_size = max(1, B_fake.shape[-1])
 
         # extract ssm_state_dtype from cache_config or hs_fake
-        ssm_state_dtype = cache_config.mamba_dtype or hs_fake.dtype
+        ssm_state_dtype = cls.resolve_cache_dtype(cache_config.mamba_ssm_cache_dtype, hs_fake.dtype)
 
-        def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                num_heads,
-                head_dim,
-                ssm_state_size,
-                device=si.device,
+        return {
+            "ssm_state_cache": SSMResourceHandler(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                d_state=ssm_state_size,
                 dtype=ssm_state_dtype,
             )
-
-        return {"ssm_state_cache": _get_ssm_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

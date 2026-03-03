@@ -5,10 +5,10 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
-from ..custom_ops.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
+from ..custom_ops.quantization.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
 from .logger import ad_logger
 from .node_utils import (
-    extract_param_names_from_node,
+    extract_weight_name,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -117,8 +117,12 @@ def should_skip_quantization(
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
-        param_name, _ = extract_param_names_from_node(node_or_name)
-        modname, _, _ = param_name.rpartition(".")
+        weight_name = extract_weight_name(node_or_name)
+        # extract_weight_name can return False when weight node is not found (e.g. after
+        # PR 10718 get_weight_node uses forward mapping; some graph shapes may have no mapping).
+        if weight_name is False or not isinstance(weight_name, str):
+            return True
+        modname = weight_name.rpartition(".")[0]
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
 

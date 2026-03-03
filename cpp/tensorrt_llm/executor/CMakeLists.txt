@@ -23,6 +23,7 @@ set(SRCS
     cache_transmission/agent_utils/connection.cpp
     cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
+    cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
     debugConfig.cpp
     decodingConfig.cpp
@@ -90,4 +91,5 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 add_subdirectory(cache_transmission/ucx_utils)
+add_subdirectory(cache_transmission/mooncake_utils)
 add_subdirectory(cache_transmission/nixl_utils)

@@ -4,7 +4,7 @@
 
 ## About TensorRT LLM
 
-[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs. 
+[TensorRT LLM](https://developer.nvidia.com/tensorrt) is NVIDIA's comprehensive open-source library for accelerating and optimizing inference performance of the latest large language models (LLMs) on NVIDIA GPUs.
 
 ## Key Capabilities
 
@@ -31,16 +31,16 @@ TensorRT LLM supports the latest and most popular LLM [architectures](https://nv
 TensorRT LLM strives to support the most popular models on **Day 0**.
 
 ### FP4 Support
-[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
+[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/), when used with TensorRT LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
 
 ### FP8 Support
 
-TensorRT LLM strives to support the most popular models on **Day 0**.
+On NVIDIA H100 and later GPUs, TensorRT LLM supports [FP8 quantization](./features/quantization.md), which can double performance and halve memory consumption compared to 16-bit floating point, with minimal impact on model accuracy.
 
 ### 🚀 **Advanced Optimization & Production Features**
 - **[In-Flight Batching & Paged Attention](./features/paged-attention-ifb-scheduler.md)**: In-flight batching eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.
 - **[Multi-GPU Multi-Node Inference](./features/parallel-strategy.md)**: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.
-- **[Advanced Quantization](./features/quantization.md)**: 
+- **[Advanced Quantization](./features/quantization.md)**:
   - **FP4 Quantization**: Native support on NVIDIA B200 GPUs with optimized FP4 kernels
   - **FP8 Quantization**: Automatic conversion on NVIDIA H100 GPUs leveraging Hopper architecture
 - **[Speculative Decoding](./features/speculative-decoding.md)**: Multiple algorithms including EAGLE, MTP and NGram
@@ -51,14 +51,6 @@ TensorRT LLM strives to support the most popular models on **Day 0**.
 - **[Guided Decoding](./features/guided-decoding.md)**: Advanced sampling with stop words, bad words, and custom constraints
 - **[Disaggregated Serving (Beta)](./features/disagg-serving.md)**: Separate context and generation phases across different GPUs for optimal resource utilization
 
-### 🔧 **Latest GPU Architecture Support**
-
-TensorRT LLM supports the full spectrum of NVIDIA GPU architectures:
-- **NVIDIA Blackwell**: B200, GB200, RTX Pro 6000 SE with FP4 optimization
-- **NVIDIA Hopper**: H100, H200,GH200 with FP8 acceleration
-- **NVIDIA Ada Lovelace**: L40/L40S, RTX 40 series with FP8 acceleration
-- **NVIDIA Ampere**: A100, RTX 30 series for production workloads
-
 ## What Can You Do With TensorRT LLM?
 
-Whether you're building the next generation of AI applications, optimizing existing LLM deployments, or exploring the frontiers of large language model technology, TensorRT LLM provides the tools, performance, and flexibility you need to succeed in the era of generative AI.To get started, refer to the {ref}`quick-start-guide`.
+Whether you're building the next generation of AI applications, optimizing existing LLM deployments, or exploring the frontiers of large language model technology, TensorRT LLM provides the tools, performance, and flexibility you need to succeed in the era of generative AI. To get started, refer to the {ref}`quick-start-guide`.

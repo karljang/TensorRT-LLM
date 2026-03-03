@@ -7,7 +7,6 @@ metadata:
   - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
-  config_index: 13
   dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
@@ -44,9 +43,6 @@ profiling:
   nsys_on: false
 accuracy:
   enable_accuracy_test: false
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true

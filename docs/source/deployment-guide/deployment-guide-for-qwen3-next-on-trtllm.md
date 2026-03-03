@@ -61,7 +61,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.
 
 ```shell
-trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --reasoning_parser deepseek-r1 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -70,7 +70,7 @@ After the server is set up, the client can now send prompt requests to the serve
 
 <!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
 
 #### `tensor_parallel_size`
 
@@ -127,7 +127,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
   * `backend`: The backend to use for MoE operations.
     **Default**: `CUTLASS`
 
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
+See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
 
@@ -172,12 +172,12 @@ Here is an example response:
 * For performance issues, check GPU utilization with nvidia-smi while the server is running.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
-
+* If you are using trtllm-serve and the thinking model of Qwen3-Next, make sure to add this server arg `--reasoning_parser deepseek-r1`.
 
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<'EOF' > bench.sh
@@ -210,7 +210,7 @@ EOF
 chmod +x bench.sh
 ```
 
-To achieve max through-put, with attention DP on, one needs to sweep up to `concurrency = max_batch_size * num_gpus`.
+To achieve max throughput, with attention DP on, one needs to sweep up to `concurrency = max_batch_size * num_gpus`.
 
 If you want to save the results to a file add the following options.
 
@@ -220,7 +220,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run `bench.sh` to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above `bench.sh` script.
 

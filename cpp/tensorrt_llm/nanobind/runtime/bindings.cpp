@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/kernels/globalTimerKernel.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -316,6 +317,17 @@ void initBindings(nb::module_& m)
         },
         "Delay kernel launch on the default stream");
     m.def(
+        "record_global_timer",
+        [](int64_t data_ptr, nb::object py_stream)
+        {
+            auto* ptr = reinterpret_cast<uint64_t*>(data_ptr);
+            auto stream_ptr = nb::cast<int64_t>(py_stream.attr("cuda_stream"));
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            nb::gil_scoped_release release;
+            tensorrt_llm::kernels::invokeReadGlobalTimer(ptr, stream);
+        },
+        "Record GPU global timer value to device memory");
+    m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations",
@@ -347,9 +359,9 @@ void initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>(), nb::arg("buf_size"),
-            nb::arg("group_size"), nb::arg("group_rank"), nb::arg("split_color"), nb::arg("device_idx"),
-            nb::arg("mn_nvlink"), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),
+            nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"), nb::arg("mn_nvlink"),
+            nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,

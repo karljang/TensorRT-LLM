@@ -78,9 +78,7 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
-
-// Type alias for multimodal hash key (hash array + start offset)
-using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
+using MmKey = tensorrt_llm::executor::MmKey;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -290,6 +288,9 @@ public:
 
     void removeNextBlock(BlockKey const& blockKey);
 
+    void freeDescendantsRecursively();
+    void freeBlockAndAllDescendants();
+
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
@@ -324,6 +325,8 @@ public:
     void setHash();
 
     size_t getHash() const;
+
+    std::vector<MmKey> getExtraKeys() const;
 
 private:
     // Linear ID of block independent of pool
@@ -365,6 +368,9 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+
+    // Mutex for the next blocks
+    mutable std::mutex mNextBlocksMutex;
 };
 
 class GenerationRequest
@@ -380,6 +386,7 @@ public:
         , mBeamWidth(beamWidth)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mNumFrontBlocksRemoved(0)
+        , mCurrentPrepopulatedPromptLen(std::numeric_limits<SizeType32>::max())
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
         mCacheBlockIds.reserve(numWindowSizes);
@@ -500,6 +507,20 @@ public:
         return mKvCacheRetentionConfig.getDirectory();
     }
 
+    [[nodiscard]] SizeType32 getCurrentPrepopulatedPromptLen() const
+    {
+        return mCurrentPrepopulatedPromptLen;
+    }
+
+    void setCurrentPrepopulatedPromptLen(SizeType32 currentPrepopulatedPromptLen)
+    {
+        TLLM_CHECK_WITH_INFO(currentPrepopulatedPromptLen <= mCurrentPrepopulatedPromptLen,
+            "currentPrepopulatedPromptLen must be updated non-increasingly due to the "
+            "assumption that smaller window sizes have shorter or equal"
+            "currentPrepopulatedPromptLen in WindowSizeManager::loadOrAllocateBlocks.");
+        mCurrentPrepopulatedPromptLen = currentPrepopulatedPromptLen;
+    }
+
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -517,6 +538,8 @@ private:
     SizeType32 mNumFrontBlocksRemoved;
     // Set of used blocks by the sequence
     std::set<KVCacheBlock::IdType> mUsedBlocks;
+    // Current prepopulated prompt length
+    SizeType32 mCurrentPrepopulatedPromptLen;
 };
 
 // attach metadata to a pool pointer
@@ -619,7 +642,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    [[nodiscard]] SizeType32 addSequence(
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
@@ -631,7 +655,7 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
@@ -674,6 +698,7 @@ public:
         return mLogPrefix;
     }
 
+    // Get num free blocks in the primary memory pool
     [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
@@ -819,6 +844,18 @@ public:
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
+    //!          of the request's context are already cached.
+    //! \param uniqueTokens The unique tokens representing the request's context.
+    //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
+    //!        to another sequence). Free cached blocks are excluded because they are already counted
+    //!        in the eviction policy's free count.
+    //! \return The number of full blocks that can be reused.
+    [[nodiscard]] SizeType32 countReusableBlocks(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
+
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
         return mBufferManager;
@@ -836,8 +873,8 @@ public:
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
-    //! \return Pair of (num blocks stored for reuse, id of the last block stored if any).
-    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+    //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         bool pinBlocks = false);
 
@@ -867,10 +904,15 @@ public:
         return mIsSWA;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mEnablePartialReuse;
+    }
+
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
-    //! \brief Unpin blocks by starting from a block id and walking prev pointers.
-    void unpinBlocksById(KVCacheBlock::IdType blockId);
+    //! \brief Unpin blocks by block ids directly
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void initializeSequenceStorageValidity(LlmRequest::RequestIdType requestId)
     {
@@ -987,7 +1029,7 @@ private:
     // Only be 1 or 2. If 2: general KV stored. If 1: K == V for any token, so only K is stored to optimize the
     // max_num_tokens(For DeepSeek). Controlled by mCacheType
     SizeType32 mKVFactor;
-    std::set<KVCacheBlock::IdType> reusedBlockIds;
+    std::set<KVCacheBlock::IdType> mReusedBlockIds;
     std::string const mLogPrefix;
     // Number of reused tokens
     double mReusedTokens;
@@ -1001,7 +1043,7 @@ private:
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 
     // Mutex for the cached blocks root
-    std::mutex mCachedBlocksRootMutex;
+    mutable std::mutex mCachedBlocksRootMutex;
 
     // Record which sequence is using the block
     std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
@@ -1054,6 +1096,11 @@ public:
         return mIndexerKCacheIndexHeadDim;
     }
 
+    [[nodiscard]] bool isEnablePartialReuse() const
+    {
+        return mWindowBlockManagers.begin()->second.isEnablePartialReuse();
+    }
+
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
 
@@ -1068,8 +1115,9 @@ public:
 
     void allocatePools(bool useUvm);
 
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest, SizeType32 windowSize);
+    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
+    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize);
 
     //! \brief Assign blocks for a new sequence.
     //! \param sequence  The GenerationRequest to process.
@@ -1086,7 +1134,7 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -1095,7 +1143,7 @@ public:
     /// @param sequence The generation request whose blocks should be pinned.
     void pinBlocks(GenerationRequest& sequence);
 
-    void unpinBlocksById(KVCacheBlock::IdType blockId);
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1105,6 +1153,11 @@ public:
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
+    [[nodiscard]] SizeType32 countReusableBlocks(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1116,7 +1169,7 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
         std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize, bool pinBlocks = false)
     {
@@ -1513,7 +1566,9 @@ public:
     /// @param llmRequest Optional request to use for KV cache lookup.
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    /// @return True if the sequence was added, False if the sequence was not added because it was already in the
+    /// manager.
+    virtual bool addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
@@ -1540,6 +1595,8 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isEnablePartialReuse() const = 0;
+
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
@@ -1558,6 +1615,17 @@ public:
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
         = 0;
 
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
+    //!          of the request's context are already cached.
+    //! \param uniqueTokens The unique tokens representing the request's context.
+    //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references.
+    //! \return The number of full blocks that can be reused.
+    [[nodiscard]] virtual SizeType32 countReusableBlocks(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
+        = 0;
+
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
@@ -1567,7 +1635,7 @@ public:
     virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
 
     /// \brief Store blocks for reuse for a given request id
-    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] virtual std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false)
         = 0;
 
@@ -1661,7 +1729,15 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
-    virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
+    virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
+    //! @brief Get the retention priority of a block by its ID.
+    //! @param blockId The ID of the block.
+    //! @param windowSize The attention window size this block belongs to.
+    //! @return The retention priority of the block, or default priority if block not found.
+    [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const
+        = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1843,7 +1919,9 @@ public:
     /// @param llmRequest Optional request to use for KV cache lookup.
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    /// @return True if the sequence was added, False if the sequence was not added because it was already in the
+    /// manager.
+    bool addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
@@ -1877,6 +1955,11 @@ public:
     [[nodiscard]] bool isEnableBlockReuse() const override
     {
         return mEnableBlockReuse;
+    }
+
+    [[nodiscard]] bool isEnablePartialReuse() const override
+    {
+        return mBlockManager.isEnablePartialReuse();
     }
 
     [[nodiscard]] bool isEnableIndexerKCache() const override
@@ -1915,6 +1998,10 @@ public:
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
 
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    [[nodiscard]] SizeType32 countReusableBlocks(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
+
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     void storeContextBlocks(LlmRequest const& llmRequest) override;
@@ -1922,7 +2009,7 @@ public:
     //! \brief Store newest blocks for reuse
     void storeNewBlock(LlmRequest const& llmRequest) override;
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+    [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false) override;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
@@ -1943,7 +2030,10 @@ public:
 
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
-    void unpinBlocksById(KVCacheBlock::IdType blockId) override;
+    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
+        KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

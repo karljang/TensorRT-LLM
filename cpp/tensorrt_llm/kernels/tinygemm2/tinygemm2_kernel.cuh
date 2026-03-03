@@ -172,7 +172,7 @@ struct Profile
 };
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL, bool PROFILE>
-__global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
+__global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output, __nv_bfloat16* weights,
     __nv_bfloat16* activations, __nv_bfloat16* bias, int M, int N, int K,
     const __grid_constant__ CUtensorMap weight_map, const __grid_constant__ CUtensorMap activation_map,
     Profile* profile = nullptr)
@@ -295,6 +295,17 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
                         : "memory");
             }
 
+            stage += 4;
+            if (stage >= STAGES)
+            {
+                stage = warp_id % 4;
+                phase ^= 1;
+            }
+        }
+        // Wait for pending loads to be consumed before exiting, to avoid race
+        for (int i = 0; i < (STAGES / 4) - 1; i++)
+        {
+            bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
             stage += 4;
             if (stage >= STAGES)
             {

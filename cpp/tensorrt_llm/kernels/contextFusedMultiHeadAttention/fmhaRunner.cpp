@@ -15,6 +15,7 @@
  */
 
 #include "fmhaRunner.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include <cassert>
@@ -28,8 +29,8 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -285,6 +286,13 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.sage.q.max_nblock = runnerParams.qMaxNBlock;
     mKernelParams.sage.k.max_nblock = runnerParams.kMaxNBlock;
     mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
+
+    // for skip-softmax attention
+    mKernelParams.skip_softmax_threshold_scale_factor = runnerParams.skipSoftmaxThresholdScaleFactor;
+#ifdef SKIP_SOFTMAX_STAT
+    mKernelParams.skip_softmax_total_blocks = runnerParams.skipSoftmaxTotalBlocks;
+    mKernelParams.skip_softmax_skipped_blocks = runnerParams.skipSoftmaxSkippedBlocks;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -379,19 +387,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         TLLM_CHECK_WITH_INFO(false, "Unsupported architecture");
     }
-    // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
-    // Only supports packed_qkv input + padding/causal mask.
-    else if (isSm90 && !separateQKvInput && paddingOrCausalMask
-        && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256
-        && !common::getEnvForceDeterministicAttention())
-    {
-        mLaunchParams.flash_attention = false;
-        // get max sequence length for non-flash-attention.
-        // this doesn't support different q and kv sequence lengths.
-        mLaunchParams.kernel_s = getSFromMaxSeqLen(runnerParams.qSeqLen);
-    }
     else
-    { // always use flash attention kernels for Ampere/Ada
+    {
+        // Non-flash-attention style original fmha_v2 kernel support has been removed
+        // always use flash attention kernels
         mLaunchParams.flash_attention = true;
         // flash attention kernles s = 0 (support any seq length)
         mLaunchParams.kernel_s = 0;
@@ -492,6 +491,18 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             && ((!isHopperContextMLA && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
                 || (isHopperContextMLA
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
+    }
+
+    // Setup launch params for skip softmax attention
+    mLaunchParams.enableSkipSoftmax = false;
+    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
+    {
+        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
+        {
+            TLLM_CHECK_WITH_INFO(false,
+                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
+        }
+        mLaunchParams.enableSkipSoftmax = true;
     }
 }
 
@@ -738,4 +749,5 @@ bool FusedMHARunnerV2::isFmhaSupported()
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

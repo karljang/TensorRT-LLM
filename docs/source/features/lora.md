@@ -15,7 +15,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [YAML Configuration](#yaml-configuration)
    - [Starting the Server](#starting-the-server)
    - [Client Usage](#client-usage)
-5. [TRTLLM bench with LORA](#trtllm-bench-with-lora)
+5. [TRTLLM bench with LoRA](#trtllm-bench-with-lora)
    - [YAML Configuration](#yaml-configuration)
    - [Run trtllm-bench](#run-trtllm-bench)
 
@@ -157,7 +157,13 @@ llm = LLM(
 
 ### YAML Configuration
 
-Create an `extra_llm_api_options.yaml` file:
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+Create a `config.yaml` file:
 
 ```yaml
 lora_config:
@@ -168,7 +174,7 @@ lora_config:
 ```bash
 python -m tensorrt_llm.commands.serve
      /path/to/model \
-    --extra_llm_api_options extra_llm_api_options.yaml
+    --config config.yaml
 ```
 
 ### Client Usage
@@ -192,11 +198,17 @@ response = client.completions.create(
 )
 ```
 
-## TRTLLM bench with LORA
+## TRTLLM bench with LoRA
 
 ### YAML Configuration
 
-Create an `extra_llm_api_options.yaml` file:
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
+Create a `config.yaml` file:
 
 ```yaml
 lora_config:
@@ -216,5 +228,5 @@ lora_config:
 ```
 ### Run trtllm-bench
 ```bash
-trtllm-bench --model $model_path throughput --dataset $dataset_path --extra_llm_api_options extra_llm_api_options.yaml --num_requests 64 --concurrency 16
+trtllm-bench --model $model_path throughput --dataset $dataset_path --config config.yaml --num_requests 64 --concurrency 16
 ```

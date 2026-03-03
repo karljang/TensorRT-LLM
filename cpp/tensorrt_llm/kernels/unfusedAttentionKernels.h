@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -25,8 +26,8 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -162,6 +163,9 @@ struct QKVPreprocessingParams
 
     float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets{nullptr};
+    bool const* helix_is_inactive_rank{nullptr};
 
     // Scalars.
     int batch_size{0};
@@ -462,4 +466,4 @@ void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_len
 
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

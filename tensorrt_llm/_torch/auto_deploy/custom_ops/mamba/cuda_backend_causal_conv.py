@@ -24,89 +24,15 @@ The flattened cached op integrates with the auto_deploy attention interface
 and updates a slot-indexed convolution state cache internally.
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
-from torch._ops import OpOverloadPacket
-from torch.fx import Node
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
-from ...utils.node_utils import extract_op_args
-from ..attention_interface import (
-    AttentionDescriptor,
-    AttentionLayout,
-    AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
-    Constant,
-    MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
-)
-
-
-def _build_conv_state_from_sequence(input_bt_c: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    """Builds a convolution state of fixed window `kernel_size` from a sequence.
-
-    input_bt_c: [B, T, C]
-    Returns: [B, C, K]
-    """
-    # [B, T, C] -> [B, C, T]
-    input_b_c_t = input_bt_c.transpose(1, 2)
-    seq_len = input_b_c_t.shape[-1]
-    if seq_len >= kernel_size:
-        return input_b_c_t[..., -kernel_size:]
-    pad_amount = kernel_size - seq_len
-    # F.pad last dim (time) with (pad_left, pad_right)
-    return torch.nn.functional.pad(input_b_c_t, (pad_amount, 0))
-
-
-# ---------------------------------------------------------------
-# Metadata + flattened cached op that integrates with the AD i/f
-# ---------------------------------------------------------------
-@torch.library.custom_op("auto_deploy::cuda_causal_conv_prepare_metadata", mutates_args=())
-def cuda_causal_conv_prepare_metadata(
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-    chunk_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached causal conv (CUDA backend).
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-    # This is only used during prefill to determine if we should use the initial states from the cache.
-    use_initial_states = input_pos[:num_seq] > 0
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
-
-
-@cuda_causal_conv_prepare_metadata.register_fake
-def cuda_causal_conv_prepare_metadata_fake(
-    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size, chunk_size
-):
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
-    )
+from ..attention_interface import AttentionRegistry, MHACallable
+from .causal_conv_common import BaseCausalConvDescriptor
 
 
 @torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
@@ -115,11 +41,13 @@ def _cuda_cached_causal_conv1d(
     input: torch.Tensor,  # [b, s, c_in]
     weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
     bias: Optional[torch.Tensor],
-    # METADATA
-    seq_len: torch.Tensor,  # [num_seq]
-    seq_start: torch.Tensor,  # [num_seq]
-    slot_idx: torch.Tensor,  # [num_seq]
-    use_initial_states: torch.Tensor,  # [num_seq]
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
     # CONSTANTS
@@ -140,16 +68,10 @@ def _cuda_cached_causal_conv1d(
     NOTE: This op modifies `input` in-place.
     """
     b, s = input.shape[:2]
-    num_seq = seq_len.shape[0]
 
-    # Split by lengths: assume prefills first, decodes after
-    if s == 1:
-        num_prefill = 0
-        num_decode = num_seq
-    else:
-        prefill_mask = seq_len > 1
-        num_prefill = int(prefill_mask.sum().item())
-        num_decode = num_seq - num_prefill
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
     # Flatten tokens
     bs = b * s
@@ -162,47 +84,29 @@ def _cuda_cached_causal_conv1d(
     else:
         w2d = weight
 
-    total_prefill_tokens = 0
-
     # PREFILL: concatenate all prefill tokens and run one varlen forward
     if num_prefill > 0:
-        seq_len_prefill = seq_len[:num_prefill].to(torch.int32)
-        total_prefill_tokens = int(seq_len_prefill.sum().item())
-
         # x_varlen: (dim, cu_seq_len)
-        x_varlen = inp_flat[:total_prefill_tokens].transpose(0, 1).contiguous()
-
-        # Metadata
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=input.device),
-                torch.cumsum(seq_len_prefill, dim=0, dtype=torch.int32),
-            ],
-            dim=0,
-        ).contiguous()
-        cache_indices = slot_idx[:num_prefill].to(torch.int32).contiguous()
-        has_initial_state = use_initial_states[:num_prefill].to(torch.bool)
+        x_varlen = inp_flat[:num_prefill_tokens].transpose(0, 1).contiguous()
 
         # Run varlen conv; updates conv_state_cache in-place per cache_indices
         y_varlen = causal_conv1d_fn(
             x_varlen,
             w2d,
             bias,
-            query_start_loc=cu_seqlens,
-            cache_indices=cache_indices,
-            has_initial_state=has_initial_state,
+            query_start_loc=cu_seqlen[: num_prefill + 1],
+            cache_indices=slot_idx[:num_prefill].to(torch.int32),
+            has_initial_state=use_initial_states[:num_prefill],
             conv_states=conv_state_cache,
             activation=activation,
             pad_slot_id=PAD_SLOT_ID,
         )  # (dim, total_prefill_tokens)
         # Scatter outputs back to input buffer
-        inp_flat[:total_prefill_tokens] = y_varlen.transpose(0, 1)
+        inp_flat[:num_prefill_tokens] = y_varlen.transpose(0, 1)
 
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        x_decode = inp_flat[
-            total_prefill_tokens : total_prefill_tokens + num_decode
-        ]  # [num_decode, C_in]
+        x_decode = inp_flat[num_prefill_tokens:num_total_tokens]  # [num_decode, C_in]
 
         causal_conv1d_update(
             x_decode,  # [batch, dim]
@@ -211,26 +115,26 @@ def _cuda_cached_causal_conv1d(
             bias,
             activation=activation,
             cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
+            conv_state_indices=slot_idx[num_prefill:num_seq].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
-
-    return
 
 
 @_cuda_cached_causal_conv1d.register_fake
 def _cuda_cached_causal_conv1d_fake(
-    # INPUTS
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    # INPUTS (dense but may be flattened across sequences)
+    input: torch.Tensor,  # [b, s, c_in]
+    weight: torch.Tensor,  # [c_out, c_in/groups, k] but we expect depthwise use: [c_in, k]
     bias: Optional[torch.Tensor],
-    # METADATA
-    seq_len: torch.Tensor,
-    seq_start: torch.Tensor,
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
+    cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
-    use_initial_states: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
-    conv_state_cache: torch.Tensor,
+    conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -238,74 +142,23 @@ def _cuda_cached_causal_conv1d_fake(
     groups: int,
     padding_mode: str,
     activation: Optional[str],
-):
-    return
+) -> None:
+    pass
 
 
-def cuda_cached_causal_conv1d_wrapper(input, *args, **kwargs):
+def cuda_cached_causal_conv1d_wrapper(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     torch.ops.auto_deploy.cuda_cached_causal_conv1d(input, *args, **kwargs)
     return input
 
 
 @AttentionRegistry.register("cuda_causal_conv")
-class CudaBackendCausalConv(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        return True
+class CudaBackendCausalConv(BaseCausalConvDescriptor):
+    """CUDA-backed causal conv1d attention descriptor.
 
-    @classmethod
-    def get_attention_layout(cls) -> AttentionLayout:
-        # Hidden states follow [b, s, c]
-        return "bsnd"
-
-    @classmethod
-    def get_num_qkv_args(cls) -> int:
-        # torch_causal_conv1d signature has 3 relevant tensor arguments
-        # TODO: bias can be optional!! How to handle None bias here?
-        return 3
-
-    @classmethod
-    def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_causal_conv1d
+    Inherits shared methods from BaseCausalConvDescriptor.
+    Only overrides get_cached_attention_op to return the CUDA wrapper.
+    """
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return cuda_cached_causal_conv1d_wrapper
-
-    @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx, use_initial_states)
-        return torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata, 4
-
-    @classmethod
-    def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
-        inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
-        w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
-
-        in_channels = inp_fake.shape[-1]
-        kernel_size = w_fake.shape[-1]
-
-        def _get_conv_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                in_channels,
-                max(1, kernel_size - 1),
-                device=si.device,
-                dtype=inp_fake.dtype,
-            )
-
-        return {"conv_state_cache": _get_conv_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
-
-    @classmethod
-    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        stride, padding, dilation, groups, padding_mode = extract_op_args(
-            source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
-        )
-        # None is for activation parameter, which may not exist in the source node (added by fusion later)
-        return [stride, padding, dilation, groups, padding_mode, None]

@@ -4,10 +4,6 @@ model: DeepSeek-V3-Lite/bf16
 backend: "pytorch"
 context_servers:
   num_instances: 1
-  build_config:
-    max_batch_size: 10
-    max_num_tokens: 512
-    max_seq_len: 768
   max_batch_size: 10
   max_num_tokens: 512
   max_seq_len: 768
@@ -16,7 +12,6 @@ context_servers:
   pipeline_parallel_size: 1
   print_iter_log: true
   cuda_graph_config: null
-  disable_overlap_scheduler: true
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.05
@@ -28,10 +23,6 @@ context_servers:
       - "localhost:8001"
 generation_servers:
   num_instances: 1
-  build_config:
-    max_batch_size: 1
-    max_num_tokens: 2048
-    max_seq_len: 2560
   tensor_parallel_size: 1
   enable_attention_dp: false
   enable_lm_head_tp_in_adp: false

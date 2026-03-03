@@ -20,11 +20,13 @@ referring to types like LlmRequest.
 
 import abc
 import sys
+from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -62,7 +64,6 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    end_ids: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -266,7 +267,8 @@ def greedy_search_sampling_batch(
     next_tokens = torch.argmax(logits, dim=-1)
     softmax: Optional[torch.Tensor] = None
     if return_probs:
-        softmax = torch.softmax(logits, dim=-1)
+        softmax = torch.zeros_like(logits)
+        softmax.scatter_(1, next_tokens.unsqueeze(-1), 1.0)
     return next_tokens, softmax
 
 
@@ -288,9 +290,8 @@ def beam_search_sampling_batch(
     beam_width_out: int,
     beam_search_args: BeamSearchMetadata,
     temperature: float | None,
-    generator: Optional[torch.Generator] = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Sample <beam_width> tokens for each request in parallel.
     """
@@ -438,9 +439,9 @@ def get_rejected_indices(
     # NB: torch.arange is needed to enable "advanced indexing",
     #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
     token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=True).to(
-        device=generator.device, non_blocking=True
-    )
+    draft_tokens_cuda = torch.tensor(
+        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+    ).to(device=generator.device, non_blocking=True)
     p = draft_probs[token_idx, draft_tokens_cuda]
     q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
     accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
@@ -471,10 +472,10 @@ def sample(
     strategy: Strategy,
     logits: torch.Tensor,
     *,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
     group_metadata: StrategyMetadata | None = None,
     return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
     match strategy:
         case ("top_k", top_k, temperature):
             tokens, softmax = top_k_sampling_batch(
@@ -506,6 +507,7 @@ def sample(
             )
         case ("greedy", None):
             tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
+            temperature = None
         case ("beam_search", beam_width_in, beam_width_out, temperature):
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
@@ -516,19 +518,18 @@ def sample(
                 beam_width_out=beam_width_out,
                 beam_search_args=group_metadata,
                 temperature=temperature,
-                generator=generator,
                 return_probs=return_probs,
             )
-    return tokens, softmax
+    return tokens, softmax, temperature
 
 
-GenericStrategyKeyType = TypeVar("GenericStrategyKeyType")
+GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)
 
 
 class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
     @staticmethod
     @abc.abstractmethod
-    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> GenericStrategyKeyType:
+    def strategy_grouping_key(strategy: Strategy) -> GenericStrategyKeyType:
         raise NotImplementedError
 
     @staticmethod
@@ -545,11 +546,18 @@ class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
+        """Sample grouped strategies.
+
+        Returns:
+          - Sampled tokens
+          - Processed probs (whenever return_probs=True)
+          - Temperature (used to compute processed _log_ probs)
+        """
         raise NotImplementedError
 
 
@@ -558,7 +566,7 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
 
     @override
     @staticmethod
-    def strategy_grouping_key(strategy: Strategy, return_probs: bool) -> STRATEGY_KEY_TYPE:
+    def strategy_grouping_key(strategy: Strategy) -> STRATEGY_KEY_TYPE:
         return strategy
 
     @override
@@ -579,19 +587,19 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         strategies: list[Strategy],
         logits: torch.Tensor,
         *,
-        group_logit_indices: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        group_logit_indices: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
         if group_key[0] == "beam_search":
             beam_width_in = group_key[1]
         else:
             beam_width_in = 1
-        if group_logit_indices is None:
-            assert logits.size(0) == beam_width_in * len(strategies)
-        else:
+
+        if group_logit_indices is not None:
             logits = logits[group_logit_indices]
+        assert logits.size(0) == beam_width_in * len(strategies)
 
         assert all(strategy == group_key for strategy in strategies), "group must be consistent"
 

@@ -28,6 +28,13 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+// Generate a unique agent name for NIXL/UCX connection identity.
+// Format: {hostname}_{pid}_{random64}_{counter}
+// The per-process random suffix prevents collisions across Docker containers
+// that share hostname (--network host) and PID namespace.
+std::string genUniqueAgentName();
+
 struct RequestAndBufferInfo
 {
     std::string mAgentName;
@@ -277,12 +284,13 @@ class AgentConnectionManager : public ConnectionManager
 public:
     AgentConnectionManager(
         std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> cacheTransBufferManagers,
-        CacheState cacheState);
+        CacheState cacheState, std::string const& backendType);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
-    AgentConnection const* recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo);
+    AgentConnection const* recvConnectionAndRequestInfo(
+        batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] std::vector<batch_manager::kv_cache_manager::CacheTransBufferManager*> const&
     getCacheTransBufferManagers() const;
     void updateUnhandledNotifications();
@@ -293,9 +301,13 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    void waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo);
-    void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo);
-    void waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo);
+    void waitForNotification(
+        std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
+    void waitForSyncInfo(
+        std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
+    void waitForReadySignal(
+        std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
+    [[nodiscard]] bool isRunning() const override;
 
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
@@ -309,6 +321,7 @@ private:
     int mDeviceId;
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    std::atomic<bool> mIsRunning{true};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

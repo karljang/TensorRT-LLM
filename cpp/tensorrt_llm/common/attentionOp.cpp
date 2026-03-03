@@ -16,6 +16,7 @@
  */
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -283,6 +284,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
     xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
+    xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
+    xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
+    xqaParams.softmax_stats = generationsParams.softmax_stats;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -295,7 +299,13 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_params = mRuntimeSparseAttentionParams;
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
-
+    // Skip softmax threshold.
+    xqaParams.skip_softmax_threshold_scale_factor = mSkipSoftmaxThresholdScaleFactorDecode;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    xqaParams.skip_softmax_total_blocks = mSkipSoftmaxTotalBlocks;
+    xqaParams.skip_softmax_skipped_blocks = mSkipSoftmaxSkippedBlocks;
+#endif
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
 
@@ -1034,7 +1044,7 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
@@ -1264,14 +1274,6 @@ int AttentionOp::mlaGeneration(
                 mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
                 return 0;
             }
-            else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
-            {
-                TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
-            }
-            else if (mFuseFp4Quant)
-            {
-                TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
-            }
         }
 
         // Use FMHA otherwise.
@@ -1311,6 +1313,8 @@ int AttentionOp::mlaGeneration(
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
+
+        // MLA does not support skip-softmax attention right now
 
         // Run the fmha kernel
         mDecoderFMHARunner->run(fmhaParams);
@@ -1686,6 +1690,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
         preprocessingParams.qkv_scale_orig_quant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
+        preprocessingParams.helix_position_offsets = params.helix_position_offsets;
+        preprocessingParams.helix_is_inactive_rank = params.helix_is_inactive_rank;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
         // Sparse KV write
@@ -1883,6 +1889,18 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
         }
+
+        // Skip-softmax attention parameters
+        fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;
+#ifdef SKIP_SOFTMAX_STAT
+        fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
+        fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;
+#else
+        if (tensorrt_llm::common::getEnvPrintSkipSoftmaxStat())
+        {
+            TLLM_THROW("To print skip softmax stat, please run build_wheel.py with -DSKIP_SOFTMAX_STAT");
+        }
+#endif
 
         if (mAttentionChunkSize)
         {

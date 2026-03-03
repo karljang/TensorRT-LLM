@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
@@ -24,8 +25,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -777,6 +778,7 @@ quantize_with_block_size(
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    // This value is prepared by model, no need to be protected by ACKBULK
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
     // Is it swizzled layout?
@@ -792,7 +794,7 @@ quantize_with_block_size(
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
     // Input tensor batch/row/col loops.
     // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
     // This improves performance for small batch sizes with swizzled layout
@@ -895,11 +897,12 @@ quantize_with_block_size(
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

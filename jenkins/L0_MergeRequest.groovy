@@ -316,10 +316,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
     if (env.gitlabMergeRequestLastCommit) {
         env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     } else {
         branch = env.gitlabBranch ? env.gitlabBranch : "main"
-        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, false, true)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
@@ -400,13 +400,13 @@ def launchReleaseCheck(pipeline)
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
         // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
-            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
                 ignoreList = [
@@ -451,7 +451,7 @@ def launchReleaseCheck(pipeline)
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
-    stageName = "Release Check"
+    stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
@@ -605,6 +605,8 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    // Note: This function intentionally propagates exceptions to the caller.
+    // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -614,20 +616,13 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 
-    try {
-        if (githubPrApiUrl != null) {
-            diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
-        } else {
-            diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
-        }
-        pipeline.echo("The change of ${filePath} is: ${diff}")
-        return diff
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception e) {
-        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
-        return ""
+    if (githubPrApiUrl != null) {
+        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+    } else {
+        diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
 }
 
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
@@ -699,7 +694,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/nanobind/",
         "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
         "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
@@ -717,12 +712,14 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
@@ -742,6 +739,12 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "tests/integration/defs/accuracy/test_disaggregated_serving.py",
+        "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
+        "tests/integration/defs/examples/test_ray.py",
+        "tests/integration/defs/accuracy/test_llm_api_autodeploy.py",
+        "tests/unittest/llmapi/test_async_llm.py",
+        "docker/common/install_ucx.sh",
+        "docker/common/install_nixl.sh",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -835,7 +838,7 @@ def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
-        stage ("Collect test result") {
+        stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
             testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
@@ -852,7 +855,7 @@ def collectTestResults(pipeline, testFilter)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
             if (testFilter[(IS_POST_MERGE)]) {
                 try {
                     sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
@@ -865,7 +868,31 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Rerun report") {
+        stage("Collect Perf Regression Result") {
+            def yamlFiles = sh(
+                returnStdout: true,
+                script: 'find . -type f -name "regression_data.yaml" 2>/dev/null || true'
+            ).trim()
+            echo "Regression data yaml files: ${yamlFiles}"
+            if (yamlFiles) {
+                def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
+                echo "Found regression data files: ${yamlFileList}"
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml")
+                sh """
+                    python3 llm/jenkins/scripts/perf/perf_regression.py \
+                    --input-files=${yamlFileList} \
+                    --output-file=perf_regression.html
+                """
+                trtllm_utils.uploadArtifacts("perf_regression.html", "${UPLOAD_PATH}/test-results/")
+                echo "Perf regression report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_regression.html"
+            } else {
+                echo "No regression_data.yaml files found."
+            }
+        } // Collect Perf Regression Result stage
+        stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
             sh "find rerun -type f"
@@ -889,23 +916,14 @@ def collectTestResults(pipeline, testFilter)
             """
             trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
             echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
-            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-            if (env.alternativeTRT || isOfficialPostMergeJob) {
-                catchError(
-                    buildResult: 'FAILURE',
-                    stageResult: 'FAILURE') {
-                    error "Some failed tests were reruned, please check the rerun report."
-                }
-            } else {
-                catchError(
-                    buildResult: 'SUCCESS',
-                    stageResult: 'UNSTABLE') {
-                    error "Some failed tests were reruned, please check the rerun report."
-                }
+            catchError(
+                buildResult: 'SUCCESS',
+                stageResult: 'UNSTABLE') {
+                error "Some failed tests were reruned, please check the rerun report."
             }
         } // Rerun report stage
         try {
-            stage("Test coverage") {
+            stage("Test Coverage") {
                 sh "ls"
                 def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
                 sh "echo ${CUR_PATH}"
@@ -1031,14 +1049,15 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
-        "Release Check": {
+        "Release-Check": {
             script {
                 launchReleaseCheck(this)
             }
         },
-        "x86_64-linux": {
+        "x86_64-Linux": {
             script {
-                stage("Build") {
+                def testStageName = "[Build-x86_64] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
@@ -1046,7 +1065,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+
+                testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1136,24 +1156,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
             }
         },
-        "SBSA-linux": {
+        "SBSA-Linux": {
             script {
-                def jenkinsUrl = ""
-                def credentials = ""
-                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
-                def singleGpuTestFailed = false
-
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
 
-                stage("Build") {
+                def testStageName = "[Build-SBSA] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
+
+                testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
@@ -1242,7 +1261,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def dockerBuildJob = [
         "Build-Docker-Images": {
             script {
-                stage("[Build-Docker-Images] Remote Run") {
+                def testStageName = "[Build-Docker-Images] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
@@ -1269,9 +1289,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
-        stages.remove("x86_64-linux")
-        stages.remove("SBSA-linux")
-        echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
+        stages.remove("x86_64-Linux")
+        stages.remove("SBSA-Linux")
+        echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
@@ -1339,11 +1359,11 @@ pipeline {
                 }
             }
         }
-        stage("Build and Test") {
+        stage("Build And Test") {
             steps {
                 script {
                     if (isReleaseCheckMode) {
-                        stage("Release Check") {
+                        stage("Release-Check") {
                             script {
                                 launchReleaseCheck(this)
                             }

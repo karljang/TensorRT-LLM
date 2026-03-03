@@ -1,13 +1,16 @@
-# Disaggregated Serving 
+# Disaggregated Serving
 
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
   - [Multi-backend Support](#Multi-backend-Support)
+  - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
+  - [Unique Global Request ID](#Unique-Global-Request-ID)
 - [Usage](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)
+  - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -38,7 +41,7 @@ In aggregated LLM serving, both the context and generation phases share the same
 
 Disaggregated serving resolves these challenges by decoupling the two phases, allowing each to run on separate GPU pools and using different parallelism strategies. This separation removes the interference between context and generation phases, as shown in Figure 2, and enables independent optimization of TTFT and TPOT. Although disaggregation incurs overhead for transferring the KV cache blocks from context to generation GPUs, the advantages can be substantial—particularly for workloads with long input sequences and moderate output lengths where interference is most severe.
 
-You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rational and design considerations of disaggregated serving.
+You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rationale and design considerations of disaggregated serving.
 
 ## KV Cache Exchange
 
@@ -52,6 +55,18 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
+
+### NIXL Backend Configuration
+
+NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Supported NIXL backends:**
+- **UCX** (default)
+- **LIBFABRIC** (available from v0.16.0)
+
+If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+
+For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
 
 ### Overlap Optimization
 
@@ -77,6 +92,14 @@ To minimize KV cache transmission latency, TensorRT LLM currently uses direct tr
 
 The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
 
+### Unique Global Request ID
+
+A disaggregated-serving request can provide a unique global request ID via `DisaggregatedParams.disagg_request_id`.
+When this field is a positive integer, the context and generation requests share that value as their internal request ID, which enables end-to-end tracking.
+To avoid collisions with worker-local or warm-up requests, it is recommended to use a value larger than `1 << 42 = 4398046511104`.
+If the field is unset or non-positive, the context and generation requests instead receive separate local sequence IDs, rotating within the range `(0, 1<<42)`, assigned by the respective workers. When `disagg_request_id` is specified, do not route the context and generation requests to the same worker.
+This field is optional at present; however, some forthcoming features will depend on this unique identifier.
+
 ## Usage
 
 ### Dynamo
@@ -100,6 +123,12 @@ For more information on how to use Dynamo with TensorRT-LLM, please refer to [th
 
 The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
 
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
+
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
@@ -118,27 +147,31 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is NIXL.
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`. The default backend is NIXL.
+
+Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable:
+- `UCX` (default)
+- `LIBFABRIC` (available from v0.16.0)
 
 `max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
-For example, you could launch two context servers and one generation servers as follows:
+For example, you could launch two context servers and one generation server as follows:
 
 ```
 
-# Generate context_extra-llm-api-config.yml
+# Generate context_config.yml
 # Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
 
 # Start Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
-# Generate gen_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+# Generate gen_config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
 
 # Start Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
@@ -167,7 +200,7 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint. For example,  you can send requests to the disaggregated server using curl:
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
 ```bash
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
@@ -183,10 +216,31 @@ curl http://localhost:8000/v1/completions \
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
 
+### Multiple Instances
+
+To increase maximum concurrency without more GPU nodes, you can deploy multiple disaggregated server instances across different nodes, while each instance manages the same context/generation servers. This is helpful when one disaggregated server becomes a performance bottleneck or runs out of ephemeral ports.
+
+Example (two-node deployment):
+
+- **Node A**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-a:8000`
+- **Node B**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-b:8000`
+- **Client entrypoint**
+  - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
+* `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
+  - `UCX` (default)
+  - `LIBFABRIC` (available from v0.16.0)
+  - If an unsupported value is specified, NIXL will automatically fall back to UCX
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
 
@@ -206,7 +260,7 @@ There are some other useful environment variables that may help when encounterin
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
-* ``UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
+* `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
 ## Troubleshooting and FAQ
 
@@ -214,7 +268,7 @@ There are some other useful environment variables that may help when encounterin
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1  are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
+A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
 
 *Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
 
@@ -233,6 +287,15 @@ A. Yes, but it's not recommended. TRT-LLM does not implement optimal scheduling 
 A. Yes, it's recommended that different server instances use different GPUs. We support running context and generation servers on the same node or different nodes. The `CUDA_VISIBLE_DEVICES` env variable can be used to control which GPUs are used by each instance.
 
 ### Debugging FAQs
+
+*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
+
+A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+
+1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
+2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+
+Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 

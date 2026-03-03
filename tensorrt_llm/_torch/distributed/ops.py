@@ -2,14 +2,16 @@ import math
 import os
 import platform
 import threading
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -63,14 +65,12 @@ def get_or_scale_allreduce_mnnvl_workspace(
     """
 
     NUM_LAMPORT_BUFFERS = 3
-    if not hasattr(_thread_local,
-                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
-                {})
+
+    # Use MNNVLAllReduce class to share across threads
+    allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    allreduce_mnnvl_workspaces = getattr(
-        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
@@ -99,19 +99,19 @@ def get_or_scale_allreduce_mnnvl_workspace(
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
             buffer_size_bytes = math.ceil(req_buffer_size_bytes /
                                           (8 * 1024 * 1024)) * (8 * 1024 * 1024)
-            if mapping.tp_rank == 0:
-                logger.debug(
-                    f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
-                )
+            logger.debug(
+                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
+            )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
         mcast_buf_handle = McastGPUBuffer(
             workspace_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
             use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+            comm.py2f(),  # Fortran handle for the MPI communicator
         )
 
         # We use per FP32 element in the buffer for lamport sync
@@ -363,6 +363,84 @@ def alltoall_helix(
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
 
 
+class HelixAllToAllNative:
+    """
+    Manager for Helix All-to-All operations with MNNVL workspace management.
+
+    Exchanges data along the cp_size dimension:
+    - partial_o: [..., cp_size, kv_lora_rank] half-precision
+    - softmax_stats: [..., cp_size, 2] float32
+    """
+
+    # Global cache: mapping -> instance
+    _cache: Dict[Mapping, "HelixAllToAllNative"] = {}
+
+    def __init__(self, mapping: Mapping, workspace: HelixCpMnnvlMemory,
+                 workspace_tensor: torch.Tensor):
+        """Private constructor - use get() instead."""
+        self.mapping = mapping
+        self.workspace = workspace
+        self.workspace_tensor = workspace_tensor
+
+    @staticmethod
+    def get(mapping: Mapping) -> "HelixAllToAllNative":
+        """
+        Get or create a HelixAllToAllNative instance for the given configuration.
+
+        Args:
+            mapping: TensorRT-LLM mapping object containing cp_size and cp_rank
+
+        Returns:
+            Cached or newly-created HelixAllToAllNative instance
+        """
+        if mapping not in HelixAllToAllNative._cache:
+            logger.info(
+                f"Rank {mapping.cp_rank} initializing HelixCpMnnvlMemory for Helix"
+            )
+            MnnvlMemory.initialize()
+
+            # Get workspace size (in bytes)
+            workspace_size_per_rank = _tllm_internal.thop.get_helix_workspace_size_per_rank(
+                mapping.cp_size)
+
+            # Allocate MNNVL memory using CP communicator for Helix
+            workspace = HelixCpMnnvlMemory(mapping, workspace_size_per_rank)
+            workspace_tensor = workspace.as_torch_strided_tensor(torch.uint64)
+
+            torch.ops.trtllm.initialize_helix_workspace(workspace_tensor,
+                                                        mapping.cp_rank,
+                                                        mapping.cp_size)
+            torch.cuda.synchronize()
+            HelixCpMnnvlMemory.get_comm(mapping).barrier()
+
+            HelixAllToAllNative._cache[mapping] = HelixAllToAllNative(
+                mapping, workspace, workspace_tensor)
+
+        return HelixAllToAllNative._cache[mapping]
+
+    def alltoall_native(self, partial_o: torch.Tensor,
+                        softmax_stats: torch.Tensor):
+        """
+        Perform all-to-all data exchange.
+
+        Args:
+            partial_o: Tensor with shape [..., cp_size, kv_lora_rank], dtype half.
+            softmax_stats: Tensor with shape [..., cp_size, 2], dtype float32.
+
+        Returns:
+            Tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs.
+        """
+        partial_o_out, softmax_stats_out = torch.ops.trtllm.alltoall_helix_native(
+            partial_o,
+            softmax_stats,
+            self.workspace_tensor,
+            self.mapping.cp_rank,
+            self.mapping.cp_size,
+        )
+
+        return partial_o_out, softmax_stats_out
+
+
 def reducescatter(
     input: Union[torch.Tensor, List[torch.Tensor]],
     mapping: Mapping,
@@ -437,6 +515,7 @@ class MNNVLAllReduce(nn.Module):
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
     for certain operations when using NVLink for multi-node communication.
     """
+    allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
@@ -450,7 +529,7 @@ class MNNVLAllReduce(nn.Module):
             )
 
         # Initialize the workspace
-        _ = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
 
     @staticmethod
     def get_supported_dtypes():
@@ -612,7 +691,6 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
-
         if self.mapping.tp_size > 1:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
@@ -708,6 +786,7 @@ class AllReduce(nn.Module):
         input = input.contiguous()  # Underlying op requires contiguous input
 
         allreduce_strategy = self.strategy
+
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
@@ -751,21 +830,42 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-        output = self.all_reduce_op(
-            input=input,
-            residual=all_reduce_params.residual,
-            norm_weight=all_reduce_params.norm_weight,
-            scale=all_reduce_params.scale,
-            bias=all_reduce_params.bias,
-            workspace=self.workspace,
-            group=self.mapping.tp_group,
-            strategy=allreduce_strategy,
-            op=all_reduce_params.fusion_op,
-            eps=all_reduce_params.eps,
-            trigger_completion_at_end=all_reduce_params.
-            trigger_completion_at_end,
-            **additional_args,
-        )
+        # In case that AutoTuner brings potential perf regression
+        # TODO: Remove this if no perf regression is observed.
+        disable_allreduce_autotune = os.environ.get(
+            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+
+        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+            output = torch.ops.trtllm.tunable_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+            )
+        else:
+            output = self.all_reduce_op(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                scale=all_reduce_params.scale,
+                bias=all_reduce_params.bias,
+                workspace=self.workspace,
+                group=self.mapping.tp_group,
+                strategy=allreduce_strategy,
+                op=all_reduce_params.fusion_op,
+                eps=all_reduce_params.eps,
+                trigger_completion_at_end=all_reduce_params.
+                trigger_completion_at_end,
+                **additional_args,
+            )
 
         return output if len(output) > 1 else output[0]
 
@@ -859,3 +959,126 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+def all_to_all_4d(
+    input: torch.Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    All-to-all for 4D tensors (batch, seq, heads, head_dim).
+
+    Redistributes a 4D tensor along two dimensions using all-to-all communication.
+    This is used for Ulysses-style sequence parallelism to transform between:
+    - Sequence sharding [B, S/P, H, D] → Head sharding [B, S, H/P, D]
+    - Head sharding [B, S, H/P, D] → Sequence sharding [B, S/P, H, D]
+
+    Args:
+        input: Input tensor with shape [batch, seq, heads, head_dim]
+        scatter_dim: Dimension to split and scatter (1 for seq, 2 for heads)
+        gather_dim: Dimension to gather (1 for seq, 2 for heads)
+        process_group: PyTorch distributed process group. If None, uses default process group.
+
+    Returns:
+        Redistributed tensor with same shape as input
+
+    Example:
+        # Transform from sequence sharding to head sharding
+        # Input: [B, S/P, H, D] (each rank has S/P sequence)
+        output = all_to_all_4d(input, scatter_dim=2, gather_dim=1, process_group=pg)
+        # Output: [B, S, H/P, D] (each rank has H/P heads)
+
+        # Transform back from head sharding to sequence sharding
+        output = all_to_all_4d(input, scatter_dim=1, gather_dim=2, process_group=pg)
+    """
+    # Only support PyTorch distributed mode (not MPI mode)
+    if not mpi_disabled():
+        raise NotImplementedError(
+            "all_to_all_4d currently only supports PyTorch distributed mode. "
+            "MPI mode is not supported.")
+
+    # Get world size from process group
+    world_size = torch.distributed.get_world_size(group=process_group)
+
+    # If world_size is 1, no communication needed
+    if world_size == 1:
+        return input
+
+    # Validate dimensions
+    assert scatter_dim in [1, 2], "scatter_dim must be 1 (seq) or 2 (heads)"
+    assert gather_dim in [1, 2], "gather_dim must be 1 (seq) or 2 (heads)"
+    assert scatter_dim != gather_dim, "scatter_dim and gather_dim must be different"
+
+    batch, seq, heads, head_dim = input.shape
+
+    # Validate that the scatter dimension is divisible by world_size
+    scatter_size = input.shape[scatter_dim]
+    assert scatter_size % world_size == 0, \
+        f"Dimension {scatter_dim} size {scatter_size} must be divisible by world_size {world_size}"
+
+    # For all-to-all, we need to:
+    # 1. Split input along scatter_dim into world_size chunks
+    # 2. Send chunk i to rank i
+    # 3. Receive chunk from each rank and concatenate along gather_dim
+
+    # Reshape for all-to-all: move scatter_dim chunks to a new dimension
+    if scatter_dim == 1:  # Scatter along seq dimension
+        # [B, S, H, D] -> [B, P, S/P, H, D] where P = world_size
+        input_reshaped = input.view(batch, world_size, seq // world_size, heads,
+                                    head_dim)
+        # Transpose to group by destination rank: [B, P, S/P, H, D] -> [P, B, S/P, H, D]
+        input_transposed = input_reshaped.permute(1, 0, 2, 3, 4).contiguous()
+    else:  # scatter_dim == 2, scatter along heads dimension
+        # [B, S, H, D] -> [B, S, P, H/P, D] where P = world_size
+        input_reshaped = input.view(batch, seq, world_size, heads // world_size,
+                                    head_dim)
+        # Transpose to group by destination rank: [B, S, P, H/P, D] -> [P, B, S, H/P, D]
+        input_transposed = input_reshaped.permute(2, 0, 1, 3, 4).contiguous()
+
+    # Flatten to [P * ...] for all-to-all communication
+    # Shape: [P, B, ...] -> [P * B * ...]
+    input_flat = input_transposed.flatten()
+    output_flat = torch.empty_like(input_flat)
+
+    # Perform all-to-all communication using PyTorch distributed
+    # all_to_all_single splits input into world_size chunks and exchanges them
+    torch.distributed.all_to_all_single(output_flat,
+                                        input_flat,
+                                        group=process_group)
+
+    # Reshape output back to [P, B, ...] form
+    output_transposed = output_flat.view_as(input_transposed)
+
+    # Transpose back and reshape to final form
+    if gather_dim == 1:  # Gather along seq dimension
+        # [P, B, S/P, H, D] -> [B, P, S/P, H, D]
+        output_reshaped = output_transposed.permute(1, 0, 2, 3, 4).contiguous()
+        # [B, P, S/P, H, D] -> [B, S, H, D] where S = P * (S/P)
+        # When scattering heads and gathering seq: seq needs to be multiplied, heads needs to be divided
+        if scatter_dim == 2:
+            # Scattered heads, so we have H/P heads and need to gather S/P -> S sequence
+            gathered_seq = seq * world_size
+            sharded_heads = heads // world_size
+            output = output_reshaped.view(batch, gathered_seq, sharded_heads,
+                                          head_dim)
+        else:
+            # Scattered seq (should be impossible if gather_dim == 1), keep as is
+            output = output_reshaped.view(batch, seq, heads, head_dim)
+    else:  # gather_dim == 2, gather along heads dimension
+        # [P, B, S, H/P, D] -> [B, S, P, H/P, D]
+        output_reshaped = output_transposed.permute(1, 2, 0, 3, 4).contiguous()
+        # [B, S, P, H/P, D] -> [B, S, H, D] where H = P * (H/P)
+        # When scattering seq and gathering heads: heads needs to be multiplied, seq needs to be divided
+        if scatter_dim == 1:
+            # Scattered seq, so we have S/P seq and need to gather H/P -> H heads
+            gathered_heads = heads * world_size
+            sharded_seq = seq // world_size
+            output = output_reshaped.view(batch, sharded_seq, gathered_heads,
+                                          head_dim)
+        else:
+            # Scattered heads (should be impossible if gather_dim == 2), keep as is
+            output = output_reshaped.view(batch, seq, heads, head_dim)
+
+    return output
