@@ -257,6 +257,11 @@ class Qwen3TTSTalkerForCausalLM(DecoderModelForCausalLM[Qwen3TTSTalkerModel, obj
     autoregressive generation of codebook-0 tokens.
     """
 
+    # HF → TRT-LLM weight key remapping
+    _WEIGHT_REMAP = {
+        "model.codec_embedding.weight": "model.embed_tokens.weight",
+    }
+
     def __init__(self, model_config: ModelConfig) -> None:
         super().__init__(
             Qwen3TTSTalkerModel(model_config),
@@ -264,6 +269,14 @@ class Qwen3TTSTalkerForCausalLM(DecoderModelForCausalLM[Qwen3TTSTalkerModel, obj
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
+
+    def load_weights(self, weights, weight_mapper=None, **kwargs):
+        """Load weights with HF → TRT-LLM key remapping."""
+        remapped = {}
+        for key, value in weights.items():
+            new_key = self._WEIGHT_REMAP.get(key, key)
+            remapped[new_key] = value
+        super().load_weights(remapped, weight_mapper, **kwargs)
 
 
 # ---------------------------------------------------------------------------
