@@ -65,11 +65,21 @@ class Qwen3TTSTalkerAttention(QKNormRoPEAttention):
         # M-RoPE configuration (same pattern as Qwen3-VL)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None:
-            pos_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
             mrope_section = rope_scaling.get("mrope_section", None)
             mrope_interleaved = rope_scaling.get("interleaved", False)
+
+            # Qwen3-TTS config has rope_type="default" with mrope_section,
+            # which means M-RoPE with no additional scaling. Override the
+            # type field so RopeParams.from_config doesn't fail on "default".
+            if mrope_section and rope_scaling.get("type") == "default":
+                config.rope_scaling = dict(rope_scaling)
+                config.rope_scaling["type"] = "mrope"
+                config.rope_scaling["rope_type"] = "mrope"
+
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string("mrope" if mrope_section else pos_type),
+                type=PositionEmbeddingType.mrope
+                if mrope_section
+                else PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
                 mrope_section=mrope_section,
                 mrope_interleaved=mrope_interleaved,
