@@ -763,16 +763,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     def _validate_layout(
         self,
-        position_ids: torch.Tensor,
+        sequence_length: int,
         token_tags: torch.Tensor,
         timestep_indices: torch.Tensor,
         timestep: torch.Tensor,
     ) -> None:
-        if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
-            raise ValueError(
-                f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
-            )
-        sequence_length = position_ids.shape[0]
+        """Range-check the packed layout; the fused AdaLN kernels gather ``mod[idx]`` without bounds checks."""
         if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
             raise ValueError(
                 "token_tags and timestep_indices must match the packed sequence length."
@@ -814,10 +810,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 raise ValueError("position_ids is required when static_context is not provided.")
             sequence_length = static_context.sequence_length
         else:
+            if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+                raise ValueError(
+                    f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
+                )
             sequence_length = position_ids.shape[0]
-            self._validate_layout(
-                position_ids, token_tags, timestep_indices, conditioning_timesteps
-            )
+        self._validate_layout(sequence_length, token_tags, timestep_indices, conditioning_timesteps)
 
         if static_context is None:
             if encoder_hidden_states is None or position_ids is None:
@@ -827,10 +825,6 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             static_context = self.prepare_static_context(
                 encoder_hidden_states,
                 position_ids,
-            )
-        elif token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
-            raise ValueError(
-                "token_tags and timestep_indices must match the cached packed sequence length."
             )
 
         if static_context.sequence_length != sequence_length:

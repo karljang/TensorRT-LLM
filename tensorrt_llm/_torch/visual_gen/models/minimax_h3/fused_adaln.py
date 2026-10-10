@@ -18,8 +18,9 @@
     gate_res_norm_mod:  x1     = x + gate[idx] * a
                         m      = rmsnorm(x1) * (1 + scale[idx]) + shift[idx]        -> (x1, m)
 
-``idx`` must hold one row index per sequence position, each below ``mod.shape[0]`` (the model validates
-its layout once per request; the kernel does not bounds-check the gather).
+``idx`` must hold one row index per sequence position, each below ``mod.shape[0]`` (the transformer
+range-checks ``token_tags`` and ``timestep_indices`` on every forward, cached or not; the kernel does not
+bounds-check the gather).
 ``mod`` is the AdaLN projection output viewed as ``[n_t * 3, 6 * D]`` (one row per (timestep, modality) pair, the
 six chunks shift/scale/gate for attention and MLP in order); ``idx`` maps each packed token to its row. The tables
 are read in place (no per-token materialization). Rounding points follow the compiled reference: x1 is stored in
