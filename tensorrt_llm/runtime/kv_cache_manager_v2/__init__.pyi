@@ -35,23 +35,177 @@ from typing import (
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+BAD_PAGE_INDEX: Final[int]
+GPU_LEVEL: Final[CacheLevel]
+CACHE_LEVEL1: Final[CacheLevel]
+
+class CorruptedError(Exception):
+    """Raised by every public entry point once a broken invariant has been recorded."""
+
+class CuError(Exception):
+    """A CUDA driver call failed; carries the driver's own status code."""
+
+    error_code: Any
+
+class LogicError(Exception):
+    """An operation violates the cache or batch's state and usage requirements."""
+
+class OutOfMemoryError(Exception): ...
+
+class HostOOMError(OutOfMemoryError):
+    """The host tier could not be backed by physical memory."""
+
+class DiskOOMError(OutOfMemoryError):
+    """The disk tier's backing file could not be grown."""
+
+class CuOOMError(OutOfMemoryError):
+    """A CUDA allocation failed for want of device memory."""
+
+class OutOfPagesError(Exception): ...
+
+def poison_reason() -> str | None:
+    """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
+
+def take_poison() -> str | None:
+    """Report the recorded violation and clear it, but only once no manager is alive."""
+
+def num_live_managers() -> int:
+    """Number of constructed, not-yet-destroyed managers."""
 
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
 
+class PageStatus(enum.Enum):
+    LOCKED = enum.auto()
+    HELD = enum.auto()
+    DROPPABLE = enum.auto()
+
+class PageIndexMode(enum.IntEnum):
+    SHARED = 0
+    PER_LAYER = 1
+
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
+
+class AttnLifeCycle:
+    """The attention life cycle, keyed by window, sink tokens, sparsity, and reuse policy."""
+
+    def __init__(
+        self,
+        window_size: int | None,
+        num_sink_blocks: int,
+        is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
+    ) -> None: ...
+    @staticmethod
+    def make(
+        window_size: int | None,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
+    ) -> "AttnLifeCycle": ...
+    @property
+    def window_size(self) -> int | None: ...
+    @property
+    def num_sink_blocks(self) -> int: ...
+    @property
+    def is_sparse(self) -> bool: ...
+    @property
+    def reuse_policy(self) -> AttentionReusePolicy: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
+
+class PlannedDropHandle:
+    def drop(self) -> None: ...
+
+class ReuseScope(NamedTuple):
+    lora_id: int | None = None
+    salt: int | None = None
+
+SlidingWindowSize: TypeAlias = int | None
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
+PoolIndex = NewType("PoolIndex", int)
+
+# From _storage_manager.py
+class StorageStatistics:
+    """Independent per-pool storage counts returned by the manager."""
+
+    @property
+    def slot_sizes(self) -> list[int]: ...
+    @property
+    def total(self) -> int: ...
+    @property
+    def free(self) -> int: ...
+    @property
+    def evictable(self) -> int: ...
+    @property
+    def available(self) -> int: ...
+    @property
+    def unavailable(self) -> int: ...
+
+# From _stats.py
+@dataclass(slots=True)
+class KVCacheStatsDelta:
+    alloc_total_blocks: int = 0
+    alloc_new_blocks: int = 0
+    reused_blocks: int = 0
+    missed_blocks: int = 0
+
+@dataclass(slots=True)
+class KVCacheIterationStatsDelta:
+    iter_alloc_total_blocks: int = 0
+    iter_alloc_new_blocks: int = 0
+    iter_reused_blocks: int = 0
+    iter_full_reused_blocks: int = 0
+    iter_partial_reused_blocks: int = 0
+    iter_missed_blocks: int = 0
+    iter_gen_alloc_blocks: int = 0
+    iter_onboard_blocks: int = 0
+    iter_onboard_bytes: int = 0
+    iter_offload_blocks: int = 0
+    iter_offload_bytes: int = 0
+    iter_intra_device_copy_blocks: int = 0
+    iter_intra_device_copy_bytes: int = 0
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
+
+@dataclass(slots=True)
+class ReusedBlocksByLevel:
+    """Reuse block counts split by the cache level the reused pages were resident on.
+
+    Indices are CacheLevel values, so entry i is the i-th configured tier.
+    """
+
+    full: list[int]
+    partial: list[int]
+
+class SsmSnapshotIterationStatsDelta:
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+    @property
+    def iter_snapshot_hit_rate(self) -> float: ...
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -60,21 +214,23 @@ class CacheTierConfig(Protocol):
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class HostCacheTierConfig:
     quota: int
+    max_quota: int | None = None
+    allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class DiskCacheTierConfig:
@@ -82,20 +238,19 @@ class DiskCacheTierConfig:
     path: str
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    is_sparse: bool = False
 
-@dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    helix_shard_size: int
-    shared_comm_port: int
+class AttentionReusePolicy(enum.IntEnum):
+    REQUIRED = 0
+    PRIVATE = 1
+    OPTIONAL = 2
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -103,22 +258,212 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
     @property
     def window_size(self) -> int | None: ...
 
 @dataclass(slots=True)
+class SsmLayerConfig:
+    layer_id: LayerId
+    buffers: list[BufferConfig]
+
+LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+@dataclass(slots=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+    beam_width: int = 1
+    prompt_length: int = 0
+
+@dataclass(slots=True)
+class BatchDesc:
+    kv_caches: list[KVCacheDesc]
+    system_prompt_length: int = 0
+
+@dataclass(slots=True)
+class SwaScratchReuseConfig:
+    max_rewind_len: int = 0
+
+@dataclass(slots=True)
+class PoolRebalanceConfig:
+    min_sampled_kv_caches: int = 2000
+    cooldown_secs: float = 120.0
+    target_ratio_update_interval: int = 100
+    ratio_tolerance: float = 0.25
+    moving_average_decay: float = 0.9999
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
-    vocab_size: int
     cache_tiers: list[CacheTierConfig]
-    layers: list[AttentionLayerConfig]
+    layers: list[LayerConfig]
     max_util_for_resume: float = ...
-    helix_config: HelixConfig | None = None
+    enable_partial_reuse: bool = True
+    # Tokens trimmed off the tail of every prefix match; nonzero only for a pool
+    # that also holds state reading that many tokens ahead of each position.
+    reuse_match_backoff: int = 0
+    constraints: list[BatchDesc] = ...
+    typical_step: BatchDesc | None = None
+    # One positive, normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    # layer-group slot-count proportions.
+    initial_pool_ratio: list[float] | None = None
+    swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    commit_min_snapshot: bool = False
+    enable_stats: bool = True
+    text_only: bool = False
+    enable_partial_commit: bool = True
+    pool_rebalance: PoolRebalanceConfig = ...
+    @property
+    def enable_swa_scratch_reuse(self) -> bool: ...
 
-# From _block_radix_tree.py
-def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+# From _event_manager.py
+EventBlockHash: TypeAlias = int | str
+BlockHashLike: TypeAlias = bytes | EventBlockHash
+BlockHashesLike: TypeAlias = BlockHashLike | Iterable[BlockHashLike]
+EventTokenId: TypeAlias = int | str
+MmKey: TypeAlias = tuple[bytes, int] | tuple[bytes, int, str | None]
+AttentionDpGatherFn: TypeAlias = Callable[[list["KVCacheEvent"]], list[list["KVCacheEvent"]]]
+
+@dataclass(slots=True, frozen=True)
+class UniqueToken:
+    token_id: EventTokenId
+    token_extra_id: int = ...
+
+@dataclass(slots=True, frozen=True)
+class KVCacheCreatedData:
+    num_blocks_per_cache_level: list[int]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredBlockData:
+    block_hash: EventBlockHash
+    tokens: list[UniqueToken]
+    cache_level: int
+    priority: int
+    mm_keys: list[MmKey] = ...
+    cache_salt: str | None = ...
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredData:
+    parent_hash: EventBlockHash | None
+    blocks: list[KVCacheStoredBlockData]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheRemovedData:
+    block_hashes: list[EventBlockHash]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheEventDiff:
+    old_value: int
+    new_value: int
+
+@dataclass(slots=True, frozen=True)
+class KVCacheUpdatedData:
+    block_hash: EventBlockHash
+    cache_level: KVCacheEventDiff | None
+    priority: KVCacheEventDiff | None
+
+@dataclass(slots=True, frozen=True)
+class KVCacheEvent:
+    event_id: int
+    data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData
+    window_size: int
+    hash_algo: str | None = None
+    attention_dp_rank: int | None = None
+    layer_group_id: int | None = None
+
+class StreamingBlockStoredData:
+    @property
+    def lora_id(self) -> int | None: ...
+    @property
+    def block_hashes(self) -> list[int]: ...
+    @property
+    def parent_block_hash(self) -> int | None: ...
+    @property
+    def token_ids(self) -> list[EventTokenId]: ...
+    @property
+    def mm_keys(self) -> list[list[MmKey]]: ...
+
+class StreamingBlockRemovedData:
+    @property
+    def block_hashes(self) -> list[int]: ...
+
+class StreamingEventStats:
+    @property
+    def stored_blocks(self) -> int: ...
+    @property
+    def removed_blocks(self) -> int: ...
+    @property
+    def partial_blocks_suppressed(self) -> int: ...
+    @property
+    def non_target_life_cycles_ignored(self) -> int: ...
+    @property
+    def dropped_events(self) -> int: ...
+
+class StreamingEventSink:
+    def __init__(
+        self,
+        max_entries: int = ...,
+        mm_token_id_offset: int | None = None,
+    ) -> None: ...
+    def set_target_life_cycle(self, life_cycle_id: int) -> None: ...
+    def drain_iteration_events(
+        self,
+    ) -> list[StreamingBlockStoredData | StreamingBlockRemovedData]: ...
+    @property
+    def stats(self) -> StreamingEventStats: ...
+
+class KVCacheEventManager:
+    def __init__(
+        self,
+        max_kv_event_entries: int,
+        *,
+        window_size: int = ...,
+        attention_dp_rank: int | None = None,
+        attention_dp_gather: AttentionDpGatherFn | None = None,
+        hash_algo: str = ...,
+        window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
+    ) -> None: ...
+    def add_created_event(
+        self,
+        num_blocks_per_cache_level: Sequence[int],
+        layer_group_ids: Sequence[int] | None = None,
+    ) -> None: ...
+    def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None: ...
+    def add_stored_event(
+        self,
+        parent_hash: EventBlockHash | None,
+        blocks: Sequence[KVCacheStoredBlockData],
+        layer_group_id: int | None = None,
+    ) -> None: ...
+    def add_stored_block_event_from_block(self, block: Any) -> None: ...
+    def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None: ...
+    def add_removed_event(self, block_hashes: BlockHashesLike) -> None: ...
+    def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None: ...
+    def add_updated_event(
+        self,
+        block_hash: BlockHashLike,
+        *,
+        cache_level: KVCacheEventDiff | None = None,
+        priority: KVCacheEventDiff | None = None,
+        layer_group_id: int | None = None,
+    ) -> None: ...
+    def flush_iteration_events(self) -> None: ...
+    def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
+
+# Native key builders, shared with the radix tree so routing hashes match the engine's.
+def gen_multimodal_cache_key_tokens(
+    id_offset: int,
+    multi_modal_data_digest: bytes,
+    num_tokens: int,
+    token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
+def sequence_to_blockchain_keys(
+    tokens_per_block: int,
+    reuse_scope: ReuseScope,
+    tokens: Sequence[TokenIdExt],
+) -> Iterator[tuple[list[TokenIdExt], bytes]]: ...
 
 # From _core/_kv_cache.py
 class _Status(enum.Enum):
@@ -126,7 +471,107 @@ class _Status(enum.Enum):
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
 
+KvCacheStatus: TypeAlias = _Status
+
 IndexSeq = array.array[int] | memoryview[int]
+
+class BatchDeviceArray:
+    """DLPack view of int32 CUDA metadata; the view keeps its allocation alive.
+
+    Treat these arrays as read-only. Convert with ``torch.from_dlpack(view)`` or
+    another DLPack consumer, after publication. Holding a view does not pin KV pages.
+    """
+
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+    def __dlpack__(self, stream: int | None = None, **kwargs: object) -> object: ...
+
+class Batch:
+    """Stable request slots and raw GPU metadata across all layer groups.
+
+    Membership is non-owning and exclusive. Closing/destroying a request removes
+    it; closing/destroying the batch detaches live requests without closing them.
+    Use the requests' owning thread. ``publish`` runs outside graph capture after
+    mutations; ``wait_ready`` orders readers after upload and KV-copy completion.
+    Call ``record_read`` after submitting reads (or graph replay), before mutating,
+    suspending, removing, or closing requests. Device addresses remain stable.
+    """
+
+    def __init__(
+        self, manager: KVCacheManager, max_rows: int, max_blocks: int, max_beam_width: int = 1
+    ) -> None:
+        """Allocate fixed device tables. Currently supports beam width 1."""
+    @property
+    def max_rows(self) -> int: ...
+    @property
+    def max_blocks(self) -> int: ...
+    @property
+    def max_beam_width(self) -> int: ...
+    @property
+    def num_layer_groups(self) -> int: ...
+    @property
+    def dirty_rows(self) -> list[int]: ...
+    def add(self, kv_cache: _KVCache, row: int | None = None) -> int: ...
+    def remove(self, kv_cache: _KVCache) -> None: ...
+    def close(self) -> None: ...
+    def publish(self, cuda_stream: CudaStream) -> list[int]:
+        """Queue dirty rows and return their slots. Failures stay dirty; retry before reading."""
+    def wait_ready(self, cuda_stream: CudaStream) -> None: ...
+    def record_read(self, cuda_stream: CudaStream) -> None: ...
+    def resize(
+        self,
+        capacities: list[int | None],
+        history_lengths: list[int | None],
+        cuda_stream: CudaStream,
+    ) -> list[bool | None]:
+        """Lists use stable row slots. Return per-request success (None for holes), then publish."""
+    def page_table(self, layer_group_id: LayerGroupId) -> BatchDeviceArray:
+        """Raw slot IDs, shape [max_rows, max_beam_width, max_blocks]; preserves BAD_PAGE_INDEX."""
+    def num_blocks(self, layer_group_id: LayerGroupId) -> BatchDeviceArray:
+        """Eligible history counts, shape [max_rows, max_beam_width]; zero for inactive/dense rows."""
+
+class PageStorageSnapshot:
+    """Copied host metadata for one layer group and beam; indices are raw mixed-tier slot IDs.
+
+    ``BAD_PAGE_INDEX`` is preserved and has no cache level. Eligibility is zero for
+    prefill, inactive requests and dense groups. Readiness events are retained internally;
+    they do not pin storage. Use indices only while the request is active and the version
+    matches. Submit reads on the request's stream, or call ``record_page_storage_read``
+    after submission on another stream, before mutating or closing the request.
+    """
+
+    @property
+    def version(self) -> int: ...
+    @property
+    def row(self) -> int | None: ...
+    @property
+    def base_page_indices(self) -> list[int]: ...
+    @property
+    def cache_levels(self) -> list[CacheLevel | None]: ...
+    @property
+    def eligible_history_blocks(self) -> int: ...
+    def wait_ready(self, cuda_stream: CudaStream) -> None:
+        """Queue copy-completion waits without blocking the CPU or uploading metadata."""
+
+class ReuseGroupStatus:
+    """Group availability at the initial prefix claim, not subsequent request progress."""
+
+    # Lifecycle group from get_layer_group_id(layer_id), not a physical pool index.
+    @property
+    def group_id(self) -> LayerGroupId: ...
+    # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
+    @property
+    def policy(self) -> AttentionReusePolicy: ...
+    # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
+    @property
+    def endpoint(self) -> int: ...
+    # All needed state is available, not necessarily on GPU or selected for reuse.
+    # False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    @property
+    def complete(self) -> bool: ...
+    # Retained [begin, end) ranges, including block-rounded SWA windows and sinks.
+    # SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    @property
+    def coverage(self) -> Sequence[tuple[int, int]]: ...
 
 class _KVCache:
     Status: ClassVar[Type[_Status]]
@@ -134,13 +579,13 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_scope: ReuseScope,
+        reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
-    ) -> None: ...
-    def set_page_index_buf(
-        self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -152,15 +597,22 @@ class _KVCache:
     @cuda_stream.setter
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
-    def finish_event(self) -> Any: ...
-    @property
     def num_blocks(self) -> int: ...
+    def commit_pending_stats(self) -> KVCacheStatsDelta: ...
+    def discard_pending_stats(self) -> None: ...
     def close(self) -> None: ...
     @property
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
-    def beam_width(self, beam_width: BeamIndex) -> None: ...
-    def get_page_indices(self, layer_group_id: int, beam_id: BeamIndex = ...) -> IndexSeq: ...
+    def beam_width(self, beam_width: BeamIndex) -> None:
+        """Expand before the first generation step, never during generation (C++ only).
+
+        First resume the cache and materialize prompt storage (or prepare synthetic
+        warmup state). Full prompt blocks are shared; the writable tail, including
+        preallocated blocks, is copied using the boundary set by
+        ``expected_prompt_length`` at cache creation.
+        """
+        ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
@@ -183,12 +635,60 @@ class _KVCache:
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
+        is_end: bool = False,
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
+    @property
+    def cached_tokens_by_level(self) -> list[int]: ...
+    def _get_last_cached_token_level(self) -> int | None: ...
+    @property
+    def reuse_status(self) -> Sequence[ReuseGroupStatus]: ...
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]: ...
+    @property
+    def reuse_scope(self) -> ReuseScope: ...
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
-    def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
+    def resume(
+        self,
+        cuda_stream: CudaStream | None = None,
+        is_decoding: bool | None = None,
+        optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+    ) -> bool: ...
+    def enter_decode(self) -> bool: ...
+    @property
+    def is_decoding(self) -> bool: ...
+    @property
+    def page_storage_version(self) -> int: ...
+    @property
+    def page_storage_dirty(self) -> bool: ...
+    @property
+    def page_storage_row(self) -> int | None: ...
+    def bind_page_storage_row(self, row: int | None) -> None:
+        """Bind a standalone consumer's row; Batch members must use Batch.add/remove."""
+    def acknowledge_page_storage(self, version: int) -> bool:
+        """Clear dirty state after all groups/beams use this same version, if it is still current."""
+    def get_page_storage_snapshot(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> PageStorageSnapshot:
+        """Read the final state under the manager lock, including after a failed operation's rollback."""
+    def record_page_storage_read(self, cuda_stream: CudaStream) -> None:
+        """Join submitted reader work into the active request's stream before any cache mutation."""
+    def prefetch(self, target: CacheLevel) -> bool: ...
+    def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
+    @property
+    def has_scratch_slots(self) -> bool: ...
+    @property
+    def enable_swa_scratch_reuse(self) -> bool: ...
+    @enable_swa_scratch_reuse.setter
+    def enable_swa_scratch_reuse(self, enable: bool) -> None: ...
+    @property
+    def text_only(self) -> bool: ...
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None: ...
+    def supports_index_mode(self, mode: PageIndexMode) -> bool: ...
     @property
     def status(self) -> _Status: ...
     @property
@@ -197,14 +697,10 @@ class _KVCache:
     def tokens_per_block(self) -> int: ...
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolDesc:
-    base: MemAddress
-    page_size: int
-
-@dataclass(slots=True, frozen=True)
-class MemoryPoolGroupDesc:
-    num_pages: int
-    pools: Sequence[MemoryPoolDesc]
+class PoolDesc:
+    pool_index: PoolIndex
+    base_address: MemAddress
+    slot_bytes: int
 
 class BufferId(NamedTuple):
     layer_id: LayerId
@@ -228,20 +724,92 @@ class AggregatedPageDesc:
     layer_group_id: LayerGroupId
     buffers: Sequence[ExpandedBuffer]
 
+@dataclass(slots=True, frozen=True)
+class CoalescedBuffer:
+    single_buffer_size: int
+    buffer_ids: Sequence[BufferId]
+    @property
+    def size(self) -> int: ...
+    @property
+    def num_buffers(self) -> int: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDescVariant:
+    coalesced_buffers: Sequence[CoalescedBuffer]
+    @property
+    def layer_group_id(self) -> LayerGroupId: ...
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDesc:
+    variants: Sequence[SlotDescVariant]
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupDesc:
+    pool_group_index: PoolGroupIndex
+    num_slots: int
+    slot_desc: SlotDesc
+    pools: Sequence[PoolDesc]
+
 # From _core/_kv_cache_manager.py
+class HalfOpenRange:
+    def __init__(self, beg: int, end: int) -> None: ...
+    @property
+    def beg(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    def __bool__(self) -> bool: ...
+    def __len__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+
+@dataclass(slots=True, frozen=True)
+class ScratchDesc:
+    range: HalfOpenRange
+    slot_ids: Sequence[int]
+    def __bool__(self) -> bool: ...
+
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
     expansion: int
+    layer_offset: int
 
-    def __call__(self, base_index: int) -> Iterator[int]: ...
+    def __call__(
+        self,
+        base_indices: Sequence[int],
+        index_mode: PageIndexMode | None = None,
+        scratch: ScratchDesc | None = None,
+    ) -> list[int]: ...
+
+class IKvCacheColdPageCodec: ...
+
+def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
+    """Create the default lossless cold-page codec.
+
+    Passing ``cold_page_codec=None`` to ``KVCacheManager`` already selects this codec, so normal users do not need to
+    call this factory. It is primarily provided to demonstrate how a native codec factory exposes an owning
+    ``IKvCacheColdPageCodec`` object for transfer into ``KVCacheManager``. Any ``KVCacheManager`` construction attempt
+    consumes an explicitly supplied codec, including an attempt that fails.
+    """
 
 class KVCacheManager:
-    def __init__(self, config: KVCacheManagerConfig) -> None: ...
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: KVCacheEventManager | StreamingEventSink | None = None,
+        cold_page_codec: IKvCacheColdPageCodec | None = None,
+    ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
-    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress: ...
+    def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
+        """Whether the named buffer uses sparse attention. Rejects unknown buffers."""
+    def get_mem_pool_base_address(
+        self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
+    ) -> MemAddress: ...
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
@@ -250,21 +818,80 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        lora_task_id: int | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
-    ) -> _KVCache: ...
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
+    ) -> _KVCache:
+        """Create a suspended cache with a prefill-to-generation boundary.
+
+        On the C++ backend, ``expected_prompt_length`` also determines which full
+        prompt blocks are shared by beams. Pass the actual full prompt length for
+        beam search if ``input_tokens`` is absent or shortened for reuse matching.
+        It defaults to the non-empty input length; without either value, the beam
+        sharing boundary is zero and the statistics boundary is unset. When set,
+        it also marks generation-phase allocation stats.
+        """
+        ...
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int: ...
+    def probe_first_new_block_key(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> bytes | None: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
+    def get_life_cycle_pool_group_indices(
+        self, cache_level: CacheLevel = ...
+    ) -> list[PoolGroupIndex]: ...
+    def get_committed_stats(self) -> KVCacheStatsDelta: ...
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]: ...
+    def record_request_suspended(self) -> None: ...
+    def record_request_resumed(self) -> None: ...
+    def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]: ...
+    def get_and_reset_iteration_disk_prefetch_blocks(self) -> int: ...
+    def get_and_reset_iteration_cached_tokens_by_level(self) -> list[int]: ...
+    def get_and_reset_iteration_reused_blocks_by_level(
+        self,
+    ) -> dict[LifeCycleId, ReusedBlocksByLevel]: ...
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> Sequence[PoolGroupPeakBlockStats]: ...
+    def get_and_reset_iteration_peak_block_stats_by_level(
+        self,
+    ) -> Sequence[Sequence[PoolGroupPeakBlockStats]]: ...
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
     def tokens_per_block(self) -> int: ...
     @property
+    def event_manager(self) -> Any | None: ...
+    @property
+    def init_config(self) -> KVCacheManagerConfig: ...
+    @property
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
+    @property
+    def enable_partial_commit(self) -> bool: ...
+    def supports_index_mode(self, mode: PageIndexMode) -> bool | None: ...
     @property
     def num_layers(self) -> int: ...
     @property
@@ -275,4 +902,14 @@ class KVCacheManager:
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
+    @property
+    def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
+    def adjust(self) -> None: ...
+    @property
+    def need_adjustment(self) -> bool: ...
+    @property
+    def commit_min_snapshot(self) -> bool: ...
+
+def exact_div(x: int, y: int) -> int: ...
+def typed_range(*args: int) -> range: ...

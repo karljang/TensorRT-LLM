@@ -61,6 +61,14 @@ class DeepSeekV32Parser(BaseToolParser):
     Reference: DeepSeek V3.2 format specification
     """
 
+    needs_raw_special_tokens = True
+
+    _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
+
+    # Invoke header up to the function name, which is arbitrary text.
+    _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+    _INVOKE_BEGIN_TEMPLATE = '<｜DSML｜invoke name="{name}">'  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -118,6 +126,8 @@ class DeepSeekV32Parser(BaseToolParser):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        if self._eos_token in text:
+            text = text.replace(self._eos_token, "")
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
@@ -127,7 +137,7 @@ class DeepSeekV32Parser(BaseToolParser):
         try:
             # Extract content between function_calls tags
             function_calls_match = re.search(
-                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
+                re.escape(self.bot_token) + r"(.*?)" + re.escape(self.eot_token),
                 text,
                 re.DOTALL,
             )
@@ -137,7 +147,7 @@ class DeepSeekV32Parser(BaseToolParser):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            invoke_pattern = self.invoke_begin_regex + r"(.*?)" + re.escape(self.invoke_end_token)
             invoke_matches = re.findall(invoke_pattern, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
@@ -161,26 +171,37 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        start_tokens = [self.bot_token, self._INVOKE_HEADER_PREFIX]
+        start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
+        has_tool_call = bool(start_indices)
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        # Hold the buffer back only while its tail could still complete into one of
+        # the DSML delimiters.
+        partial_tokens = [
+            self.bot_token,
+            self._INVOKE_HEADER_PREFIX,
+            self.eot_token,
+            self.invoke_end_token,
+            self._eos_token,
+        ]
+        ends_with_partial_token = any(
+            self._ends_with_partial_token(current_text, token) for token in partial_tokens
+        )
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
-
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+        if not has_tool_call and not ends_with_partial_token:
+            normal_text = current_text
             self._buffer = ""
-            for e_token in [self.eot_token, self.invoke_end_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+            for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
+                normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Text before the earliest start token is content, so stream it and keep the
+        # buffer from that token onwards.
+        prefix_len = min(start_indices, default=0)
+        normal_text = current_text[:prefix_len]
+        if normal_text:
+            current_text = current_text[prefix_len:]
+            self._buffer = current_text
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -191,7 +212,12 @@ class DeepSeekV32Parser(BaseToolParser):
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    pattern=(
+                        self.invoke_begin_regex
+                        + r"(.*?)("
+                        + re.escape(self.invoke_end_token)
+                        + r"|$)"
+                    ),
                     string=current_text,
                     flags=re.DOTALL,
                 )
@@ -282,15 +308,15 @@ class DeepSeekV32Parser(BaseToolParser):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger=f'<｜DSML｜invoke name="{name}">',
+            begin=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
+            end=self.invoke_end_token,
+            trigger=self._INVOKE_BEGIN_TEMPLATE.format(name=name),
         )

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +17,10 @@ import math
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import (getSMVersion, skip_pre_blackwell_unittest,
-                        unittest_name_func)
+from utils.util import (getSMVersion, isSM100Family,
+                        skip_pre_blackwell_unittest, unittest_name_func)
 
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm.quantization.utils.fp8_utils import \
     per_token_quant_and_transform
 
@@ -100,6 +101,34 @@ def test_fp8_quantize_blackwell(dtype, m, k):
                                a.cpu().to(torch.float32),
                                atol=1e-1,
                                rtol=1e-1)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100 and getSMVersion() != 90,
+    reason="Only test on Blackwell and Hopper",
+)
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_fp8_quantize_1x128_vectorized_matches_elementwise(use_ue8m0):
+    # A 16-byte aligned input takes the vectorized kernel, one 4 bytes past the
+    # boundary the element-wise kernel; both give the same bytes and scales.
+    # K = 576 ends in a partial group, M = 37 pads the scale rows.
+    m, k = 37, 576
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    a_offset = torch.empty(m * k + 2, device='cuda',
+                           dtype=torch.bfloat16)[2:].view(m, k)
+    a_offset.copy_(a)
+    fp8_a, scale_a = torch.ops.trtllm.fp8_quantize_1x128(a, use_ue8m0)
+    fp8_b, scale_b = torch.ops.trtllm.fp8_quantize_1x128(a_offset, use_ue8m0)
+    assert torch.equal(fp8_a.view(torch.uint8), fp8_b.view(torch.uint8))
+    # Hopper returns the scale buffer with unwritten padding rows.
+    num_blocks, m_padded = (k + 127) // 128, (m + 3) // 4 * 4
+    rows = m if scale_a.numel() == num_blocks * m else m_padded
+
+    def written(scale):
+        return scale.flatten()[:num_blocks * rows].view(num_blocks, rows)[:, :m]
+
+    assert torch.equal(written(scale_a), written(scale_b))
 
 
 def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
@@ -201,6 +230,129 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
 
 
+@pytest.mark.parametrize("is_sf_swizzled_layout, alignment", [(False, 512),
+                                                              (True, 32)])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_zero_rows(is_sf_swizzled_layout, alignment):
+    """No rows: empty outputs, and no launch error left for the next call."""
+    k = 2880
+    torch.random.manual_seed(0)
+    a = torch.randn([4, k], dtype=torch.bfloat16, device="cuda")
+    ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                      alignment)
+
+    empty = torch.empty([0, k], dtype=torch.bfloat16, device="cuda")
+    empty_fp8, empty_sf = torch.ops.trtllm.mxfp8_quantize(
+        empty, is_sf_swizzled_layout, alignment)
+    assert empty_fp8.shape == (0, ref_fp8.shape[1])
+    assert empty_sf.numel() == 0
+
+    # A launch error left pending by the empty call is raised by the next
+    # kernel launch, here torch.equal's.
+    a_fp8, a_sf = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout,
+                                                  alignment)
+    assert torch.equal(a_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(a_sf, ref_sf)
+
+
+def _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales):
+    m, k = hidden_states.shape
+    top_k = token_selected_experts.shape[1]
+
+    ref_x, ref_x_sf_u8 = torch.ops.trtllm.mxfp8_quantize(
+        hidden_states, False, 32)
+    ref_x_sf = ref_x_sf_u8.view(m, k // 32).view(torch.int32)
+
+    buf_rows = m + 3
+    x_out = torch.empty((buf_rows, k), dtype=torch.float8_e4m3fn, device="cuda")
+    x_sf_out = torch.empty((buf_rows, k // 128),
+                           dtype=torch.int32,
+                           device="cuda")
+    topk_idx_out = torch.empty((buf_rows, top_k),
+                               dtype=torch.int64,
+                               device="cuda")
+    topk_weights_out = torch.empty((buf_rows, top_k),
+                                   dtype=torch.float32,
+                                   device="cuda")
+
+    torch.ops.trtllm.megamoe_prepare(hidden_states, token_selected_experts,
+                                     token_final_scales, x_out, x_sf_out,
+                                     topk_idx_out, topk_weights_out)
+    torch.cuda.synchronize()
+
+    assert torch.equal(x_out[:m].view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(x_sf_out[:m], ref_x_sf)
+    assert torch.equal(topk_idx_out[:m], token_selected_experts.to(torch.int64))
+    assert torch.equal(topk_weights_out[:m],
+                       token_final_scales.to(torch.float32))
+
+
+@pytest.mark.parametrize("m", [1, 7, 128])
+@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("top_k", [1, 6])
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_matches_mxfp8_quantize(m, k, top_k):
+    torch.random.manual_seed(123)
+    hidden_states = (torch.randn([m, k], dtype=torch.float) * 16).to(
+        torch.bfloat16).cuda().contiguous()
+    token_selected_experts = torch.randint(0,
+                                           384, (m, top_k),
+                                           dtype=torch.int32,
+                                           device="cuda")
+    token_final_scales = torch.randn((m, top_k),
+                                     dtype=torch.float32,
+                                     device="cuda")
+
+    _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales)
+
+
+@pytest.mark.parametrize("expert_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("scale_dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_accepts_supported_topk_dtypes(expert_dtype,
+                                                       scale_dtype):
+    torch.random.manual_seed(123)
+    m, k, top_k = 5, 256, 3
+    hidden_states = (torch.randn([m, k], dtype=torch.float) * 16).to(
+        torch.bfloat16).cuda().contiguous()
+    token_selected_experts = torch.randint(0,
+                                           384, (m, top_k),
+                                           dtype=expert_dtype,
+                                           device="cuda")
+    token_final_scales = torch.randn((m, top_k),
+                                     dtype=scale_dtype,
+                                     device="cuda")
+
+    _run_megamoe_prepare(hidden_states, token_selected_experts,
+                         token_final_scales)
+
+
+@skip_pre_blackwell_unittest
+def test_megamoe_prepare_allows_zero_tokens():
+    k, top_k = 256, 3
+    hidden_states = torch.empty((0, k), dtype=torch.bfloat16, device="cuda")
+    token_selected_experts = torch.empty((0, top_k),
+                                         dtype=torch.int32,
+                                         device="cuda")
+    token_final_scales = torch.empty((0, top_k),
+                                     dtype=torch.float32,
+                                     device="cuda")
+    x_out = torch.empty((1, k), dtype=torch.float8_e4m3fn, device="cuda")
+    x_sf_out = torch.empty((1, k // 128), dtype=torch.int32, device="cuda")
+    topk_idx_out = torch.empty((1, top_k), dtype=torch.int64, device="cuda")
+    topk_weights_out = torch.empty((1, top_k),
+                                   dtype=torch.float32,
+                                   device="cuda")
+
+    torch.ops.trtllm.megamoe_prepare(hidden_states, token_selected_experts,
+                                     token_final_scales, x_out, x_sf_out,
+                                     topk_idx_out, topk_weights_out)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.skipif(
     getSMVersion() != 103 and getSMVersion() != 90,
     reason="Only test on Blackwell and Hopper",
@@ -273,3 +425,402 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         atol=1e-10,
         rtol=0.01,
         msg=f"UE8M0 decoded scales mismatch for shape ({m}, {k})")
+
+
+# ---------------------------------------------------------------------------
+# Tests for fp8_quantize_1x128_packed_ue8m0 (SM100 fused quant+pack)
+# ---------------------------------------------------------------------------
+
+# The op guards on the C++ isSM100Family() (SM100-109), which is wider than the
+# utils.util helper of the same name. The Triton comparisons further down keep
+# using that helper: they are limited to the archs Triton can target, not to the
+# archs the op supports.
+skip_if_not_sm100_family = pytest.mark.skipif(
+    not 100 <= getSMVersion() < 110,
+    reason="fp8_quantize_1x128_packed_ue8m0 is SM100-family only. "
+    "Current SM is %d." % getSMVersion(),
+)
+
+
+def _decode_packed_int32_ue8m0(packed_int32):
+    """Decode each packed int32 into four UE8M0 exponent bytes."""
+    b0 = (packed_int32 >> 0) & 0xFF
+    b1 = (packed_int32 >> 8) & 0xFF
+    b2 = (packed_int32 >> 16) & 0xFF
+    b3 = (packed_int32 >> 24) & 0xFF
+    return torch.stack([b0, b1, b2, b3], dim=-1)
+
+
+def _legacy_packed_to_r128c4(packed_int32, m, num_quant_sf_k, sf_replication=1):
+    """Convert packed quant scales to replicated R128c4 consumer slots."""
+    num_packed_quant_sf_k = (num_quant_sf_k + 3) // 4
+    m_padded = (m + 127) // 128 * 128
+    num_output_sf_k = num_quant_sf_k * sf_replication
+    num_packed_output_sf_k = (num_output_sf_k + 3) // 4
+    expected = torch.zeros((m_padded * num_packed_output_sf_k * 4),
+                           dtype=torch.uint8,
+                           device=packed_int32.device)
+
+    logical = _decode_packed_int32_ue8m0(packed_int32.contiguous().view(
+        torch.int32)).reshape(m, num_packed_quant_sf_k * 4)[:, :num_quant_sf_k]
+    logical = logical.repeat_interleave(sf_replication, dim=1)
+
+    m_idx = torch.arange(m, device=packed_int32.device,
+                         dtype=torch.int64).view(-1, 1)
+    sf_k_idx = torch.arange(num_output_sf_k,
+                            device=packed_int32.device,
+                            dtype=torch.int64).view(1, -1)
+    offsets = (((m_idx // 128 * num_packed_output_sf_k + sf_k_idx // 4) * 32 +
+                m_idx % 32) * 4 + (m_idx % 128) // 32) * 4 + sf_k_idx % 4
+    expected[offsets.flatten()] = logical.flatten().to(torch.uint8)
+    return expected
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("m,k", [
+    (1, 128),
+    (3, 256),
+    (4, 512),
+    (7, 512),
+    (31, 384),
+    (32, 512),
+    (33, 640),
+    (16, 7168),
+    (127, 4096),
+    (128, 512),
+    (129, 512),
+    (1024, 7168),
+    pytest.param(262141, 128, id="grid-y-overflow"),
+])
+def test_fp8_quantize_1x128_packed_ue8m0_r128c4(m, k):
+    """K128 scales are replicated into K32-addressable R128c4 slots."""
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+
+    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        x, True)
+
+    # Legacy quantization is the value/scale reference. Convert its MN-major
+    # packed scales to the standard byte layout for a physical-layout check.
+    ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=True)
+    ref_packed = fp8_utils.get_col_major_tma_aligned_packed_tensor(
+        ref_scale[:, :m].t().contiguous().to(torch.float32))
+    num_quant_sf_k = (k + 127) // 128
+    expected_scale = _legacy_packed_to_r128c4(ref_packed,
+                                              m,
+                                              num_quant_sf_k,
+                                              sf_replication=4)
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       ref_fp8.view(torch.uint8)[:m]), \
+        f"FP8 mismatch for ({m}, {k})"
+    assert fused_scale.dtype == torch.uint8
+    assert fused_scale.shape == expected_scale.shape
+    assert torch.equal(fused_scale, expected_scale), \
+        f"R128c4 UE8M0 mismatch for ({m}, {k})"
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("m,k", [(1, 128), (33, 640)])
+def test_fp8_quantize_1x128_packed_ue8m0_r128c4_zero_blocks(m, k):
+    """All-zero blocks retain the legacy kernel's UE8M0 scale encoding."""
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    x = torch.zeros((m, k), device="cuda", dtype=torch.bfloat16)
+    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        x, True)
+    ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=True)
+    ref_packed = fp8_utils.get_col_major_tma_aligned_packed_tensor(
+        ref_scale[:, :m].t().contiguous().to(torch.float32))
+    expected_scale = _legacy_packed_to_r128c4(ref_packed,
+                                              m,
+                                              k // 128,
+                                              sf_replication=4)
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       ref_fp8.view(torch.uint8)[:m])
+    assert torch.equal(fused_scale, expected_scale)
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("m,k", [
+    (1, 128),
+    (3, 256),
+    (7, 512),
+    (13, 7168),
+    (127, 4096),
+    (129, 640),
+])
+def test_fp8_quantize_1x128_packed_ue8m0_r128c4_padding_is_zero(m, k):
+    """R128c4 M padding is initialized and every K32 slot is populated."""
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    _, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, True)
+
+    num_sf_k = k // 32
+    num_packed_sf_k = (num_sf_k + 3) // 4
+    valid = torch.zeros_like(scale, dtype=torch.bool)
+    m_idx = torch.arange(m, device="cuda", dtype=torch.int64).view(-1, 1)
+    sf_k_idx = torch.arange(num_sf_k, device="cuda",
+                            dtype=torch.int64).view(1, -1)
+    offsets = ((
+        (m_idx // 128 * num_packed_sf_k + sf_k_idx // 4) * 32 + m_idx % 32) * 4
+               + (m_idx % 128) // 32) * 4 + sf_k_idx % 4
+    valid[offsets.flatten()] = True
+    assert torch.count_nonzero(scale[~valid]).item() == 0
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("use_r128c4_layout", [False, True])
+@pytest.mark.parametrize("m,k,swiglu_limit", [
+    (1, 128, None),
+    (3, 256, None),
+    (16, 1536, None),
+    (32, 3072, None),
+    (32, 7168, None),
+    (7, 512, 7.0),
+    pytest.param(262141, 128, None, id="grid-y-overflow"),
+])
+def test_silu_and_mul_fp8_quantize_1x128_packed_ue8m0_matches_separate(
+        m, k, swiglu_limit, use_r128c4_layout):
+    """Fused SwiGLU quantization should match separate SwiGLU and quantize."""
+    torch.manual_seed(0)
+    gate_up = torch.randn((m, 2 * k), device="cuda", dtype=torch.bfloat16)
+
+    fused_fp8, fused_packed = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+        gate_up, swiglu_limit, use_r128c4_layout)
+
+    swiglu = torch.ops.trtllm.silu_and_mul(gate_up, swiglu_limit=swiglu_limit)
+    reference_fp8, reference_packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        swiglu, use_r128c4_layout)
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       reference_fp8.view(torch.uint8))
+    assert torch.equal(fused_packed.contiguous(), reference_packed.contiguous())
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.")
+@pytest.mark.parametrize("n,k", [(128, 128), (129, 256), (2112, 7168)])
+def test_transform_k128_scales_to_cutedsl_mxfp8_layout(n, k):
+    """Weight K128 scales are expanded over N rows and four K32 slots."""
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    num_n_blocks = math.ceil(n / 128)
+    num_k_blocks = k // 128
+    exponents = torch.arange(num_n_blocks * num_k_blocks,
+                             device="cuda",
+                             dtype=torch.float32).reshape(
+                                 num_n_blocks, num_k_blocks)
+    weight_scale = torch.pow(2.0, exponents.remainder(32) - 16)
+
+    transformed = \
+        fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(
+            weight_scale, mn=n, k=k)
+
+    per_row = weight_scale.repeat_interleave(128, dim=0)[:n]
+    expected_ue8m0 = (per_row.contiguous().view(torch.int32) >> 23).to(
+        torch.uint8).repeat_interleave(4, dim=1)
+    expected = torch.ops.trtllm.block_scale_interleave(
+        expected_ue8m0.contiguous())
+
+    assert transformed.dtype == torch.uint8
+    assert transformed.numel() == math.ceil(n / 128) * 128 * (k // 32)
+    assert torch.equal(transformed, expected)
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("m,k", [(3, 256), (7, 512), (127, 4096)])
+def test_fp8_quantize_1x128_packed_ue8m0_legacy_layout(m, k):
+    """The compatibility mode retains deep_gemm's packed SF contract."""
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    fused_fp8, fused_packed = \
+        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, False)
+    ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=True)
+    ref_packed = fp8_utils.get_col_major_tma_aligned_packed_tensor(
+        ref_scale[:, :m].t().contiguous().to(torch.float32))
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       ref_fp8.view(torch.uint8)[:m])
+    assert fused_packed.dtype == torch.int32
+    assert torch.equal(fused_packed.contiguous(), ref_packed.contiguous())
+
+
+# ---------------------------------------------------------------------------
+# Tests for triton_fp8_quantize_1x128 (library Triton quant kernel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="Triton-vs-CUDA scale layout comparison requires SM100+. "
+    "Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("use_ue8m0", [True, False])
+@pytest.mark.parametrize("k", [128, 256, 512, 576, 1024, 5120])
+@pytest.mark.parametrize("m", [4, 16, 64, 256, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_triton_fp8_quantize_1x128_vs_cuda(dtype, m, k, use_ue8m0):
+    """Validate triton_fp8_quantize_1x128 matches CUDA fp8_quantize_1x128.
+
+    Both kernels perform 1x128 block-scale FP8 E4M3 quantization.  We compare:
+      1. FP8 quantized values  (< 1% byte-level mismatch)
+      2. Float32 scale tensors (match within FP tolerance)
+
+    Tested with both use_ue8m0=True (power-of-2 scales) and False (raw scales).
+    """
+    from tensorrt_llm.quantization.utils.fp8_quantize import \
+        triton_fp8_quantize_1x128
+
+    torch.random.manual_seed(42)
+    input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
+
+    cuda_fp8, cuda_scale = torch.ops.trtllm.fp8_quantize_1x128(
+        input_tensor, use_ue8m0=use_ue8m0)
+
+    triton_fp8, triton_scale = triton_fp8_quantize_1x128(input_tensor,
+                                                         use_ue8m0=use_ue8m0)
+
+    # --- FP8 values ---
+    cuda_u8 = cuda_fp8.view(torch.uint8)[:m, :k]
+    triton_u8 = triton_fp8.view(torch.uint8)
+    fp8_mismatch = torch.sum(cuda_u8 != triton_u8).item()
+    fp8_total = cuda_u8.numel()
+    fp8_mismatch_pct = fp8_mismatch / fp8_total * 100
+    assert fp8_mismatch_pct < 1.0, (
+        f"FP8 byte mismatch {fp8_mismatch_pct:.2f}% >= 1.0% "
+        f"for shape ({m}, {k}) use_ue8m0={use_ue8m0}")
+
+    # --- Scale values ---
+    assert cuda_scale.shape == triton_scale.shape, (
+        f"Scale shape mismatch: CUDA {cuda_scale.shape} vs "
+        f"Triton {triton_scale.shape}")
+    torch.testing.assert_close(
+        triton_scale,
+        cuda_scale,
+        atol=1e-6,
+        rtol=1e-3,
+        msg=f"Scale mismatch for shape ({m}, {k}) use_ue8m0={use_ue8m0}")
+
+
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="Triton-vs-CUDA scale layout comparison requires SM100+. "
+    "Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("use_ue8m0", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_triton_fp8_quantize_1x128_large_m(dtype, use_ue8m0):
+    """Stress-test with large M values typical of visual-gen / long-prefill.
+
+    These are the shapes where the Triton kernel is expected to outperform
+    CUDA by ~3x.  We still validate correctness here, not performance.
+    """
+    from tensorrt_llm.quantization.utils.fp8_quantize import \
+        triton_fp8_quantize_1x128
+
+    torch.random.manual_seed(42)
+
+    for m, k in [(8192, 5120), (16384, 5120), (4096, 13824)]:
+        input_tensor = torch.randn((m, k), device='cuda', dtype=dtype)
+
+        cuda_fp8, cuda_scale = torch.ops.trtllm.fp8_quantize_1x128(
+            input_tensor, use_ue8m0=use_ue8m0)
+        triton_fp8, triton_scale = triton_fp8_quantize_1x128(
+            input_tensor, use_ue8m0=use_ue8m0)
+
+        cuda_u8 = cuda_fp8.view(torch.uint8)[:m, :k]
+        triton_u8 = triton_fp8.view(torch.uint8)
+        fp8_mismatch_pct = (torch.sum(cuda_u8 != triton_u8).item() /
+                            cuda_u8.numel() * 100)
+        assert fp8_mismatch_pct < 1.0, (
+            f"FP8 mismatch {fp8_mismatch_pct:.2f}% for ({m}, {k}) "
+            f"use_ue8m0={use_ue8m0}")
+
+        assert cuda_scale.shape == triton_scale.shape
+        torch.testing.assert_close(triton_scale,
+                                   cuda_scale,
+                                   atol=1e-6,
+                                   rtol=1e-3,
+                                   msg=f"Scale mismatch for shape ({m}, {k}) "
+                                   f"use_ue8m0={use_ue8m0}")
+
+
+# ---------------------------------------------------------------------------
+# Round-trip tests for inverse_transform_sf / unpack_col_major_tma_aligned_packed_tensor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mn,k", [
+    (256, 256),
+    (384, 512),
+    (1024, 5120),
+    (768, 13824),
+    (5120, 5120),
+])
+def test_unpack_col_major_tma_aligned_round_trip(mn, k):
+    """Pack then unpack should recover the original float32 UE8M0 tensor."""
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        get_col_major_tma_aligned_packed_tensor,
+        unpack_col_major_tma_aligned_packed_tensor)
+
+    # Build a random UE8M0 scale tensor: 2^exp where exp in [-10, 10].
+    exponents = torch.randint(-10, 11, (mn, k), device='cuda')
+    original = torch.pow(2.0, exponents.float())
+
+    packed = get_col_major_tma_aligned_packed_tensor(original)
+    recovered = unpack_col_major_tma_aligned_packed_tensor(packed, mn, k)
+
+    torch.testing.assert_close(recovered,
+                               original,
+                               atol=0.0,
+                               rtol=0.0,
+                               msg=f"Round-trip failed for ({mn}, {k})")
+
+
+@pytest.mark.parametrize("out_features,in_features", [
+    (256, 256),
+    (384, 512),
+    (1024, 5120),
+    (768, 13824),
+    (5120, 5120),
+])
+def test_inverse_transform_sf_round_trip(out_features, in_features):
+    """transform_sf → inverse_transform_sf should recover block-scale grid."""
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        inverse_transform_sf, transform_sf_into_required_layout)
+
+    block_size = 128
+    nb_m = math.ceil(out_features / block_size)
+    nb_k = math.ceil(in_features / block_size)
+
+    exponents = torch.randint(-10, 11, (nb_m, nb_k), device='cuda')
+    original_scale = torch.pow(2.0, exponents.float())
+
+    packed = transform_sf_into_required_layout(
+        original_scale.clone(),
+        mn=out_features,
+        k=in_features,
+        recipe=(1, 128, 128),
+        is_sfa=False,
+    )
+
+    recovered = inverse_transform_sf(
+        packed,
+        mn=out_features,
+        k=in_features,
+        block_size=block_size,
+    )
+
+    torch.testing.assert_close(
+        recovered,
+        original_scale,
+        atol=0.0,
+        rtol=0.0,
+        msg=f"inverse_transform_sf failed for ({out_features}, {in_features})")

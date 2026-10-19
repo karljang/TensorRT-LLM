@@ -1,69 +1,167 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import asyncio
-import tempfile
+import json
 import threading
 import time
-from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-from tensorrt_llm.llmapi.llm_utils import *
+from tensorrt_llm.llmapi import llm as llm_module
+from tensorrt_llm.llmapi import mm_encoder as mm_encoder_module
+from tensorrt_llm.llmapi.llm import _TorchLLM
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import AsyncQueue
 
 # isort: off
 from .test_llm import llama_model_path
 # isort: on
 
-from tensorrt_llm.llmapi.llm_args import *
+
+@pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_preserves_explicit_values(tmp_path):
+    expected = {
+        "temperature": 1.0,
+        "top_p": 0.9,
+    }
+    (tmp_path / "generation_config.json").write_text(json.dumps(expected),
+                                                     encoding="utf-8")
+
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == expected
 
 
-def test_ModelLoader():
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-
-    # Test with HF model
-    temp_dir = tempfile.TemporaryDirectory()
-
-    def build_engine():
-        args = TrtLlmArgs(model=llama_model_path,
-                          kv_cache_config=kv_cache_config)
-        model_loader = ModelLoader(args)
-        engine_dir = model_loader(engine_dir=Path(temp_dir.name))
-        assert engine_dir
-        return engine_dir
-
-    # Test with engine
-    args = TrtLlmArgs(model=build_engine(), kv_cache_config=kv_cache_config)
-    assert args.model_format is _ModelFormatKind.TLLM_ENGINE
-    print(f'engine_dir: {args.model}')
-    model_loader = ModelLoader(args)
-    engine_dir = model_loader()
-    assert engine_dir == args.model
+@pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_returns_empty_without_file(tmp_path):
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
 
 
-def test_CachedModelLoader():
-    # CachedModelLoader enables engine caching and multi-gpu building
-    args = TrtLlmArgs(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        enable_build_cache=True)
-    stats = LlmBuildStats()
-    model_loader = CachedModelLoader(args, llm_build_stats=stats)
-    engine_dir, _ = model_loader()
-    assert engine_dir
-    assert engine_dir.exists() and engine_dir.is_dir()
-    model_format = get_model_format(engine_dir, trust_remote_code=True)
-    assert model_format is _ModelFormatKind.TLLM_ENGINE
+@pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_returns_empty_for_malformed_json(
+        tmp_path):
+    (tmp_path / "generation_config.json").write_text("{", encoding="utf-8")
+
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
 
 
+@pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_returns_empty_for_json_array(tmp_path):
+    (tmp_path / "generation_config.json").write_text("[1, 2]", encoding="utf-8")
+
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_returns_model_dir(tmp_path):
+    llm_args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+
+    model_dir = CachedModelLoader(llm_args)()
+
+    assert model_dir == tmp_path
+
+
+@pytest.mark.cpu_only
+def test_attached_model_loader_resolves_hub_on_nonzero_device(
+        monkeypatch, tmp_path):
+    args = TorchLlmArgs(model="example/model", gpus_per_node=1)
+    loader = CachedModelLoader(args, is_attached_frontend=True)
+    model = SimpleNamespace(is_hub_model=True,
+                            model_name="example/model",
+                            model_dir=None)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 1)
+    download = MagicMock(return_value=tmp_path)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
+                        download)
+
+    assert loader._download_hf_model_if_needed(
+        model, revision="pinned-revision") == tmp_path
+    assert model.model_dir == tmp_path
+    download.assert_called_once_with("example/model", "pinned-revision")
+
+
+@pytest.mark.cpu_only
+def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
+    llm = object.__new__(_TorchLLM)
+    llm.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+    llm.mpi_session = None
+    llm._is_attached_frontend = False
+    llm._executor_cls = MagicMock()
+
+    monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
+    monkeypatch.setattr(_TorchLLM, "_try_load_tokenizer", lambda self: None)
+    monkeypatch.setattr(_TorchLLM, "_try_load_hf_model_config",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM,
+                        "_reject_token_encoder_config_without_buckets",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM, "_try_load_generation_config",
+                        lambda self: None)
+    monkeypatch.setattr(_TorchLLM,
+                        "_try_load_generation_config_explicit_values",
+                        lambda self: {})
+    monkeypatch.setattr(llm_module, "create_input_processor",
+                        lambda *args, **kwargs: SimpleNamespace(tokenizer=None))
+    monkeypatch.setattr(llm_module, "external_mpi_comm_available",
+                        lambda world_size: False)
+
+    llm._build_model()
+
+    create_call = llm._executor_cls.create.call_args
+    assert create_call.args == (None, )
+    assert create_call.kwargs["hf_model_dir"] == tmp_path
+
+
+@pytest.mark.cpu_only
+def test_multimodal_encoder_build_passes_none_to_executor(
+        monkeypatch, tmp_path):
+    encoder = object.__new__(MultimodalEncoder)
+    encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
+    encoder.mpi_session = None
+    encoder._is_attached_frontend = False
+    encoder._executor_cls = MagicMock()
+
+    monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
+    monkeypatch.setattr(MultimodalEncoder, "_try_load_tokenizer",
+                        lambda self: None)
+    monkeypatch.setattr(mm_encoder_module, "create_input_processor",
+                        lambda *args, **kwargs: SimpleNamespace(tokenizer=None))
+    monkeypatch.setattr(mm_encoder_module, "external_mpi_comm_available",
+                        lambda world_size: False)
+
+    encoder._build_model()
+
+    assert encoder._executor_cls.create.call_args.args == (None, )
+
+
+@pytest.mark.cpu_only
 def test_LlmArgs_default_gpus_per_node():
     # default
-    llm_args = TrtLlmArgs(model=llama_model_path)
+    llm_args = TorchLlmArgs(model=llama_model_path)
     assert llm_args.gpus_per_node == torch.cuda.device_count()
 
     # set explicitly
-    llm_args = TrtLlmArgs(model=llama_model_path, gpus_per_node=6)
+    llm_args = TorchLlmArgs(model=llama_model_path, gpus_per_node=6)
     assert llm_args.gpus_per_node == 6
 
 
+@pytest.mark.cpu_only
 def test_AsyncQueue():
     queue = AsyncQueue()
 

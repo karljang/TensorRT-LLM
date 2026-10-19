@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,9 @@
 #include <random>
 #include <vector>
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -392,8 +393,8 @@ class MoEARFuseTestRunner
 {
     static_assert(std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>);
     static constexpr ncclDataType_t kNCCLDataType = std::is_same_v<DType, half> ? ncclFloat16 : ncclBfloat16;
-    static constexpr nvinfer1::DataType kTRTDataType
-        = std::is_same_v<DType, half> ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kBF16;
+    static constexpr tensorrt_llm::DataType kTRTDataType
+        = std::is_same_v<DType, half> ? tensorrt_llm::DataType::kHALF : tensorrt_llm::DataType::kBF16;
 
 public:
     MoEARFuseTestRunner(int max_token_num, int hidden_dim, int max_expert_num)

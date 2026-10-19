@@ -32,8 +32,19 @@ foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
       list(APPEND DEEP_EP_CUDA_ARCHITECTURES
            "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}a${CUDA_ARCH_POSTFIX}")
     else()
-      list(APPEND DEEP_EP_CUDA_ARCHITECTURES
-           "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${CUDA_ARCH_POSTFIX}")
+      # Preserve the architecture suffix (a/f) from the input, e.g. "107f-real"
+      # -> "f".
+      string(REGEX MATCH "^[1-9][0-9]*[0-9]([af])" ARCH_SUFFIX_MATCH
+                   ${CUDA_ARCH})
+      if(CMAKE_MATCH_1)
+        set(ARCH_SUFFIX ${CMAKE_MATCH_1})
+      else()
+        set(ARCH_SUFFIX "")
+      endif()
+      list(
+        APPEND DEEP_EP_CUDA_ARCHITECTURES
+        "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${ARCH_SUFFIX}${CUDA_ARCH_POSTFIX}"
+      )
     endif()
   endif()
 endforeach()
@@ -120,6 +131,15 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_C_COMPILER gcc)
   set(CMAKE_CXX_COMPILER g++)
   set(CMAKE_CUDA_HOST_COMPILER g++)
+  # PyTorch's cmake/public/cuda.cmake (loaded transitively by
+  # find_package(Torch)) appends -Xcompiler=-fclang-abi-compat=17 to
+  # CMAKE_CUDA_FLAGS whenever the parent build is configured with Clang>=18 (see
+  # pytorch PR #175233). Since this subdirectory falls back to GCC for NVSHMEM
+  # compatibility, that Clang-only flag would be forwarded to g++ via `nvcc
+  # -ccbin=g++` and abort the build with: g++: error: unrecognized command-line
+  # option '-fclang-abi-compat=17'
+  string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" ""
+                       CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 
 # Add nvshmem external project
@@ -144,6 +164,7 @@ ExternalProject_Add(
     -DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}
     -DCMAKE_CUDA_HOST_COMPILER:STRING=${CMAKE_CUDA_HOST_COMPILER}
     -DCMAKE_CUDA_COMPILER_LAUNCHER:STRING=${CMAKE_CUDA_COMPILER_LAUNCHER}
+    -DMLX5_lib:FILEPATH=${MLX5_lib}
     -DNVSHMEM_BUILD_EXAMPLES:BOOL=0
     -DNVSHMEM_BUILD_PACKAGES:BOOL=0
     -DNVSHMEM_BUILD_TESTS:BOOL=0
@@ -190,8 +211,8 @@ set_target_properties(
   deep_ep_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
              CUDA_STANDARD_REQUIRED ON
-             CXX_STANDARD 17
-             CUDA_STANDARD 17
+             CXX_STANDARD 20
+             CUDA_STANDARD 20
              CUDA_SEPARABLE_COMPILATION ON
              CUDA_ARCHITECTURES "${DEEP_EP_CUDA_ARCHITECTURES}"
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_cpp_tllm.version
@@ -204,6 +225,12 @@ target_compile_options(
 target_compile_definitions(
   deep_ep_cpp_tllm PRIVATE DISABLE_AGGRESSIVE_PTX_INSTRS
                            TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
+# Newer CUDA containers provide NVSHMEM headers in the default CUDA include
+# directory. DeepEP must compile against the vendored NVSHMEM headers because it
+# links the vendored NVSHMEM static library below.
+target_include_directories(
+  deep_ep_cpp_tllm BEFORE
+  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
 target_link_libraries(
   deep_ep_cpp_tllm PRIVATE nvshmem_project::nvshmem ${TORCH_LIBRARIES}
                            ${TORCH_PYTHON_LIB})

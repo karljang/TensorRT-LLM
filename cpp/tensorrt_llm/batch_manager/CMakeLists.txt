@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,58 +19,45 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    allocateKvCache.cpp
-    assignReqSeqSlots.cpp
     baseTransBuffer.cpp
+    blockKey.cpp
     cacheFormatter.cpp
     cacheTransferLayer.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
-    createNewDecoderRequests.cpp
     contextProgress.cpp
+    contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    decoderBuffers.cpp
-    encoderBuffers.cpp
-    guidedDecoder.cpp
-    handleContextLogits.cpp
-    handleGenerationLogits.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    logitsPostProcessor.cpp
-    loraBuffers.cpp
-    makeDecodingBatchInputOutput.cpp
-    medusaBuffers.cpp
     microBatchScheduler.cpp
-    pauseRequests.cpp
     peftCacheManager.cpp
-    promptTuningBuffers.cpp
-    rnnStateBuffers.cpp
-    rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    runtimeBuffers.cpp
-    sequenceSlotManager.cpp
-    transformerBuffers.cpp
-    trtEncoderModel.cpp
-    trtGptModelInflightBatching.cpp
-    updateDecoderBuffers.cpp
-    utils/debugUtils.cpp
-    utils/inflightBatchingUtils.cpp
-    utils/logitsThread.cpp
-    utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp)
+    cacheTransBuffer.cpp
+    agentTree.cpp)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
      "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
-list(APPEND SRCS ${XGRAMMAR_SRCS})
+
+add_library(tensorrt_llm_xgrammar_static STATIC ${XGRAMMAR_SRCS})
+set_target_properties(
+  tensorrt_llm_xgrammar_static
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+             POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  tensorrt_llm_xgrammar_static SYSTEM
+  PRIVATE ${xgrammar_source_dir}/3rdparty/picojson
+          ${xgrammar_source_dir}/3rdparty/dlpack/include
+          ${xgrammar_source_dir}/include)
 
 if(NOT WIN32)
   # additional warnings
@@ -87,16 +74,23 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+# Include kv_cache_manager_v2 C++ sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
+
+# Include the KVCM cold-page compression codec bridge sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_compression/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_COMPRESSION_SRCS})
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
-         ${xgrammar_source_dir}/3rdparty/dlpack/include
-         ${xgrammar_source_dir}/include)
+  PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
+         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              POSITION_INDEPENDENT_CODE ON)
 
 set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
@@ -117,5 +111,7 @@ endif()
 
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
-                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)
+target_link_libraries(
+  ${BATCH_MANAGER_STATIC_TARGET}
+  PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils
+  PRIVATE tensorrt_llm_xgrammar_static)

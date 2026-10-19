@@ -1,10 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import struct
 import types
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    validate_and_set_kv_cache_quant,
+    validate_encoder_decoder_kv_cache_config,
+)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 def make_pretrained_config(
@@ -14,6 +28,7 @@ def make_pretrained_config(
     head_dim: int | None = None,
     num_hidden_layers: int = 1,
     vocab_size: int = 3000,
+    is_encoder_decoder: bool = False,
 ):
     # A minimal config object that provides the attributes used by
     # ModelConfig.get_bindings_model_config().
@@ -30,6 +45,7 @@ def make_pretrained_config(
         num_hidden_layers=num_hidden_layers,
         vocab_size=vocab_size,
         torch_dtype=torch.float16,
+        is_encoder_decoder=is_encoder_decoder,
     )
 
 
@@ -71,20 +87,322 @@ def test_get_bindings_model_config_attention_dp_attn_tp_override(
     # bindings hidden_size is sharded by attn_tp_size and attn_cp_size.
     attn_tp_size = mapping.attn_tp_size if not mapping.enable_attention_dp else 1
     attn_cp_size = mapping.attn_cp_size
-    assert bindings_cfg.num_heads == cfg.num_attention_heads // (attn_tp_size * attn_cp_size)
+
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    assert bindings_cfg.num_heads == ceil_div(cfg.num_attention_heads, attn_tp_size * attn_cp_size)
     # bindings hidden_size is sharded by attn_tp_size.
-    assert bindings_cfg.hidden_size == cfg.hidden_size // attn_tp_size
+    assert bindings_cfg.hidden_size == ceil_div(cfg.hidden_size, attn_tp_size)
     if isinstance(cfg.num_key_value_heads, (list, tuple)):
         expected_num_kv_heads_per_layer = [
-            kv // (attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
+            ceil_div(kv, attn_tp_size * attn_cp_size) for kv in cfg.num_key_value_heads
         ]
         assert list(bindings_cfg.num_kv_heads_per_layer) == expected_num_kv_heads_per_layer
         assert bindings_cfg.num_kv_heads(0) == expected_num_kv_heads_per_layer[0]
     else:
-        assert bindings_cfg.num_kv_heads(0) == cfg.num_key_value_heads // (
-            attn_tp_size * attn_cp_size
+        assert bindings_cfg.num_kv_heads(0) == ceil_div(
+            cfg.num_key_value_heads, attn_tp_size * attn_cp_size
         )
 
     # tp_size-dependent value (uses mapping.tp_size, not attn_tp_size).
-    assert bindings_cfg.mlp_hidden_size == (cfg.intermediate_size // mapping.tp_size)
+    assert bindings_cfg.mlp_hidden_size == ceil_div(cfg.intermediate_size, mapping.tp_size)
     assert bindings_cfg.tokens_per_block == tokens_per_block
+
+
+def _make_model_config_with_kv_quant(kv_cache_quant_algo):
+    return ModelConfig(quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo))
+
+
+def _make_kv_cache_config(
+    *, use_kv_cache_manager_v2: bool, cross_kv_cache_fraction: float | None = None
+) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        cross_kv_cache_fraction=cross_kv_cache_fraction,
+        enable_block_reuse=True,
+    )
+
+
+def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "auto")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    with pytest.raises(ValueError, match="Accepted types are"):
+        validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def _mock_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: 107)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.torch.cuda.is_available",
+        lambda: True,
+    )
+
+
+def test_validate_and_set_kv_cache_quant_downgrades_nvfp4_on_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_sm107(monkeypatch)
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def _make_mixed_precision_model_config():
+    """MIXED_PRECISION checkpoint shape: global config plus per-layer entries
+    whose kv_cache_quant_algo comes only from hf_quant_config.json (None here)."""
+    return ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=None),
+        quant_config_dict={
+            "model.layers.0.attention": QuantConfig(quant_algo=QuantAlgo.FP8),
+            "model.layers.0.mixer.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        },
+    )
+
+
+def test_validate_and_set_kv_cache_quant_propagates_to_quant_config_dict():
+    """Explicit kv_cache_config.dtype must override the per-layer QuantConfigs
+    too, otherwise the KV pool (sized from the global config) and attention
+    modules (built from per-layer configs) disagree on KV element size."""
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "fp8")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "auto")
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo is None
+
+
+def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_config_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SM107 NVFP4->FP8 downgrade must update per-layer QuantConfigs too,
+    otherwise a mixed-precision checkpoint keeps NVFP4 in quant_config_dict
+    while the KV pool (sized from the global config) uses FP8."""
+    _mock_sm107(monkeypatch)
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
+    shard_name = "model-00001-of-00001.safetensors"
+    header = {
+        _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: {
+            "dtype": tensor_dtype,
+            "shape": tensor_shape,
+            "data_offsets": [0, 0],
+        }
+    }
+    encoded_header = json.dumps(header).encode("utf-8")
+
+    with open(checkpoint_dir / shard_name, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded_header)))
+        f.write(encoded_header)
+
+    with open(checkpoint_dir / "model.safetensors.index.json", "w") as f:
+        json.dump({"weight_map": {_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: shard_name}}, f)
+
+
+@pytest.mark.parametrize(
+    "tensor_dtype,tensor_shape,expected_layout,expected_is_base",
+    [
+        pytest.param("I8", [2048, 2048], "mxfp4", False, id="mxfp4"),
+        pytest.param("U8", [2048, 2048], "nvfp4", False, id="nvfp4"),
+        pytest.param("F8_E4M3", [2048, 4096], None, True, id="base-fp8"),
+    ],
+)
+def test_deepseek_v4_base_checkpoint_detection(
+    tmp_path, tensor_dtype, tensor_shape, expected_layout, expected_is_base
+):
+    _write_safetensors_header(tmp_path, tensor_dtype, tensor_shape)
+
+    assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
+    assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+
+
+@pytest.mark.parametrize("sidecar", [True, False], ids=["modelopt-file", "modelopt-inline"])
+def test_deepseek_v41_nvfp4_checkpoint_quantization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: bool
+) -> None:
+    """Resolve dense FP8 separately from the checkpoint's NVFP4 expert policy."""
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41Config
+
+    quantization = {
+        "quant_algo": "MIXED_PRECISION",
+        "group_size": 16,
+        "kv_cache_quant_algo": "FP8",
+        "exclude_modules": ["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
+        "quantized_layers": {
+            "layers.0.ffn.experts": {"quant_algo": "NVFP4", "group_size": 16},
+            "model.layers.0.self_attn.o_proj": {
+                "quant_algo": "FP8_BLOCK_SCALES",
+                "group_size": 128,
+            },
+        },
+    }
+    inline = {
+        **deepcopy(quantization),
+        "producer": {"name": "modelopt"},
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "modules_to_not_convert": ["*engram*"],
+    }
+    pretrained = DeepseekV41Config(
+        architectures=["DeepseekV41ForCausalLM"], quantization_config=deepcopy(inline)
+    )
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained
+    )
+    _write_safetensors_header(tmp_path, "U8", [2304, 2560])
+    if sidecar:
+        # The file's explicit null must win over the inline KV policy.
+        quantization["kv_cache_quant_algo"] = None
+        (tmp_path / "hf_quant_config.json").write_text(
+            json.dumps({"producer": inline["producer"], "quantization": quantization})
+        )
+
+    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
+    dense = model_config.quant_config
+    assert dense.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert dense.group_size == 128
+    assert dense.kv_cache_quant_algo == (None if sidecar else QuantAlgo.FP8)
+    assert dense.is_module_excluded_from_quantization("model.layers.1.engram.kv_proj")
+    assert not dense.is_module_excluded_from_quantization("model.layers.0.mlp.shared_experts")
+    for layer in range(pretrained.num_hidden_layers):
+        expert = model_config.quant_config_dict[f"model.layers.{layer}.mlp.experts"]
+        assert expert.quant_algo == QuantAlgo.NVFP4
+        assert expert.group_size == 16
+    explicit = model_config.quant_config_dict["model.layers.0.self_attn.o_proj"]
+    assert explicit.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert explicit.group_size == 128
+    assert explicit.kv_cache_quant_algo == dense.kv_cache_quant_algo
+    assert pretrained.quantization_config == inline
+
+
+def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
+    """DeepSeek-V4 load must fail fast with a clear error when neither the
+    checkpoint config nor a user ``sparse_attention_config`` provides
+    ``compress_ratios``.
+
+    Regression test: previously ``compress_ratios`` could stay ``None`` and the
+    internal normalization comprehension raised an opaque
+    ``TypeError: 'NoneType' object is not iterable`` mid-load.
+    """
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
+
+    pretrained_config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        compress_ratios=None,
+        num_hidden_layers=4,
+    )
+
+    # Avoid touching the filesystem for the HF config load; the empty tmp_path
+    # makes the real ``_is_deepseek_v4_base_checkpoint`` probe return False.
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+
+    with pytest.raises(ValueError, match="compress_ratios"):
+        ModelConfig.from_pretrained(str(tmp_path))
+
+
+def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    assert model_config.is_encoder_decoder is True
+
+
+def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
+    """Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set."""
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    validate_encoder_decoder_kv_cache_config(
+        model_config,
+        _make_kv_cache_config(use_kv_cache_manager_v2=False, cross_kv_cache_fraction=0.5),
+    )
+
+
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction(
+    use_kv_cache_manager_v2: bool,
+) -> None:
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="cross_kv_cache_fraction to be set"):
+        validate_encoder_decoder_kv_cache_config(
+            model_config,
+            _make_kv_cache_config(use_kv_cache_manager_v2=use_kv_cache_manager_v2),
+        )
+
+
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_validate_encoder_decoder_kv_cache_config_rejects_cross_fraction_for_decoder_only(
+    use_kv_cache_manager_v2: bool,
+) -> None:
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="should only be set for encoder-decoder models"):
+        validate_encoder_decoder_kv_cache_config(
+            model_config,
+            _make_kv_cache_config(
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2, cross_kv_cache_fraction=0.5
+            ),
+        )
+
+
+def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    validate_encoder_decoder_kv_cache_config(
+        model_config,
+        _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
+    )

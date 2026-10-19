@@ -2,8 +2,15 @@ import os
 
 import pytest
 import ray
-from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
-                                      placement_group, remove_placement_group)
+from ray.util.placement_group import placement_group, remove_placement_group
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
@@ -14,8 +21,7 @@ from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
 
 @pytest.mark.gpu2
 def test_worker_extension():
-    llm = LLM(model=llm_models_root() /
-              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    llm = LLM(model=llm_models_root() / "Qwen3/Qwen3-0.6B",
               ray_worker_extension_cls=
               "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
               orchestrator_type="ray",
@@ -54,8 +60,7 @@ def test_placement_env_vars(setup_ray_cluster, monkeypatch):
                 placement_group_capture_child_tasks=True,
             ),
         )(LLM).remote(
-            model=os.path.join(llm_models_root(), "llama-models-v2",
-                               "TinyLlama-1.1B-Chat-v1.0"),
+            model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             tensor_parallel_size=2,
             orchestrator_type="ray",
@@ -93,8 +98,7 @@ def test_placement_api(setup_ray_cluster, monkeypatch, n_gpus, bundle_indices):
         print(f"Placement group ready with bundles {pg.bundle_specs}")
 
         llm = LLM(
-            model=os.path.join(llm_models_root(), "llama-models-v2",
-                               "TinyLlama-1.1B-Chat-v1.0"),
+            model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             tensor_parallel_size=tp_size,
             orchestrator_type="ray",
@@ -125,8 +129,7 @@ def test_cuda_visible_device(monkeypatch):
     """Placement via cuda_visible_device"""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
 
-    llm = LLM(model=llm_models_root() /
-              "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    llm = LLM(model=llm_models_root() / "Qwen3/Qwen3-0.6B",
               orchestrator_type="ray")
 
     infer_actor_uuids = llm._collective_rpc("report_device_id")

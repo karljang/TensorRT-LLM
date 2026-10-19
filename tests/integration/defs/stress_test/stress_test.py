@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
+Stress test script for model inference using the TensorRT LLM PyTorch backend.
 This script is used for stress testing inference performance using trtllm-serve and aiperf.
 
 The script supports three test modes:
@@ -72,6 +72,12 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 # Define a constant for process termination timeouts
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
+# Single source of truth for aiperf artifact location.
+# Passed to aiperf via --output-artifact-dir so writes and reads stay aligned
+# regardless of the pytest cwd.
+ARTIFACTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "artifacts")
+
 
 def _get_default_port() -> int:
     """Get a default port using CI allocation if available, otherwise use 8000."""
@@ -109,12 +115,10 @@ class ModelConfig:
     model_dir: str
     tp_size: int
     memory_requirement: int
-    backend: Optional[str] = None
 
     def __str__(self) -> str:
         model_name = os.path.basename(self.model_dir)
-        backend_str = f"_{self.backend}" if self.backend else ""
-        return f"{model_name}_tp{self.tp_size}{backend_str}"
+        return f"{model_name}_tp{self.tp_size}"
 
     @property
     def model_name(self) -> str:
@@ -167,14 +171,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
+    input_len_mean: int = 64  # Customized for TinyLlama and Qwen3.5-4B.
     input_len_std: int = 16
-    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
+    output_len_mean: int = 128  # Customized for TinyLlama and Qwen3.5-4B.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
+    test_timeout: int = 3600  # One hour for TinyLlama and Qwen3.5-4B.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -349,6 +353,46 @@ def check_server_health(server_url: str,
         return False, f"Unexpected error during health check: {str(e)}"
 
 
+def warmup_inference(server_url: str,
+                     model_name: str,
+                     timeout: float = 300.0,
+                     num_warmup_requests: int = 2) -> bool:
+    """
+    Send a few lightweight completion requests to the server so the inference
+    pipeline (JIT, CUDA graphs, memory pools) is fully warmed up before
+    aiperf begins timing.  The /health endpoint only confirms the HTTP server
+    is up -- the first real inference can be orders of magnitude slower.
+
+    Returns True if warmup succeeded, False otherwise.
+    """
+    endpoint = f"{server_url}/v1/completions"
+    payload = {
+        "model": model_name,
+        "prompt": "Hello",
+        "max_tokens": 8,
+        "temperature": 0.0,
+    }
+    for i in range(num_warmup_requests):
+        try:
+            print_info(
+                f"Sending inference warmup request {i+1}/{num_warmup_requests}..."
+            )
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                print_info(
+                    f"Warmup request {i+1}/{num_warmup_requests} succeeded")
+            else:
+                print_warning(
+                    f"Warmup request {i+1} returned status {resp.status_code}: "
+                    f"{resp.text[:200]}")
+                return False
+        except requests.RequestException as e:
+            print_warning(f"Warmup request {i+1} failed: {e}")
+            return False
+    print_info("Inference warmup complete")
+    return True
+
+
 def is_port_available(port: int,
                       host: str = "localhost") -> Tuple[bool, Optional[str]]:
     """
@@ -373,7 +417,6 @@ def is_port_available(port: int,
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
     ids=lambda x: x)
-@pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
@@ -385,13 +428,11 @@ def is_port_available(port: int,
     [
         # Configuration for TinyLlama model
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-                    tp_size=1,
-                    memory_requirement=12288),
-        # Configuration for Llama-v3 model
+        ModelConfig(
+            model_dir="Qwen3/Qwen3-0.6B", tp_size=1, memory_requirement=12288),
+        # Configuration for Qwen3.5-4B
         # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
-                    tp_size=1,
+        ModelConfig(model_dir="Qwen3.5-4B", tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
         # memory_requirement is in MiB (96 GB = 98304 MiB)
@@ -419,9 +460,9 @@ def is_port_available(port: int,
                     memory_requirement=172032),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
-def test_run_stress_test(config, stress_time_timeout, backend,
-                         capacity_scheduler_policy, test_mode):
-    """Run the stress test with the provided configuration, backend, and test mode.
+def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
+                         test_mode):
+    """Run the stress test with the provided configuration and test mode.
 
     This test function calls the stress_test function with the given parameters.
     The function should start with test_ prefix to be recognized as a test function by pytest.
@@ -429,18 +470,9 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
-        backend: Backend to use ("trt" or "pytorch")
         capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
-    # Create a new ModelConfig with the backend parameter
-    # Convert 'trt' to None as expected by the ModelConfig
-
-    new_config = ModelConfig(model_dir=config.model_dir,
-                             tp_size=config.tp_size,
-                             memory_requirement=config.memory_requirement,
-                             backend=backend)
-
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
 
@@ -448,9 +480,8 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     server_config = ServerConfig(
         capacity_scheduler_policy=capacity_scheduler_policy)
 
-    # Call the existing stress_test function with the new config and test mode
-    stress_test(new_config, test_mode, server_config, stress_time,
-                stress_timeout)
+    # Call the existing stress_test function with the config and test mode
+    stress_test(config, test_mode, server_config, stress_time, stress_timeout)
 
 
 def stress_test(config,
@@ -531,6 +562,9 @@ def stress_test(config,
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # Reduce CUDA allocator fragmentation so transient MoE workspace
+        # allocations don't OOM when KV cache reservation is large.
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
@@ -542,7 +576,7 @@ def stress_test(config,
             max_num_tokens=
             8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.75,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
@@ -636,14 +670,13 @@ def stress_test(config,
             print_warning(f"Failed to detect GPU architecture: {e}. "
                           "Using default MOE backend (CUTLASS).")
 
-        if config.backend == "pytorch":
-            extra_llm_options.update({
-                "cuda_graph_config": {
-                    "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                },
-                "print_iter_log": True,
-            })
+        extra_llm_options.update({
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -663,7 +696,7 @@ def stress_test(config,
         "--pp_size",
         str(test_server_config.pp_size),
         "--backend",
-        config.backend,
+        "pytorch",
     ]
 
     # Only add ep_size parameter if it's not None
@@ -752,6 +785,14 @@ def stress_test(config,
             # Run performance tests only if server is healthy
             print_info(
                 f"Server is running with model {model_name}. Starting tests...")
+
+            # Warm up the inference pipeline before benchmarking.
+            # The /health endpoint only confirms the HTTP layer is up; the
+            # first real inference triggers JIT/CUDA-graph compilation that
+            # can take much longer than aiperf's per-request timeout.
+            if not warmup_inference(test_server_config.url, model_name):
+                print_warning("Inference warmup failed -- proceeding anyway, "
+                              "but aiperf may hit startup timeouts")
 
             # Run baseline accuracy test first if enabled
             baseline_accuracy_success = True
@@ -851,10 +892,15 @@ def create_aiperf_command(model_name,
                           input_len_mean=PerformanceParams.input_len_mean,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
-                          output_len_std=PerformanceParams.output_len_std,
-                          warmup_request_count=10):
+                          output_len_std=PerformanceParams.output_len_std):
     """
     Create a command list for aiperf with standardized parameters.
+
+    The server should already be inference-warmed via warmup_inference()
+    before this command is run, so aiperf's own warmup phase is skipped
+    (no --warmup-request-count).  This avoids hitting aiperf's fixed
+    internal startup timeout on memory-constrained GPUs where warmup
+    requests at full profiling concurrency are too slow.
 
     Args:
         model_name: Name of the model
@@ -866,11 +912,15 @@ def create_aiperf_command(model_name,
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
         output_len_std: Standard deviation of output length
-        warmup_request_count: Number of warmup requests
 
     Returns:
         List of command-line arguments for aiperf
     """
+    # --no-server-metrics: trtllm-serve exposes /metrics as a JSON
+    # iteration-stats endpoint (see openai_server.get_iteration_stats),
+    # not a Prometheus exposition. aiperf's ServerMetricsManager hangs
+    # scraping it, causing PROFILE_START to exceed the 60s
+    # AIPERF_SERVICE_PROFILE_START_TIMEOUT and the benchmark to abort.
     return [
         "aiperf",
         "profile",
@@ -882,6 +932,7 @@ def create_aiperf_command(model_name,
         "completions",
         "-u",
         server_url,
+        "--no-server-metrics",
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -896,8 +947,10 @@ def create_aiperf_command(model_name,
         str(request_count),
         "--concurrency",
         str(concurrency),
-        "--warmup-request-count",
-        str(warmup_request_count),
+        "--output-artifact-dir",
+        os.path.join(
+            ARTIFACTS_DIR,
+            f"{model_name}-openai-completions-concurrency{concurrency}"),
         # "--verbose",
     ]
 
@@ -910,6 +963,9 @@ def run_aiperf_process(cmd,
     """
     Run a aiperf process and monitor both the process and server health.
 
+    Captures stdout/stderr so that aiperf's error output is visible in the
+    pytest report when it exits with a non-zero code.
+
     Args:
         cmd: Command list to execute aiperf
         test_start_time: Start time of the test
@@ -920,29 +976,53 @@ def run_aiperf_process(cmd,
     Returns:
         Boolean indicating whether the process completed successfully
     """
-    # Start aiperf process with our context manager
-    with launch_process(cmd,
-                        start_new_session=True,
-                        filter_pattern=None,
-                        request_counter=request_counter) as process:
-        # Set monitoring parameters
+    stdout_lines = []
+    stderr_lines = []
+    stdout_lock = threading.Lock()
+    stderr_lock = threading.Lock()
+
+    def _capture_and_print(pipe, line_buffer, lock):
+        try:
+            for line in iter(pipe.readline, ''):
+                print(line, end='', flush=True)
+                with lock:
+                    line_buffer.append(line)
+        except (BrokenPipeError, IOError, ValueError):
+            pass
+
+    process = Popen(cmd,
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=1,
+                    universal_newlines=True)
+    print_info(f"Process started with PID: {process.pid}")
+
+    stdout_reader = threading.Thread(target=_capture_and_print,
+                                     args=(process.stdout, stdout_lines,
+                                           stdout_lock),
+                                     daemon=True)
+    stderr_reader = threading.Thread(target=_capture_and_print,
+                                     args=(process.stderr, stderr_lines,
+                                           stderr_lock),
+                                     daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+
+    try:
         last_health_check = time.time()
         process_completed = False
 
-        # Monitor both the server and aiperf process
         while process.poll() is None:
             current_time = time.time()
 
-            # Check if aiperf is still running but exceeded timeout
             elapsed_time = current_time - test_start_time
             if elapsed_time > test_timeout:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
                     f"aiperf test timed out after {test_timeout} seconds")
 
-            # Check server health periodically
             if current_time - last_health_check > server_config.health_check_timeout:
-
                 is_healthy, error_msg = check_server_health(
                     server_config.url, server_config.health_check_timeout)
 
@@ -951,24 +1031,32 @@ def run_aiperf_process(cmd,
                         f"Server health check passed after {elapsed_time:.1f} seconds of test"
                     )
                 else:
-                    # Raise an exception to stop the test
                     print_warning(f"Server health check failed: {error_msg}")
                     cleanup_process_tree(process, has_session=True)
                     raise RuntimeError(
                         f"Server health check failed during test: {error_msg}")
 
-                # Update last health check time
                 last_health_check = current_time
 
             time.sleep(0.5)
 
-        # Check final status of aiperf process
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
+
         retcode = process.poll()
         if retcode is not None:
             if retcode != 0:
+                with stderr_lock:
+                    captured_stderr = ''.join(stderr_lines[-50:])
+                with stdout_lock:
+                    captured_stdout = ''.join(stdout_lines[-50:])
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"aiperf exited with non-zero code: {retcode}")
+                    f"aiperf exited with non-zero code: {retcode}\n"
+                    f"--- aiperf stdout (last 50 lines) ---\n"
+                    f"{captured_stdout}\n"
+                    f"--- aiperf stderr (last 50 lines) ---\n"
+                    f"{captured_stderr}")
             else:
                 print_info("aiperf completed successfully")
                 process_completed = True
@@ -976,6 +1064,17 @@ def run_aiperf_process(cmd,
             cleanup_process_tree(process, has_session=True)
             raise RuntimeError(
                 "aiperf did not complete normally, will terminate")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=GRACEFUL_TERMINATION_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                cleanup_process_tree(process, has_session=True)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
     return process_completed
 
@@ -1024,8 +1123,7 @@ def measure_capacity_stage(model_name,
             input_len_mean=performance_params.input_len_mean,
             input_len_std=performance_params.input_len_std,
             output_len_mean=performance_params.output_len_mean,
-            output_len_std=performance_params.output_len_std,
-            warmup_request_count=10)
+            output_len_std=performance_params.output_len_std)
 
         # Run aiperf process
         process_completed = run_aiperf_process(cmd, test_start_time,
@@ -1132,8 +1230,7 @@ def stress_stage(model_name,
         input_len_mean=PerformanceParams.input_len_mean,
         input_len_std=PerformanceParams.input_len_std,
         output_len_mean=PerformanceParams.output_len_mean,
-        output_len_std=PerformanceParams.output_len_std,
-        warmup_request_count=10)
+        output_len_std=PerformanceParams.output_len_std)
 
     # Start aiperf process
     process_completed = run_aiperf_process(cmd, test_start_time, test_timeout,
@@ -1262,9 +1359,10 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     """
     # Set default artifacts_dir relative to this script's location
     # The artifacts are at defs/artifacts/, one level up from stress_test/
+    # For local testing, the artifacts are at
+    # artifacts_dir = os.path.join(script_dir, "artifacts")
     if artifacts_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+        artifacts_dir = ARTIFACTS_DIR
 
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,

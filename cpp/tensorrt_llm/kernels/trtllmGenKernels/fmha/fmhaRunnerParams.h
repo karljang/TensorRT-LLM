@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,7 +38,11 @@ enum class TrtllmGenAttentionMaskType
     // Sliding window or chunked causal mask.
     SlidingOrChunkedCausal,
     // Custom mask.
-    Custom
+    Custom,
+    // Sliding window mask combined with custom packed mask.
+    SlidingWindowCustom,
+    // Per-token contiguous window bounds.
+    VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -54,9 +58,23 @@ enum class TrtllmGenAttentionMaskType
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
-ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+inline bool isCustomMask(TrtllmGenAttentionMaskType maskType)
+{
+    return maskType == TrtllmGenAttentionMaskType::Custom
+        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
+}
+
+inline bool usesSlidingWindowMask(TrtllmGenAttentionMaskType maskType)
+{
+    return maskType == TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom
+        || maskType == TrtllmGenAttentionMaskType::VariableWindow;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -71,8 +89,6 @@ enum class FmhaKernelType
     SwapsMmaAbForGeneration,
     // Keep tensor A and tensor B of Mma.
     KeepsMmaAbForGeneration,
-    // Speculative decoding (Medusa and Eagle) generation-phase attention kernels, where seqLenQ > 1.
-    SpecDecodingGeneration
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -89,9 +105,8 @@ FMHA_KERNEL_TYPE_FUNCTION(Context)
 FMHA_KERNEL_TYPE_FUNCTION(Generation)
 FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
-FMHA_KERNEL_TYPE_FUNCTION(SpecDecodingGeneration)
 
-#undef QKV_LAYOUT_FUNCTION
+#undef FMHA_KERNEL_TYPE_FUNCTION
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -131,6 +146,36 @@ QKV_LAYOUT_FUNCTION(PagedKv)
 QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 #undef QKV_LAYOUT_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Sparse attention types.
+enum class SparseType : int32_t
+{
+    None = 0,
+    StaticTokenSparse = 1,
+    DynamicTokenSparse = 2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse attention type.
+
+#define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
+    inline bool is##SparseTypeName(SparseType sparseType)                                                              \
+    {                                                                                                                  \
+        return (sparseType == SparseType::SparseTypeName);                                                             \
+    }
+
+SPARSE_TYPE_FUNCTION(StaticTokenSparse)
+SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
+
+#undef SPARSE_TYPE_FUNCTION
+
+inline bool isTokenSparse(SparseType sparseType)
+{
+    return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -183,6 +228,16 @@ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 struct TllmGenFmhaRunnerParams
 {
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled{false};
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cosSinCache{nullptr};
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scaleBufM{0};
+    };
+
     // Input layout.
     QkvLayout mQkvLayout;
     // Attention mask type.
@@ -202,6 +257,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr = nullptr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
@@ -212,10 +269,17 @@ struct TllmGenFmhaRunnerParams
     int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
     uint32_t* customMaskPtr;
+    // The number of uint32 elements behind customMaskPtr.
+    int64_t customMaskCapacity = 0;
     // The packed custom mask's offsets of each sequence.
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t* firstSparseMaskOffsetsKvPtr;
+    // The variable sparse MLA topK lengths with shape [numTokensQ].
+    int32_t const* ptrSparseMlaTopKLens = nullptr;
+    // Inclusive VariableWindow bounds with one pair per packed Q token.
+    int32_t const* variableWindowTokenStartsPtr = nullptr;
+    int32_t const* variableWindowTokenEndsPtr = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -243,8 +307,15 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // Optional DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams mDsv4EpilogueFusion;
+    // SageAttention scaling factors for Q, K, P and V.
+    float const* sageAttnSfsQPtr = nullptr;
+    float const* sageAttnSfsKPtr = nullptr;
+    float const* sageAttnSfsPPtr = nullptr;
+    float const* sageAttnSfsVPtr = nullptr;
     // The sequence lengths for Q.
-    int const* seqlensQPtr;
+    int const* seqLensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -262,9 +333,16 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
-    // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
-    // mAttentionWindowSize).
-    int mAttentionWindowSize;
+    // Optional JIT warmup shape.
+    bool mJITWarmup = false;
+    int mJITWarmupMaxNumRequests = 0;
+    int mJITWarmupMaxSeqLenQ = 0;
+    int mJITWarmupMaxSeqLenKv = 0;
+    // True when a prefill/context path intentionally uses a generation kernel.
+    bool mUseGenKernelForPrefill = false;
+    // Sliding-window reaches excluding the current token. A negative value means unbounded on that side.
+    int mLeftSlidingWindow;
+    int mRightSlidingWindow;
     // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
     int mChunkedAttentionSize;
     // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
@@ -285,16 +363,28 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
-    // Whether to use sparse MLA.
-    bool mSparseMla;
-    // The top k value for sparse MLA.
-    int mSparseMlaTopK;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float mSkipCorrThreshold{0.0F};
+    // Sparse attention type.
+    SparseType mSparseAttention;
+    // The top k value for sparse attention.
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.
     int32_t mLayerIdx = 0;
     // Whether the spec-dec tree is used.
     bool mIsSpecDecTree = false;
+    // The max seqLenQ used as row stride for generalPackedCustoMaskPtr.
+    // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
+    // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
+    int32_t mPackedMaskMaxSeqLenQ = 0;
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
+    bool mForcePrepareSpecDecTreeMask = false;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax{false};
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress{false};
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
@@ -312,7 +402,7 @@ struct TllmGenFmhaRunnerParams
         case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
             mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             break;
-        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+        case 4: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
             break;
         default:
@@ -354,6 +444,10 @@ struct TllmGenSelectKernelParams
     bool mUses2CtaMma;
     // Skips softmax or not.
     bool mSkipsSoftmaxWhenPossible;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax;
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -370,7 +464,9 @@ struct TllmGenSelectKernelParams
         , mTileSizeQ(128)
         , mTileSizeKv(128)
         , mUses2CtaMma(false)
-        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f)
+        , mFp16Softmax(params.mFp16Softmax)
+        , mUsesSpcompress(params.mUsesSpcompress){};
 };
 
 } // namespace kernels

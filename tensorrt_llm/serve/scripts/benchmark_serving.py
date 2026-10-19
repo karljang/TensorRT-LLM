@@ -28,6 +28,7 @@ from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -80,6 +81,10 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
+    # Energy metrics
+    total_energy_j: Optional[float]
+    output_tps_per_w: Optional[float]
+    total_gpu_power_w: Optional[float]
     # Statistics for avg_decoded_tokens_per_iter across all requests
     mean_avg_decoded_tokens_per_iter: float
     min_avg_decoded_tokens_per_iter: float
@@ -139,6 +144,8 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    total_energy: Optional[float] = None,
+    total_energy_query_time: Optional[float] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -223,6 +230,16 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2)
+
+    # Compute energy-derived metrics
+    total_output_tokens = sum(actual_output_lens)
+    if total_energy is not None and total_energy > 0:
+        output_tps_per_w = total_output_tokens / total_energy
+        total_gpu_power_w = total_energy / total_energy_query_time if total_energy_query_time > 0 else 0.0
+    else:
+        output_tps_per_w = None
+        total_gpu_power_w = None
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -253,6 +270,9 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
+        total_energy_j=total_energy,
+        output_tps_per_w=output_tps_per_w,
+        total_gpu_power_w=total_gpu_power_w,
         mean_avg_decoded_tokens_per_iter=np.mean(
             avg_decoded_tokens_per_iter_list or 0),
         min_avg_decoded_tokens_per_iter=np.min(avg_decoded_tokens_per_iter_list)
@@ -389,6 +409,9 @@ async def benchmark(
                                       pbar=pbar,
                                       session=session)
 
+    # Query energy metrics before benchmark
+    energy_start = await fetch_energy_metrics(base_url)
+
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     session = aiohttp.ClientSession(trust_env=True,
@@ -450,8 +473,21 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    # Query energy metrics after benchmark
+    energy_end = await fetch_energy_metrics(base_url)
+
     # Close the session
     await session.close()
+
+    # Compute energy delta for this benchmark run
+    total_energy, total_energy_query_time = None, None
+    if (energy_start is not None and energy_end is not None
+            and "total_energy_j" in energy_start
+            and "total_energy_j" in energy_end):
+        total_energy = (energy_end["total_energy_j"] -
+                        energy_start["total_energy_j"])
+        total_energy_query_time = energy_end["query_time"] - energy_start[
+            "query_time"]
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -461,6 +497,8 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        total_energy=total_energy,
+        total_energy_query_time=total_energy_query_time,
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
@@ -522,6 +560,13 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+
+    if metrics.total_energy_j is not None:
+        result["energy"] = {
+            "total_energy_j": metrics.total_energy_j,
+            "output_tps_per_w": metrics.output_tps_per_w,
+            "total_gpu_power_w": metrics.total_gpu_power_w,
+        }
 
     def process_one_metric(
         # E.g., "ttft"
@@ -595,6 +640,16 @@ async def benchmark(
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
+    if metrics.total_energy_j is not None:
+        print("{s:{c}^{n}}".format(s=' Energy Metrics ', n=50, c='-'))
+        print("{:<40} {:<10.4f}".format("Total Energy (J):",
+                                        metrics.total_energy_j))
+        print("{:<40} {:<10.4f}".format(
+            "Output Tokens per Second per Watt (tps/W):",
+            metrics.output_tps_per_w))
+        print("{:<40} {:<10.4f}".format("Total GPU Power (W):",
+                                        metrics.total_gpu_power_w))
+
     print("=" * 50)
 
     return result
@@ -659,32 +714,82 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         write_to_json(pt_file, pt_records)
 
 
-async def fetch_perf_metrics(base_url: str) -> dict:
-    """
-    Fetch performance metrics from the /perf_metrics endpoint.
+async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
+    """Fetch energy metrics from the /energy_metrics endpoint.
 
     Args:
-        base_url: The base URL of the server
+        base_url: The base URL of the server.
 
     Returns:
-        Dictionary containing the performance metrics
+        Dictionary containing energy metrics, or None if unavailable.
     """
-    perf_url = f"{base_url}/perf_metrics"
+    energy_url = f"{base_url}/energy_metrics"
 
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
         try:
-            async with session.get(perf_url) as response:
+            async with session.get(energy_url) as response:
                 if response.status == 200:
                     return await response.json()
                 else:
-                    print(
-                        f"Failed to fetch performance metrics. Status: {response.status}"
-                    )
-                    return {}
-        except Exception as e:
-            print(f"Error fetching performance metrics: {e}")
-            return {}
+                    return None
+        except Exception:
+            return None
+
+
+def _snapshot_perf_metrics(output_dir: str) -> dict[Path, int]:
+    directory = Path(output_dir)
+    if not directory.exists():
+        return {}
+    if not directory.is_dir():
+        raise ValueError(
+            f"Performance metrics output path is not a directory: {output_dir}")
+    return {
+        path: path.stat().st_size
+        for path in directory.glob("perf_metrics-*.jsonl")
+    }
+
+
+def _perf_metrics_files(output_dir: str, offsets: dict[Path,
+                                                       int]) -> list[Path]:
+    paths = sorted(Path(output_dir).glob("perf_metrics-*.jsonl"))
+    by_kind = {}
+    for path in paths:
+        if path.stat().st_size <= offsets.get(path, 0):
+            continue
+        kind = path.name.removeprefix("perf_metrics-").split("-", 1)[0]
+        by_kind.setdefault(kind, []).append(path)
+    if "disagg" in by_kind:
+        return by_kind["disagg"]
+    if "server" in by_kind:
+        return by_kind["server"]
+    return []
+
+
+def _read_new_perf_metrics(
+    output_dir: str,
+    offsets: dict[Path, int],
+    expected_count: int,
+    timeout: float = 10,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    records = []
+    while time.monotonic() < deadline:
+        records = []
+        for path in _perf_metrics_files(output_dir, offsets):
+            with path.open("r", encoding="utf-8") as metrics_file:
+                metrics_file.seek(offsets.get(path, 0))
+                for line in metrics_file:
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        if len(records) >= expected_count:
+            return records
+        time.sleep(0.1)
+    return records
 
 
 def main(args: argparse.Namespace):
@@ -710,7 +815,9 @@ def main(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
+                              trust_remote_code=args.trust_remote_code,
+                              custom_tokenizer=getattr(args, 'custom_tokenizer',
+                                                       None))
 
     if args.dataset_name is None:
         raise ValueError(
@@ -782,11 +889,12 @@ def main(args: argparse.Namespace):
         )
 
     elif args.dataset_name == "trtllm_custom":
-        input_requests = CustomDataset(dataset_path=args.dataset_path,
-                                       random_seed=args.seed).sample(
-                                           num_requests=args.num_prompts,
-                                           tokenizer=tokenizer,
-                                       )
+        input_requests = CustomDataset(
+            dataset_path=args.dataset_path, random_seed=args.seed).sample(
+                num_requests=args.num_prompts,
+                tokenizer=tokenizer,
+                output_len=args.trtllm_custom_output_len,
+            )
 
     else:
 
@@ -886,6 +994,10 @@ def main(args: argparse.Namespace):
     # Avoid GC - reduce pause times.
     gc.disable()
 
+    perf_metrics_output_dir = getattr(args, 'save_request_time_breakdown', None)
+    perf_metrics_offsets = (_snapshot_perf_metrics(perf_metrics_output_dir)
+                            if perf_metrics_output_dir else {})
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -966,54 +1078,82 @@ def main(args: argparse.Namespace):
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
-    # Save per-request breakdown if requested
-    if args.save_request_time_breakdown:
-        print("Fetching request performance metrics...")
-        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+    if perf_metrics_output_dir:
+        expected_count = benchmark_result["completed"] + int(
+            not args.no_test_input)
+        perf_metrics = _read_new_perf_metrics(perf_metrics_output_dir,
+                                              perf_metrics_offsets,
+                                              expected_count)
+        if not perf_metrics:
+            print("No new public-server performance metrics found; "
+                  "skipping time breakdown report.")
+            return
+        if len(perf_metrics) < expected_count:
+            print(f"Warning: found {len(perf_metrics)} of "
+                  f"{expected_count} expected performance metrics records.")
 
-        if perf_metrics:
-            # Generate filename for perf metrics
-            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-            base_model_id = model_id.split("/")[-1]
-            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                                   if args.max_concurrency is not None else "")
-            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_model_id = model_id.split("/")[-1]
+        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                               if args.max_concurrency is not None else "")
+        output_stem = (f"{backend}-{args.request_rate}qps{max_concurrency_str}-"
+                       f"{base_model_id}-{current_dt}-perf_metrics")
+        if args.result_dir:
+            output_stem = os.path.join(args.result_dir, output_stem)
+        # Reduce the records we already hold rather than writing them out and reading
+        # them back: the round trip made the whole breakdown depend on output_stem
+        # being writable, so a read-only working directory (no --result-dir) cost the
+        # measurement instead of just the artifact.
+        analyzer = RequestTimeBreakdown()
+        timing_data = analyzer.parse_records(perf_metrics)
+        if not timing_data:
+            print("No time data found; skipping time breakdown report.")
+            return
 
-            if args.result_dir:
-                perf_filename = os.path.join(args.result_dir, perf_filename)
+        # Deliberately not printed as scrapeable "Time Breakdown ..." lines. The
+        # perf-sanity harness aggregates the same spans itself from the worker
+        # JSONLs, and a second producer of those lines is worse than none: this
+        # view is built from the client's copy of the file only, drops spans whose
+        # events overlapped (see compute_statistics), and models neither the
+        # per-step nor the per-chunk spans. Printing it made the harness's
+        # "no breakdown lines were parsed" check pass on the fallback, hiding the
+        # aggregation failure the check exists to surface. Written as an artifact
+        # instead, for whoever passed --save-request-time-breakdown by hand.
+        span_stats = analyzer.compute_statistics(timing_data)
 
-            # Save perf metrics to JSON file
-            with open(perf_filename, "w", encoding='utf-8') as outfile:
-                try:
-                    json.dump(perf_metrics, outfile, indent=2)
-                except Exception as e:
-                    print(f"Failed to save perf metrics: {e}")
-
+        # Each artifact is written independently: an unwritable output_stem would
+        # otherwise raise out of main() and make the client exit non-zero, which the
+        # harness reads as a failed benchmark. output_stem is relative to the current
+        # directory unless --result-dir was given. Report and continue. span_stats is
+        # passed in so the reduction is not run a second time over every request.
+        perf_filename = f"{output_stem}.jsonl"
+        try:
+            with open(perf_filename, "w", encoding="utf-8") as outfile:
+                for record in perf_metrics:
+                    outfile.write(
+                        json.dumps(record, separators=(",", ":")) + "\n")
             print(f"Request performance metrics saved to: {perf_filename}")
+        except OSError as exc:
+            print(f"Could not write {perf_filename}: {exc}")
 
-            # Create timing diagram from the saved JSON file
-            try:
-                analyzer = RequestTimeBreakdown()
+        stats_filename = f"{output_stem}-time_breakdown_stats.json"
+        try:
+            analyzer.export_statistics_json(timing_data,
+                                            stats_filename,
+                                            span_stats=span_stats)
+            print(f"Span statistics saved to: {stats_filename}")
+        except OSError as exc:
+            print(f"Could not write {stats_filename}: {exc}")
 
-                print("Creating time diagram from request time breakdown...")
-                timing_data = analyzer.parse_json_file(perf_filename)
-
-                if timing_data:
-                    # Generate HTML filename for the timing diagram
-                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
-                    analyzer.create_timing_diagram(timing_data,
-                                                   diagram_filename)
-
-                    print(f"Time diagram saved to: {diagram_filename}")
-                else:
-                    print(
-                        "No time data found in request time breakdown - skipping diagram creation."
-                    )
-            except Exception as e:
-                print(f"Failed to create time diagram: {e}")
-                print("Performance metrics were still saved successfully.")
-        else:
-            print("Failed to fetch per-request performance metrics.")
+        diagram_filename = f"{output_stem}-time_diagram.html"
+        try:
+            analyzer.create_timing_diagram(timing_data, diagram_filename)
+            print(f"Time diagram saved to: {diagram_filename}")
+        except (OSError, ValueError, TypeError) as exc:
+            # plotly is a module-scope import of time_breakdown, so ImportError cannot
+            # surface here -- it would already have failed this module's import. What can
+            # surface is plotly rejecting the figure it was handed (ValueError/TypeError).
+            print(f"Could not write {diagram_filename}: {exc}")
 
 
 if __name__ == "__main__":
@@ -1138,6 +1278,14 @@ if __name__ == "__main__":
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code from huggingface",
+    )
+    parser.add_argument(
+        "--custom-tokenizer",
+        type=str,
+        default=None,
+        help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
+        "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+        "is incompatible with AutoTokenizer.",
     )
     parser.add_argument(
         "--disable-tqdm",
@@ -1340,6 +1488,16 @@ if __name__ == "__main__":
         "from the sampled HF dataset.",
     )
 
+    trtllm_custom_group = parser.add_argument_group(
+        "trtllm_custom dataset options")
+    trtllm_custom_group.add_argument(
+        "--trtllm-custom-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the per-sample "
+        "\"max_tokens\" from the trtllm_custom dataset.",
+    )
+
     sampling_group = parser.add_argument_group("sampling parameters")
     sampling_group.add_argument(
         "--top-p",
@@ -1400,9 +1558,14 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--save-request-time-breakdown",
-        action="store_true",
-        help=
-        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="PERF_METRICS_OUTPUT_DIR",
+        help=("Read JSONL records dumped by the server's "
+              "perf_metrics_output_dir, save the benchmark records, and "
+              "create an interactive time breakdown diagram. If no directory "
+              "is provided, use the current directory."),
     )
 
     args = parser.parse_args()

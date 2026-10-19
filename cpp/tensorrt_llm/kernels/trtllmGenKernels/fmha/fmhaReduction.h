@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,8 @@
 #pragma once
 
 #include "cubin/kernelMetaInfo.h"
-#include "fmhaRunnerParams.h"
-#include "kernelParams.h"
 #include "tensorrt_llm/common/config.h"
+#include "trtllmGen_fmha_export/KernelParamsDecl.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,8 +27,8 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
-    int32_t multiProcessorCount, cudaStream_t stream);
+void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
+    float softmaxPScale, int32_t multiProcessorCount, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -65,47 +65,29 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
 
     // Fragment double buffer (reduce register pressure)
-    enum
-    {
-        FRAGMENT_QK_SIZE_IN_K_DIM
-        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K
-    };
+    static constexpr int FRAGMENT_QK_SIZE_IN_K_DIM
+        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K;
 
     static_assert(!(Kernel_traits::LIMIT_QK_FRAGMENTS && USE_LDGSTS_K), "");
     static_assert(!(Kernel_traits::SHARE_SMEM_FOR_K_AND_V
                       && (Kernel_traits::LIMIT_QK_FRAGMENTS || Kernel_traits::LIMIT_V_FRAGMENTS)),
         "");
 
-    enum
-    {
-        FRAGMENT_V_SIZE_IN_K_DIM
-        = (Kernel_traits::LIMIT_V_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_V_FRAGMENTS) *Mma_tile_o::MMAS_K
-    };
+    static constexpr int FRAGMENT_V_SIZE_IN_K_DIM
+        = (Kernel_traits::LIMIT_V_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_V_FRAGMENTS) *Mma_tile_o::MMAS_K;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -172,19 +154,42 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     static_assert(MASK_LOOPS * Cta_tile_p::N == Cta_tile_p::M || Cta_tile_p::N >= Cta_tile_p::M, "");
 
     // The start/end step of kv loops.
-    // Do we need to mask out the tokens that is far away from the beginning.
+    // Do we need to mask out the tokens that is not in the sliding window.
     bool const mask_sliding_window
-        = Kernel_traits::SLIDING_WINDOW_ATTENTION && binfo.actual_kv_seqlen > params.sliding_window_size;
+        = (Kernel_traits::SLIDING_WINDOW_ATTENTION && binfo.actual_kv_seqlen > params.sliding_window_size)
+        || (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+            && binfo.actual_kv_seqlen > params.sliding_window_size / 2 + 1); // +1 to include self token
+
     int const valid_seqlen = Kernel_traits::CAUSAL_MASK ? min(q_sequence_start + Cta_tile_p::M, binfo.actual_kv_seqlen)
                                                         : binfo.actual_kv_seqlen;
 
-    int const kv_loop_end = ((valid_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N) * Cta_tile_p::N;
-    int const kv_loop_start = mask_sliding_window
-        ? (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
-        : 0;
-    int const sliding_window_mask_end = mask_sliding_window
-        ? (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
-        : 0;
+    int kv_loop_start = 0;
+    int kv_loop_end = fmha::div_up(valid_seqlen, int(Cta_tile_p::N)) * int(Cta_tile_p::N);
+    int sliding_window_mask_left = 0;
+    int sliding_window_mask_right = kv_loop_end;
+    if (mask_sliding_window)
+    {
+        if constexpr (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+        {
+            kv_loop_start = (max(0, q_sequence_start - params.sliding_window_size / 2) / Cta_tile_p::N) * Cta_tile_p::N;
+            sliding_window_mask_left
+                = (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size / 2) / Cta_tile_p::N)
+                * Cta_tile_p::N;
+
+            kv_loop_end = min(kv_loop_end,
+                (fmha::div_up(q_sequence_start + Cta_tile_p::M + params.sliding_window_size / 2, int(Cta_tile_p::N))
+                    * Cta_tile_p::N));
+            sliding_window_mask_right = min(sliding_window_mask_right,
+                ((q_sequence_start + params.sliding_window_size / 2) / int(Cta_tile_p::N)) * Cta_tile_p::N);
+        }
+        else
+        {
+            kv_loop_start = (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N;
+            sliding_window_mask_left
+                = (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size) / Cta_tile_p::N)
+                * Cta_tile_p::N;
+        }
+    }
 
     static_assert(Cta_tile_p::M >= Cta_tile_p::N, "");
 
@@ -278,10 +283,7 @@ inline __device__ void device_flash_attention_nl(Params const& params)
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum
-    {
-        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8;
 
     using Gmem_tile_p = fmha::Gmem_tile_p<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
     Gmem_tile_p gmem_p(params.p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx,
@@ -290,10 +292,7 @@ inline __device__ void device_flash_attention_nl(Params const& params)
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum
-    {
-        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8;
 
     using Gmem_tile_s = fmha::Gmem_tile_s<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
     Gmem_tile_s gmem_s(params.s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx,
@@ -309,36 +308,22 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     }
 
     // Prefetch next kv buffer to share memory
-    enum
-    {
-        PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY
-    };
+    static constexpr int PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY;
 
-    enum
-    {
-        PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V
-    };
+    static constexpr int PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V;
 
-    enum
-    {
-        PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM
-    };
+    static constexpr int PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM;
 
     // The number of threads per row.
     // enum { THREADS_PER_ROW = Cta_tile_p::WARPS_N * 8 };
     // DEBUG.
     // static_assert(THREADS_PER_ROW == 32, "");
     // END OF DEBUG.
-    enum
-    {
-        THREADS_PER_ROW = 32
-    };
+    static constexpr int THREADS_PER_ROW = 32;
 
     // Do we need to check if there are negative inf for softmax row_max ?
-    enum
-    {
-        CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK
-    };
+    static constexpr int CHECK_NEG_INF = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+        || Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK;
 
     // Load the mask for that iteration.
     mask.load(Kernel_traits::CUSTOM_MASK || Kernel_traits::IS_MTP ? q_loop * Gmem_tile_q::ROWS : q_sequence_start);
@@ -363,7 +348,8 @@ inline __device__ void device_flash_attention_nl(Params const& params)
 
         bool const first_step = (kv_loop == kv_loop_start);
         // It is possible that all tokens are masked out (sliding-window-attention).
-        bool const apply_sliding_window_mask = (mask_sliding_window && kv_loop <= sliding_window_mask_end);
+        bool const apply_sliding_window_mask
+            = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
         bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
 
         // Move mask offset.

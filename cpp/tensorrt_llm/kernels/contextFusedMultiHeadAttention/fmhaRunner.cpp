@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -84,12 +84,16 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
-    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_100
-                             || mSM == kSM_103 || mSM == kSM_120 || mSM == kSM_121),
+    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90
+                             || tensorrt_llm::common::isSM100Family(mSM) || mSM == kSM_120 || mSM == kSM_121),
         "Unsupported architecture");
-    TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
-                             || mFixedParams.dataType == DATA_TYPE_E4M3),
+    TLLM_CHECK_WITH_INFO(
+        (mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16 || isFp8Selected()),
         "Unsupported data type");
+    if (tensorrt_llm::common::isSM100Family(mSM))
+    {
+        mSM = kSM_100;
+    }
     xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
     if (mFixedParams.headSizeV == 0)
@@ -273,7 +277,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // 2 scales prepared for scaleBmm1 in the device memory: float scale, float (scale with log2e).
     int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? kIdxScaleSoftmaxLog2Ptr : kIdxScaleSoftmaxPtr);
     // Only fp8 kernels need to load scales from the device memory.
-    if (mFixedParams.dataType == DATA_TYPE_E4M3)
+    if (isFp8Selected())
     {
         mKernelParams.scale_bmm1_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm1Ptr + scaleBmm1PtrOffset);
         mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
@@ -317,7 +321,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.enableAttnLogitSoftcapping = mFixedParams.attnLogitSoftcappingScale != 0.f;
     // BF16 FMHA only accumulates on FP32.
     // E4M3 FMHA only supports fp32 accumulation currently.
-    mLaunchParams.force_fp32_acc = mFixedParams.dataType == DATA_TYPE_BF16 || mFixedParams.dataType == DATA_TYPE_E4M3
+    mLaunchParams.force_fp32_acc = mFixedParams.dataType == DATA_TYPE_BF16 || isFp8Selected()
         || mFixedParams.forceFp32Acc || runnerParams.forceFp32Acc;
     // The attention mask type.
     mLaunchParams.attention_mask_type = mFixedParams.attentionMaskType;
@@ -353,7 +357,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
-    bool const isSm100f = (mSM == kSM_100 || mSM == kSM_103);
+    bool const isSm100f = tensorrt_llm::common::isSM100Family(mSM);
     bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
 
     // Sliding_or_chunked_causal mask.
@@ -378,7 +382,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     // Only warp-specialized FMHA kernels support FP8 on Hopper.
     // Separate Q + KV input layout: enable warp-specialization kernels when s > 512, otherwise use ampere-style flash
     // attention kernels.
-    if (isSm90 && (mFixedParams.dataType == DATA_TYPE_E4M3 || (separateQKvInput && runnerParams.kvSeqLen > 512)))
+    if (isSm90 && (isFp8Selected() || (separateQKvInput && runnerParams.kvSeqLen > 512)))
     {
         mLaunchParams.flash_attention = true;
         mLaunchParams.force_unroll = true;
@@ -396,7 +400,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if ((isSm89 || isSm120f) && mFixedParams.dataType == DATA_TYPE_E4M3)
+        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
         {
             // so far Ada QMMA only supports non-tiled kernels.
             mLaunchParams.granular_tiling = false;
@@ -493,17 +497,16 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
-    // Setup launch params for skip softmax attention
-    mLaunchParams.enableSkipSoftmax = false;
-    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
-    {
-        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
-        {
-            TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
-        }
-        mLaunchParams.enableSkipSoftmax = true;
-    }
+    // Skip-softmax is driven by the threshold alone -- there is no separate enable
+    // flag. It is realized by two kernels: the Hopper warp-specialized FMHA, which
+    // is selected through the enableSkipSoftmax cubin-hash bit, and the sm_120 /
+    // sm_121 warp-specialized context FMHA, which reads the threshold directly and
+    // therefore does not need the cubin-hash bit (enableSkipSoftmax stays false
+    // there -- see fused_multihead_attention_v2.cpp). If no skip-capable kernel
+    // matches the config, skipping is simply not enabled and the request runs full
+    // softmax.
+    mLaunchParams.enableSkipSoftmax = runnerParams.skipSoftmaxThresholdScaleFactor > 0 && isSm90
+        && mLaunchParams.warp_specialization && mLaunchParams.flash_attention;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

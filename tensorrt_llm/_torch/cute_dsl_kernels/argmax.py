@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025, Tri Dao.
 # SPDX-FileCopyrightText: Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -117,7 +117,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @cute.jit
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-        tApA = cute.make_fragment(
+        tApA = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tAcA, mode=[0, 1]),
@@ -597,9 +597,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             x: Input tensor of shape (M, N)
 
         Returns:
-            Output tensor of shape (M, 2) where:
-            - Column 0: Maximum value in each row
-            - Column 1: Index of maximum value in each row (argmax)
+            Output tensor of shape (M, 2) in float32 dtype where:
+            - Column 0: Maximum value in each row (converted to float32)
+            - Column 1: Index of maximum value in each row (argmax, stored as float32)
+
         """
         assert x.dim() == 2, "Input must be 2D"
         assert x.is_cuda, "Tensor must be on CUDA device"
@@ -609,9 +610,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         if _should_use_torch_fallback(N, x.dtype):
             max_vals, max_indices = torch.max(x, dim=-1, keepdim=True)
-            return torch.cat([max_vals, max_indices.to(x.dtype)], dim=-1)
+            # Use float32 for indices to avoid precision loss with large vocab sizes
+            return torch.cat([max_vals.to(torch.float32), max_indices.to(torch.float32)], dim=-1)
 
-        out = torch.empty((M, 2), dtype=x.dtype, device=x.device)
+        # Use float32 for output to preserve argmax index precision.
+        # Float32 can exactly represent all integers up to 2^24 = 16,777,216.
+        # Typical vocab sizes (e.g. 131072 = 2^17) are well within this range.
+        out = torch.empty((M, 2), dtype=torch.float32, device=x.device)
         dtype = torch2cute_dtype_map[x.dtype]
 
         def convert_from_dlpack(tensor):
@@ -645,4 +650,4 @@ else:
     def argmax(x: torch.Tensor) -> torch.Tensor:
         """Fallback argmax using PyTorch when CUTLASS DSL is not available."""
         max_vals, max_indices = torch.max(x, dim=-1, keepdim=True)
-        return torch.cat([max_vals, max_indices.to(x.dtype)], dim=-1)
+        return torch.cat([max_vals.to(torch.float32), max_indices.to(torch.float32)], dim=-1)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,10 +101,9 @@ def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
 
 
 @pytest.mark.gpu4
-@pytest.mark.parametrize("model_dir", ["Qwen2-7B-Instruct"])
-@pytest.mark.parametrize("sampler_type", ["TRTLLMSampler"])
+@pytest.mark.parametrize("model_dir", ["Qwen3/Qwen3-8B"])
 @pytest.mark.parametrize("allreduce_strategy", ["NCCL", "AUTO"])
-def test_accuracy_with_allreduce_strategy(model_dir, sampler_type, allreduce_strategy):
+def test_accuracy_with_allreduce_strategy(model_dir, allreduce_strategy):
     """Test accuracy with different allreduce strategies.
 
     This test validates that both NCCL and AUTO allreduce strategies produce
@@ -138,7 +137,6 @@ def test_accuracy_with_allreduce_strategy(model_dir, sampler_type, allreduce_str
         max_batch_size=256,
         max_num_tokens=8192,
         tensor_parallel_size=4,
-        sampler_type=sampler_type,
         allreduce_strategy=allreduce_strategy,
     )
 

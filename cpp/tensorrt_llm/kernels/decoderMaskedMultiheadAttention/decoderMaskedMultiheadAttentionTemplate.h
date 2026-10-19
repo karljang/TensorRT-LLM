@@ -702,7 +702,7 @@ __inline__ __device__ __nv_fp8_e4m3 vec_conversion<__nv_fp8_e4m3, float>(float c
 template <>
 __inline__ __device__ float2 vec_conversion<float2, fp8_2_t>(fp8_2_t const& a)
 {
-    return float2(a);
+    return fp8x2_to_float2(a);
 }
 
 template <>
@@ -715,7 +715,7 @@ __inline__ __device__ fp8_2_t vec_conversion<fp8_2_t, float2>(float2 const& a)
 template <>
 __inline__ __device__ float4 vec_conversion<float4, fp8_4_t>(fp8_4_t const& a)
 {
-    return float4(a);
+    return fp8x4_to_float4(a);
 }
 
 template <>
@@ -1522,13 +1522,20 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     bool const load_qkv_quant = params.qkv_scale_quant_orig != nullptr;
     bool const write_attention_quant = params.attention_out_scale_orig_quant != nullptr;
 
-    // Quant/Dequant scales for 8bits kv cache.
+    // Quant/Dequant scales for 8bits kv cache. The ENABLE_8BITS_* guards are
+    // compile-time template flags; the runtime pointer can still be nullptr
+    // when the caller omits scales (e.g. unit tests, non-fp8 paths exercising
+    // the same template). Default to 1.0 in that case to mirror the FlashMLA
+    // descale_*_ptr nullptr-safety fix.
     using T_scale = typename kv_cache_scale_type_t<T, Tcache>::Type;
     T_scale kv_scale_orig_quant, k_scale_quant_orig;
-    float const k_scale_quant_orig_f = (ENABLE_8BITS_K_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
-    float const kv_scale_quant_orig_f = (ENABLE_8BITS_KV_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    float const k_scale_quant_orig_f
+        = (ENABLE_8BITS_K_CACHE && params.kv_scale_quant_orig != nullptr ? params.kv_scale_quant_orig[0] : 1.0f);
+    float const kv_scale_quant_orig_f
+        = (ENABLE_8BITS_KV_CACHE && params.kv_scale_quant_orig != nullptr ? params.kv_scale_quant_orig[0] : 1.0f);
     convert_from_float(&k_scale_quant_orig, k_scale_quant_orig_f);
-    convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_KV_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
+    convert_from_float(&kv_scale_orig_quant,
+        (ENABLE_8BITS_KV_CACHE && params.kv_scale_orig_quant != nullptr ? params.kv_scale_orig_quant[0] : 1.0f));
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();

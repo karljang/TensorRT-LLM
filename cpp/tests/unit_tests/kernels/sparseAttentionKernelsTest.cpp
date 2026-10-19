@@ -1,5 +1,22 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -40,34 +57,35 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     constexpr int total_sparse_tokens = 14;
 
     // Create input buffers
-    auto kv_page_offsets
-        = mBufferManager->gpu(ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
-    auto seq_lengths = mBufferManager->gpu(ITensor::makeShape({batch_size}), nvinfer1::DataType::kINT32);
+    auto kv_page_offsets = mBufferManager->gpu(
+        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
+    auto seq_lengths = mBufferManager->gpu(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
     // Shape: [num_head_kv, total_sparse_tokens] - flattened across all batches
     auto sparse_indices
-        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, total_sparse_tokens}), nvinfer1::DataType::kINT32);
-    auto sparse_indices_offsets = mBufferManager->gpu(ITensor::makeShape({batch_size + 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, total_sparse_tokens}), tensorrt_llm::DataType::kINT32);
+    auto sparse_indices_offsets
+        = mBufferManager->gpu(ITensor::makeShape({batch_size + 1}), tensorrt_llm::DataType::kINT32);
 
     // Create output buffers
     auto output_kv_page_offsets = mBufferManager->gpu(
-        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
     auto output_seq_lengths
-        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, batch_size}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, batch_size}), tensorrt_llm::DataType::kINT32);
 
     // Create pinned host buffers for data initialization
     auto kv_page_offsets_host = mBufferManager->pinned(
-        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
-    auto seq_lengths_host = mBufferManager->pinned(ITensor::makeShape({batch_size}), nvinfer1::DataType::kINT32);
-    auto sparse_indices_host
-        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, total_sparse_tokens}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
+    auto seq_lengths_host = mBufferManager->pinned(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
+    auto sparse_indices_host = mBufferManager->pinned(
+        ITensor::makeShape({num_head_kv, total_sparse_tokens}), tensorrt_llm::DataType::kINT32);
     auto sparse_indices_offsets_host
-        = mBufferManager->pinned(ITensor::makeShape({batch_size + 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({batch_size + 1}), tensorrt_llm::DataType::kINT32);
 
     // Initialize test data
-    auto kv_page_offsets_ptr = bufferCast<int32_t>(*kv_page_offsets_host);
-    auto seq_lengths_ptr = bufferCast<int>(*seq_lengths_host);
-    auto sparse_indices_ptr = bufferCast<int>(*sparse_indices_host);
-    auto sparse_indices_offsets_ptr = bufferCast<int>(*sparse_indices_offsets_host);
+    auto kv_page_offsets_ptr = kv_page_offsets_host->getBufferPtr<int32_t>();
+    auto seq_lengths_ptr = seq_lengths_host->getBufferPtr<int>();
+    auto sparse_indices_ptr = sparse_indices_host->getBufferPtr<int>();
+    auto sparse_indices_offsets_ptr = sparse_indices_offsets_host->getBufferPtr<int>();
 
     // Initialize KV page offsets with test data
     for (int b = 0; b < batch_size; ++b)
@@ -128,24 +146,25 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     mBufferManager->copy(*sparse_indices_offsets_host, *sparse_indices_offsets);
 
     SparseAttentionParams sparse_params;
-    sparse_params.sparse_attn_indices = bufferCast<int32_t>(*sparse_indices);
-    sparse_params.sparse_attn_offsets = bufferCast<int32_t>(*sparse_indices_offsets);
+    sparse_params.sparse_attn_indices = sparse_indices->getBufferPtr<int32_t>();
+    sparse_params.sparse_attn_offsets = sparse_indices_offsets->getBufferPtr<int32_t>();
     sparse_params.sparse_attn_indices_block_size = 1; // Token-level indexing
     sparse_params.sparse_attn_indices_stride = total_sparse_tokens;
 
     // Launch the kernel
-    invokeGatherKvPageOffsets(bufferCast<int32_t>(*output_kv_page_offsets), bufferCast<int32_t>(*output_seq_lengths),
-        bufferCast<int32_t>(*kv_page_offsets), bufferCast<int32_t>(*seq_lengths), sparse_params, batch_size,
-        num_head_kv, tokens_per_page, max_num_pages_per_seq, mStream->get());
+    invokeGatherKvPageOffsets(output_kv_page_offsets->getBufferPtr<int32_t>(),
+        output_seq_lengths->getBufferPtr<int32_t>(), kv_page_offsets->getBufferPtr<int32_t>(),
+        seq_lengths->getBufferPtr<int32_t>(), sparse_params, batch_size, num_head_kv, tokens_per_page,
+        max_num_pages_per_seq, mStream->get());
 
     // Wait for completion
     mStream->synchronize();
 
     // Copy results back to host for verification
     auto output_kv_page_offsets_host = mBufferManager->pinned(
-        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
     auto output_seq_lengths_host
-        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, batch_size}), nvinfer1::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, batch_size}), tensorrt_llm::DataType::kINT32);
 
     mBufferManager->copy(*output_kv_page_offsets, *output_kv_page_offsets_host);
     mBufferManager->copy(*output_seq_lengths, *output_seq_lengths_host);
@@ -153,8 +172,8 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     // Wait for completion
     mStream->synchronize();
 
-    auto output_kv_offsets_ptr = bufferCast<int32_t>(*output_kv_page_offsets_host);
-    auto output_seq_len_ptr = bufferCast<int>(*output_seq_lengths_host);
+    auto output_kv_offsets_ptr = output_kv_page_offsets_host->getBufferPtr<int32_t>();
+    auto output_seq_len_ptr = output_seq_lengths_host->getBufferPtr<int>();
 
     // Define expected results for each head and batch
     // Format: {num_pages, {page_indices...}, seq_len}

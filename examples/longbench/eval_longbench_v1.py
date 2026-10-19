@@ -1,12 +1,38 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 LongBench v1 evaluation script with TensorRT-LLM and sparse attention.
 
 Usage:
-    python longbench_rocket_eval.py --dataset narrativeqa --model_path /path/to/model --longbench_path ./LongBench --output_dir results/
+    # RocketKV sparse attention
+    python eval_longbench_v1.py --dataset narrativeqa --model_path /path/to/model --longbench_path ./LongBench --output_dir results/ --rocket_sparse --token_budget 2048
 
     # Run all LongBench tasks
-    python longbench_rocket_eval.py --model_path /path/to/model --longbench_path ./LongBench --output_dir results/ --token_budget 2048 --rocket_sparse
+    python eval_longbench_v1.py --run_all_tasks --model_path /path/to/model --longbench_path ./LongBench --output_dir results/ --rocket_sparse
+
+    # DSA sparse attention + MTP (DeepSeek V3.2 style)
+    python eval_longbench_v1.py --run_all_tasks \
+        --model_path /path/to/DeepSeek-V3.2-Exp-FP4 \
+        --longbench_path ./LongBench --output_dir results/ \
+        --backend pytorch --tp_size 8 --moe_ep_size 8 \
+        --dsa_sparse --enable_heuristic_topk \
+        --mtp 1 --kv_cache_dtype fp8 --tokens_per_block 64 \
+        --kv_cache_fraction 0.8 --enable_attention_dp \
+        --use_cuda_graph --cuda_graph_padding_enabled \
+        --max_batch_size 1 --print_iter_log
 """
 
 import argparse
@@ -23,7 +49,9 @@ from transformers import AutoTokenizer
 
 # Add tensorrt_llm imports
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig, MoeConfig,
+from tensorrt_llm.evaluate.lm_eval import _replace_fuzzywuzzy_with_rapidfuzz
+from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  RocketSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
@@ -94,7 +122,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--backend',
                         type=str,
                         default='pytorch',
-                        choices=['pytorch', 'tensorrt'],
+                        choices=['pytorch'],
                         help='LLM backend to use')
     parser.add_argument('--chat_template',
                         type=str,
@@ -125,8 +153,8 @@ def parse_arguments() -> argparse.Namespace:
                         type=str,
                         default='CUTLASS',
                         choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM',
+                            'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
@@ -134,10 +162,16 @@ def parse_arguments() -> argparse.Namespace:
                         default=False,
                         action='store_true')
 
-    # RocketKV configuration
-    parser.add_argument('--rocket_sparse',
-                        action='store_true',
-                        help='Use rocket sparse attention')
+    # Sparse attention configuration
+    sparse_group = parser.add_mutually_exclusive_group()
+    sparse_group.add_argument('--rocket_sparse',
+                              action='store_true',
+                              help='Use RocketKV sparse attention')
+    sparse_group.add_argument('--dsa_sparse',
+                              action='store_true',
+                              help='Use DeepSeek DSA sparse attention')
+
+    # RocketKV-specific options
     parser.add_argument('--token_budget',
                         type=int,
                         default=2048,
@@ -160,16 +194,36 @@ def parse_arguments() -> argparse.Namespace:
                         choices=['bfloat16', 'float8_e5m2'],
                         help='KT cache data type')
 
+    # DSA-specific options
+    parser.add_argument('--enable_heuristic_topk',
+                        action='store_true',
+                        default=False,
+                        help='Enable heuristic topk for DSA sparse attention')
+    parser.add_argument('--dsa_index_topk',
+                        type=int,
+                        default=None,
+                        help='Top-k for DSA indexer')
+
+    # Speculative decoding (MTP)
+    parser.add_argument('--mtp',
+                        type=int,
+                        default=0,
+                        help='Number of MTP predict layers (0 = disabled)')
+
     # KV cache configuration
     parser.add_argument('--kv_cache_dtype',
                         type=str,
                         default='auto',
-                        help='KV cache data type')
+                        help='KV cache data type (auto, fp8, nvfp4)')
     parser.add_argument('--tokens_per_block', type=int, default=32)
     parser.add_argument('--kv_cache_fraction',
                         type=float,
                         default=0.7,
                         help='Fraction of GPU memory for KV cache')
+    parser.add_argument('--enable_chunked_prefill',
+                        action='store_true',
+                        default=False,
+                        help='Enable chunked prefill')
 
     # Runtime
     parser.add_argument('--print_iter_log',
@@ -322,12 +376,14 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
 
     try:
         # Configure KV cache
-        kv_cache_config = KvCacheConfig(
-            # sparse attention doesn't support KV cache reuse
+        kv_cache_kwargs = dict(
             enable_block_reuse=False,
             free_gpu_memory_fraction=args.kv_cache_fraction,
             tokens_per_block=args.tokens_per_block,
         )
+        if args.kv_cache_dtype != 'auto':
+            kv_cache_kwargs['dtype'] = args.kv_cache_dtype
+        kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
 
         # Configure CUDA graph
         cuda_graph_config = CudaGraphConfig(
@@ -337,7 +393,6 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
 
         # Configure sparse attention
         if args.rocket_sparse:
-            # Configure RocketKV sparse attention
             sparse_attention_config = RocketSparseAttentionConfig(
                 window_size=args.window_size,
                 kernel_size=args.kernel_size,
@@ -345,10 +400,28 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
                 topk=args.topk,
                 kt_cache_dtype=args.kt_cache_dtype,
             )
-            logger.info(f"Using RocketKV sparse attention")
+            logger.info("Using RocketKV sparse attention")
+        elif args.dsa_sparse:
+            dsa_kwargs = dict(
+                enable_heuristic_topk=args.enable_heuristic_topk, )
+            if args.dsa_index_topk is not None:
+                dsa_kwargs['index_topk'] = args.dsa_index_topk
+            sparse_attention_config = DeepSeekSparseAttentionConfig(
+                **dsa_kwargs)
+            logger.info(
+                f"Using DSA sparse attention (heuristic_topk={args.enable_heuristic_topk})"
+            )
         else:
             sparse_attention_config = None
             logger.info("Using standard attention")
+
+        # Configure speculative decoding (MTP)
+        speculative_config = None
+        if args.mtp > 0:
+            speculative_config = MTPDecodingConfig(
+                num_nextn_predict_layers=args.mtp)
+            logger.info(
+                f"Using MTP speculative decoding with {args.mtp} layers")
 
         # Initialize LLM
         llm = LLM(
@@ -358,9 +431,11 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             max_batch_size=args.max_batch_size,
             attn_backend=args.attention_backend,
             sparse_attention_config=sparse_attention_config,
+            speculative_config=speculative_config,
             tensor_parallel_size=args.tp_size,
             moe_expert_parallel_size=args.moe_ep_size,
             enable_attention_dp=args.enable_attention_dp,
+            enable_chunked_prefill=args.enable_chunked_prefill,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
             cuda_graph_config=cuda_graph_config,
@@ -500,10 +575,12 @@ def calculate_metrics(
     # Setup LongBench imports
     setup_longbench_imports(longbench_path)
 
-    # Import LongBench metrics
-    from metrics import (classification_score, code_sim_score, count_score,
-                         qa_f1_score, qa_f1_zh_score, retrieval_score,
-                         retrieval_zh_score, rouge_score, rouge_zh_score)
+    # LongBench still imports FuzzyWuzzy by name. Supply RapidFuzz while its
+    # metrics module loads so the example does not require FuzzyWuzzy.
+    with _replace_fuzzywuzzy_with_rapidfuzz():
+        from metrics import (classification_score, code_sim_score, count_score,
+                             qa_f1_score, qa_f1_zh_score, retrieval_score,
+                             retrieval_zh_score, rouge_score, rouge_zh_score)
 
     # Mapping of datasets to their metric functions (from LongBench)
     dataset2metric = {

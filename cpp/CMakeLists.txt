@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -26,11 +26,27 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+# Single source of truth for the inline ABI namespace. Read by both the C++ side
+# (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
+# the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes
+# the same value into Itanium-mangled linker names). Override at configure time
+# with `-DTRTLLM_ABI_NAMESPACE=_v2` to ship a parallel ABI version that won't
+# collide at static-link time. The compile definition propagates to every C++ TU
+# under this directory so the macro expansion stays in sync with the CMake
+# variable.
+set(TRTLLM_ABI_NAMESPACE
+    "_v1"
+    CACHE
+      STRING
+      "Inline namespace used to version the TRT-LLM ABI (see tensorrt_llm/common/config.h)."
+)
+add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
+
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
@@ -38,7 +54,6 @@ option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
-option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
@@ -110,12 +125,6 @@ else()
   message(STATUS "Not building Google tests")
 endif()
 
-if(BUILD_BENCHMARKS)
-  message(STATUS "Building benchmarks")
-else()
-  message(STATUS "Not building benchmarks")
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   message(STATUS "Building C++ micro benchmarks")
 else()
@@ -125,11 +134,6 @@ endif()
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
-endif()
-
-if(INDEX_RANGE_CHECK)
-  add_compile_definitions("INDEX_RANGE_CHECK")
-  message(WARNING "Check index range to detect OOB accesses")
 endif()
 
 # Read the project version
@@ -149,9 +153,29 @@ else()
   message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
+# Where the configured executor/version.h is written. Out-of-tree builds point
+# this at the build tree so the source tree is never written (it may be mounted
+# read-only); the default keeps the in-source location.
+set(TRTLLM_VERSION_H_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    CACHE PATH "Include root for the configured executor/version.h")
 configure_file(
   cmake/templates/version.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+  "${TRTLLM_VERSION_H_INCLUDE_DIR}/tensorrt_llm/executor/version.h")
+if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
+   "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  # BEFORE: the configured header must win over a stale in-source copy.
+  include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
+endif()
+
+# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
+# cubin/fmha_cubin.{h,cpp}). fmha_cubin.h is included transitively by headers
+# used across several targets, so the directory must be on every target's
+# include path, not just the FMHA target's.
+set(TRTLLM_FMHA_GEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+    CACHE PATH "Directory containing generated FMHA sources")
+include_directories("${TRTLLM_FMHA_GEN_DIR}")
 
 setup_cuda_compiler()
 
@@ -166,9 +190,8 @@ setup_cuda_architectures()
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVPTX_LIB CUDA::nvptxcompiler_static)
 
-set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml nvptxcompiler_static)
+set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml)
 
 if(CUBLAS_DYNAMIC_LINKING)
   set(CUBLAS_LIB CUDA::cublas)
@@ -208,7 +231,13 @@ else()
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+# TRT-LLM currently validates CUDA 13.x toolkits. Require CUDA major version 13
+# or newer to align with that coverage.
+find_package(CUDAToolkit 13.0 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+
+if(NOT WIN32)
+  find_package(NUMA REQUIRED)
+endif()
 
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
@@ -227,14 +256,13 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 
 # TRT dependencies
-find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
-set(TRT_LIB TensorRT::NvInfer)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
@@ -251,10 +279,17 @@ endif()
 FetchContent_MakeAvailable(nanobind)
 include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
 
+# cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
+# bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is
+# enabled, so bounce does NOT require UCX (its real deps are NIXL + zmq,
+# orthogonal to UCX). ucxx stays UCX-only.
+if(NIXL_ROOT OR ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq)
+endif()
 if(ENABLE_UCX)
-  FetchContent_MakeAvailable(cppzmq ucxx)
+  FetchContent_MakeAvailable(ucxx)
 endif()
 
 if(NOT NVTX_DISABLE)
@@ -275,7 +310,6 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
-  $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
@@ -313,25 +347,33 @@ if(ENABLE_MULTI_DEVICE)
   add_definitions("-DOMPI_SKIP_MPICXX")
 endif()
 
-# C++17
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is required by the PyTorch headers starting with torch 2.14.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# C++20 makes CMake scan the sources for module imports, which needs a scanner
+# the build images do not ship. Nothing here uses modules, so skip the scan.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 
@@ -386,10 +428,27 @@ endif()
 option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
 if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   message(STATUS "BOLT compatible flags enabled")
-  # Compiler flags for C/C++
-  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Compiler flags for C/C++ -fno-reorder-blocks-and-partition is GCC-only
+  # (required for GCC 8+ per BOLT docs). Clang does not support this flag and
+  # does not enable the corresponding optimization by default.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fno-reorder-blocks-and-partition)
+  endif()
+  add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
+  # Ubuntu's aarch64 GCC turns on -mfix-cortex-a53-843419 by default, which
+  # makes the linker rewrite some loads as a branch to a veneer that performs
+  # the load and jumps back. BOLT reads that branch as a tail call, so when it
+  # relocates the function it patches the veneer's return site with an x16
+  # trampoline and destroys a live x16. Grace is not a Cortex-A53, so the
+  # workaround only costs us correctness here. Note there is no
+  # -Wl,--no-fix-cortex-a53-843419: GNU ld rejects it, the driver flag is the
+  # only way to stop the option being passed.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
+                                                        STREQUAL "GNU")
+    add_link_options(-mno-fix-cortex-a53-843419)
+  endif()
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""
@@ -440,10 +499,10 @@ endif()
 
 if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
-    # MSVC does not apply the correct __cplusplus version per the C++ standard
-    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
-    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
-    # set __cplusplus to 201703 with std=c++17. See
+    # MSVC does not report the correct __cplusplus version per the C++ standard
+    # by default, which the CUTLASS kernels rely on to enable their constexpr
+    # paths. /Zc:__cplusplus makes it follow the standard it is compiling
+    # against. See
     # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
     # more info.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
@@ -598,13 +657,38 @@ if(ENABLE_UCX)
     if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
       if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
         file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
+        # use GITHUB_MIRROR to download RAPIDS.cmake
         string(
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
+        # RAPIDS.cmake downloads the rapids-cmake archive from github.com unless
+        # rapids-cmake-url is set.
+        if(NOT FILE_CONTENTS MATCHES "rapids-cmake-url"
+           AND FILE_CONTENTS MATCHES
+               "rapids-cmake/raw/refs/heads/([^/]+)/RAPIDS\\.cmake")
+          string(
+            PREPEND
+            FILE_CONTENTS
+            "set(rapids-cmake-url \"$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/archive/refs/heads/${CMAKE_MATCH_1}.zip\")\n"
+          )
+        endif()
         file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
       endif()
+      # rapids-cmake downloads CPM.cmake from github.com unless the file exists.
+      # Version and MD5 follow rapids-cmake's cpm/detail/download.cmake. If an
+      # upgraded rapids-cmake uses another CPM version, it ignores this file and
+      # downloads its own, no side effect.
+      #
+      # Update the version and MD5 when the ucxx git_tag in
+      # 3rdparty/fetch_content.json changes.
+      set(ucxx_cpm_file "${CMAKE_BINARY_DIR}/ucxx/build/cmake/CPM_0.40.0.cmake")
+      file(
+        DOWNLOAD
+        "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v0.40.0/CPM.cmake"
+        "${ucxx_cpm_file}"
+        EXPECTED_MD5 6c9866a0aa0f804a36fe8c3866fb8a2c)
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
@@ -644,11 +728,6 @@ if(BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARKS)
-  add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
-                   ${CMAKE_BINARY_DIR}/benchmarks)
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
                    ${CMAKE_BINARY_DIR}/micro_benchmarks)
@@ -663,6 +742,6 @@ if(MEASURE_BUILD_TIME)
 endif()
 
 set(BUILD_WHEEL_TARGETS
-    tensorrt_llm;nvinfer_plugin_tensorrt_llm
+    tensorrt_llm
     CACHE STRING "Targets used to build wheel")
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

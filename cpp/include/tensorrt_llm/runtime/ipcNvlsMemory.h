@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,11 @@
  */
 #pragma once
 
+#include "tensorrt_llm/runtime/mcastGroupComm.h"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -44,9 +47,36 @@ struct IpcNvlsHandle
 
 void MPI_group_barrier(std::set<int> ranks);
 
+//! \brief Whether NVLS (NVLink SHARP) multicast memory can be allocated on this
+//! node. Checks only the static capability (CUDA driver >= 12010 and
+//! CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED). This is the precondition for
+//! ipcNvlsAllocate(): the allocator itself selects a fabric or POSIX-FD handle
+//! via getMemHandleType(), so single-node NVLS works over POSIX-FD even when the
+//! fabric/IMEX plane is not provisioned. The result is cached.
 bool ipcNvlsSupported();
 
+//! \brief Whether the NVLink fabric/IMEX plane is provisioned so that NVLS
+//! multicast memory can actually be *bound* (not merely statically supported).
+//! Extends ipcNvlsSupported() with a live fabric probe (getMemHandleType() must
+//! resolve to CU_MEM_HANDLE_TYPE_FABRIC). Use this to decide whether NCCL may
+//! attempt NVLS: on an unprovisioned node the static multicast attribute is a
+//! false positive and NCCL aborts during init, so callers should disable
+//! NCCL_NVLS when this returns false. The (heavy) result is cached.
+bool ipcNvlsFabricUsable();
+
+//! \brief Allocate NVLS multicast memory shared by \p ranks, exchanging the memory handles over
+//! the MPI session communicator. The process must therefore be part of an MPI job.
+//!
+//! Kept as a distinct overload rather than a defaulted argument on the one below: a default
+//! argument lives at the call site, not in the symbol, so folding the two would drop this mangled
+//! name and break prebuilt archives that link against it.
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
+
+//! \brief Allocate NVLS multicast memory shared by \p ranks.
+//! \param groupComm Host collective covering exactly \p ranks, used to exchange the memory
+//! handles. Non-MPI orchestrators (Ray) pass a ProcessGroup-backed collective here. Passing null
+//! is equivalent to the overload above.
+IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks, std::shared_ptr<McastGroupComm> groupComm);
 
 void ipcNvlsFree(IpcNvlsHandle* handle);
 

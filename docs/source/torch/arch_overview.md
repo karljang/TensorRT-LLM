@@ -1,7 +1,7 @@
 # Architecture Overview
 
 TensorRT LLM is a toolkit designed to create optimized solutions for Large Language Model (LLM) inference.
-Besides TensorRT, PyTorch can also serve as the backend for TensorRT-LLM. This document provides an overview of the PyTorch Backend architecture.
+PyTorch is the sole execution backend of TensorRT LLM; the former TensorRT engine backend has been removed (see the [migration guide](../legacy/tensorrt-backend-removal.md)). This document provides an overview of the PyTorch backend architecture.
 
 ## Top Level API
 
@@ -16,9 +16,6 @@ The `LLM` also manages the tokenization and detokenization processes of the inpu
 
 ## PyExecutor
 
-
-Similar to the TensorRT backend, which uses [Executor API](../legacy/advanced/executor.md), the PyTorch backend employs a `PyExecutor` class.
-This class has a similar interface to Executor, allowing it to be integrated into LLM as an alternative backend.
 Key components of the `PyExecutor` include:
 
 - Model Engine: Holds the language model and efficiently supports single-step model forward.

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -39,8 +39,51 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
-  # Link against CUDA
+  # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  # ------------------------------------------------------------------------
+  # Bounce v2 transport. Its real dependencies are NIXL (data plane, gated by
+  # the NIXL_ROOT block above) + zmq (control plane) — NOT UCX. So compile it
+  # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
+  # is fetched at the top level when NIXL or UCX is on. Activates the
+  # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
+  # CacheTransceiverConfig (agent_bounce_buffer_enable +
+  # kv_cache_bounce_size_mb, Python (v2) transceiver only).
+  # ------------------------------------------------------------------------
+  find_package(PkgConfig)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(ZMQ libzmq) # optional: bounce is skipped if libzmq is
+                                  # absent
+  endif()
+  if(ZMQ_FOUND)
+    target_sources(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE bounce/BounceTransferPlan.cpp
+              bounce/BuddyAllocator.cpp
+              bounce/CreditScheduler.cpp
+              bounce/BounceMessage.cpp
+              bounce/BounceArena.cpp
+              bounce/ExecPool.cpp
+              bounce/GatherScatterKernel.cu
+              bounce/ZmqControlChannel.cpp
+              bounce/BounceTransport.cpp)
+    target_include_directories(
+      ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
+                                     ${ZMQ_INCLUDE_DIRS})
+    target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES}
+                                                         ${NIXL_BUILD_LIBRARY})
+    target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
+    # The .cu device symbols must resolve into this shared lib.
+    set_target_properties(${NIXL_WRAPPER_TARGET}
+                          PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    message(STATUS "NIXL bounce v2: enabled (libzmq found)")
+  else()
+    message(
+      STATUS
+        "NIXL bounce v2: disabled - libzmq/pkg-config not found; an explicit agent_bounce_buffer_enable opt-in fails at agent construction (on a bounce build, runtime setup failures degrade to standard NIXL with a WARNING)"
+    )
+  endif()
 
   set(NIXL_ENABLED TRUE)
 else()
@@ -95,15 +138,16 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
     message(STATUS "Transfer agent binding: NIXL support enabled")
   endif()
 
-  # Conditionally add Mooncake support
+  # Conditionally add Mooncake support NOTE: We intentionally do NOT link
+  # against tensorrt_llm_mooncake_wrapper here. The mooncake wrapper (and its
+  # dependency libtransfer_engine.so) is loaded lazily via DynLibLoader::dlopen
+  # in makeTransferAgent("mooncake", ...) at runtime. This allows the binding
+  # module to be imported even when Mooncake is not installed.
   if(MOONCAKE_ENABLED)
     target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
                                PRIVATE ENABLE_MOONCAKE)
-    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
-                               PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
-    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
-                          PRIVATE tensorrt_llm_mooncake_wrapper)
-    message(STATUS "Transfer agent binding: Mooncake support enabled")
+    message(
+      STATUS "Transfer agent binding: Mooncake support enabled (lazy loading)")
   endif()
 
   # Common dependencies

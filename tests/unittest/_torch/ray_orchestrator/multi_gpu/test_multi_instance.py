@@ -3,11 +3,14 @@ import os
 import pytest
 import ray
 import torch
-from ray.util.placement_group import (
-    PlacementGroupSchedulingStrategy,
-    placement_group,
-    remove_placement_group,
-)
+from ray.util.placement_group import placement_group, remove_placement_group
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import AsyncLLM
@@ -36,7 +39,6 @@ class TRTLLMInstance:
         self.llm = None
 
 
-@pytest.mark.gpu4
 @pytest.mark.parametrize(
     "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_2instances", "tp1_4instances"]
 )
@@ -96,9 +98,7 @@ def test_multi_instance(setup_ray_cluster, tp_size, num_instances):
                         runtime_env=runtime_env,
                     ).remote(
                         async_llm_kwargs={
-                            "model": os.path.join(
-                                llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
-                            ),
+                            "model": os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
                             "kv_cache_config": {
                                 "free_gpu_memory_fraction": 0.1,
                             },

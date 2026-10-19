@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -50,6 +50,25 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
 from cutlass.pipeline import (Agent, CooperativeGroup, PipelineAsync,
                               PipelineOp, PipelineState, agent_sync)
+
+_SM100_SYNC_FACTORY_ERROR = (
+    "Custom UMMA pipelines require "
+    "cutlass.pipeline.sm100.PipelineTmaUmma._make_sync_object with "
+    "PipelineOp.TCGen05Mma support. Install the CuTe DSL version specified "
+    "in this TensorRT-LLM checkout's requirements.txt. "
+    "PipelineAsync._make_sync_object cannot be used as a fallback.")
+
+try:
+    from cutlass.pipeline.sm100 import PipelineTmaUmma as _Sm100PipelineTmaUmma
+    _sm100_make_sync = _Sm100PipelineTmaUmma._make_sync_object
+except (ImportError, AttributeError) as exc:
+    raise ImportError(_SM100_SYNC_FACTORY_ERROR) from exc
+
+# A missing SM100 override can resolve to the inherited SM90 factory, which
+# does not support TCGen05Mma even though the attribute exists.
+if (not callable(_sm100_make_sync)
+        or _sm100_make_sync is PipelineAsync._make_sync_object):
+    raise ImportError(_SM100_SYNC_FACTORY_ERROR)
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
@@ -179,9 +198,9 @@ class PipelineTmaUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer, tx_count)
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_full = _sm100_make_sync(barrier_storage.align(min_align=8),
+                                            num_stages, producer, tx_count)
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -214,7 +233,7 @@ class PipelineTmaUmma(PipelineAsync):
             cta_group,
         )
 
-    def consumer_release(self, state: PipelineState):
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
 
@@ -225,12 +244,18 @@ class PipelineTmaUmma(PipelineAsync):
         Returns:
             None
         """
-        self.sync_object_empty.arrive(state.index, self.consumer_mask,
-                                      self.cta_group)
+        self.sync_object_empty.arrive(state.index,
+                                      self.consumer_mask,
+                                      self.cta_group,
+                                      loc=loc,
+                                      ip=ip)
 
     def producer_acquire(self,
                          state: PipelineState,
-                         try_acquire_token: Optional[Boolean] = None):
+                         try_acquire_token: Optional[Boolean] = None,
+                         *,
+                         loc=None,
+                         ip=None):
         """
         Conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
 
@@ -246,15 +271,20 @@ class PipelineTmaUmma(PipelineAsync):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
         )
         if_generate(
             self.is_leader_cta,
-            lambda: self.sync_object_full.arrive(state.index, self.producer_mask
-                                                 ),
+            lambda: self.sync_object_full.arrive(
+                state.index, self.producer_mask, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
         )
 
-    def producer_commit(self, state: PipelineState):
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
         """
         TMA producer commit is a noop since TMA instruction itself updates the transaction count.
 
@@ -323,9 +353,9 @@ class PipelineUmmaAsync(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer)
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_full = _sm100_make_sync(barrier_storage.align(min_align=8),
+                                            num_stages, producer)
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -357,23 +387,26 @@ class PipelineUmmaAsync(PipelineAsync):
             cta_group,
         )
 
-    def producer_commit(self, state: PipelineState):
-        self.sync_object_full.arrive(state.index, self.producer_mask,
-                                     self.cta_group)
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        self.sync_object_full.arrive(state.index,
+                                     self.producer_mask,
+                                     self.cta_group,
+                                     loc=loc,
+                                     ip=ip)
 
-    def producer_tail(self, state: PipelineState):
+    def producer_tail(self, state: PipelineState, *, loc=None, ip=None):
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster())
+            cute.arch.block_idx_in_cluster(loc=loc, ip=ip), loc=loc, ip=ip)
         is_leader_cta = cta_rank_in_cluster % 2 == 0
 
         def then_body():
             # Assume state contains that next useful buffer
             # So we only need to advance to num_stages - 1 times to last used buffer
             for i in range(self.num_stages - 1):
-                state.advance()
-            self.producer_acquire(state)
+                state.advance(loc=loc, ip=ip)
+            self.producer_acquire(state, loc=loc, ip=ip)
 
-        if_generate(is_leader_cta, then_body)
+        if_generate(is_leader_cta, then_body, loc=loc, ip=ip)
 
 
 @dataclass(frozen=True)
@@ -473,12 +506,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
+        sync_object_full = _sm100_make_sync(
             barrier_storage.align(min_align=8),
             num_stages,
             producer,
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = _sm100_make_sync(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -515,9 +548,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
             cta_group,
         )
 
-    def consumer_release(self, state: PipelineState):
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
         """
-        self.sync_object_empty.arrive(state.index, self.consumer_mask,
-                                      self.cta_group)
+        self.sync_object_empty.arrive(state.index,
+                                      self.consumer_mask,
+                                      self.cta_group,
+                                      loc=loc,
+                                      ip=ip)

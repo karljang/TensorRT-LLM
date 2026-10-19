@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,6 +69,8 @@ enum class ContextAttentionMaskType
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK
 };
@@ -135,14 +137,20 @@ struct MHARunnerFixedParams
     int tpSize = 1;
     // The tensor parallel rank (alibi).
     int tpRank = 0;
-    // q tensor quant block size in sage attention
+    // q tensor quant block size in sage attention, in tokens per scale. 0 disables sage attention.
     int sageBlockSizeQ = 0;
-    // k tensor quant block size in sage attention
+    // k tensor quant block size in sage attention, in tokens per scale.
     int sageBlockSizeK = 0;
-    // v tensor quant block size in sage attention
+    // v tensor quant block size in sage attention, in channels per scale.
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
+    // Use spcompress (context phase, SM107 only) ?
+    bool useSpcompress = false;
+    // Use sparse attention in trtllm-gen ?
+    bool useTllmGenSparseAttention = false;
+    // Fuse DSv4 inverse RoPE and FP8 output quantization in trtllm-gen.
+    bool fusesDsv4InvRopeFp8Quant = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -193,6 +201,10 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
+        output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
+        output += ", useSpcompress = " + std::string(useSpcompress ? "true" : "false");
+        output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
+        output += ", fusesDsv4InvRopeFp8Quant = " + std::string(fusesDsv4InvRopeFp8Quant ? "true" : "false");
 
         return output;
     }
@@ -256,6 +268,11 @@ struct MHARunnerParams
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
     int totalKvSeqLen;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllmGenJITWarmup = false;
+    int32_t trtllmGenJITWarmupMaxNumRequests = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenQ = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenKv = 0;
 
     // Buffers.
     // The packed QKV buffer ptr.
@@ -274,8 +291,21 @@ struct MHARunnerParams
     KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
-    // The output scaling factor buffer ptr. (only used for FP4 output)
+    // The output scaling factor buffer ptr. Used by FP4 output and DSv4 fused epilogue.
     void* outputSfPtr;
+
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled = false;
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cosSinCache = nullptr;
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scaleBufM = 0;
+    };
+
+    // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams dsv4EpilogueFusion;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
     // The attention sinks ptr.
@@ -292,6 +322,11 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
+    // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
+    // Only required when the sparse context path selects a GmemReduction cubin; nullptr otherwise.
+    void* multiCtasKvScratchPtr = nullptr;
+    // Per-CTA counter buffer for MultiCtasKv mode synchronization; sized as sizeof(int32_t) * SM count.
+    int32_t* multiCtasKvCounterPtr = nullptr;
     // The bmm1 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).
@@ -306,7 +341,7 @@ struct MHARunnerParams
     float* qScalePtr;
     float* kScalePtr;
     float* vScalePtr;
-    // q, k, v block size in sageattention
+    // number of scales per head for q, k, v in sageattention
     int qMaxNBlock;
     int kMaxNBlock;
     int vMaxNBlock;
@@ -315,6 +350,8 @@ struct MHARunnerParams
 
     // Skip-softmax attention parameters
     float skipSoftmaxThresholdScaleFactor = 0;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float skipCorrectionThreshold = 0;
 #ifdef SKIP_SOFTMAX_STAT
     // Statistics of skip-softmax, pointers of device memory for output
     uint32_t* skipSoftmaxTotalBlocks;
@@ -454,14 +491,29 @@ struct Fused_multihead_attention_params_v2
     // is input/output padded
     bool is_s_padded = false;
 
-    // SageAttention parameters
+    // SageAttention parameters. This is the reference description of the scale layout; the
+    // quantizer that produces these buffers lives in common/sageQuant.cu.
+    //
+    // Q and K are quantized to INT8 along the sequence axis and their scales are amax/127; V is
+    // quantized to e4m3 along the channel axis, one scale per channel, with the amax taken over
+    // every token of every sequence.
+    //
+    // How Q and K tokens are grouped into scales depends on the GPU. SM100 groups a run of
+    // sage_block_size consecutive tokens. SM90 groups the tokens a single thread owns -- 2 query
+    // rows and 16 keys, both strided -- and stores the scales swizzled so that a thread's scales
+    // are contiguous, so a q/k scale buffer is not a plain per-token-block array.
+    //
+    // The q/k buffers have no batch dimension. A sequence's scales start at a base derived from
+    // its cu_seqlens entry, so the buffer can be sized from the batch size and the total token
+    // count alone, without knowing the longest sequence. Each sequence reserves a spare tile,
+    // because a partial final tile is still indexed in full.
     struct SageAttention
     {
         struct Scales
         {
-            // ceil(max_seqlen / block_size)
+            // number of scales per head, i.e. the stride between heads. Unused for v.
             int max_nblock;
-            // The scale of each block, layout: (B, H, max_nblock)
+            // the scales, layout: (H, max_nblock) for q and k, (H_kv, D) for v
             float* scales;
         } q, k, v;
     } sage;

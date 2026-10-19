@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_delta_h.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
 # -*- coding: utf-8 -*-
@@ -16,23 +18,49 @@ from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
 
+def _save_autotune_state(args: dict, reset_only: bool = False) -> None:
+    """Snapshot the indexed state slots mutated by each autotune trial."""
+    if reset_only or args["h0"] is None or args["h0_i"] is None:
+        return
+    # Match N in chunk_gated_delta_rule_fwd_h and the kernel's
+    # state_index = tl.load(h0_i + i_n) for i_n < N.
+    cu_seqlens = args["cu_seqlens"]
+    num_seqs = (len(cu_seqlens) -
+                1 if cu_seqlens is not None else args["k"].shape[0])
+    indices = args["h0_i"][:num_seqs].to(torch.long)
+    # Only these slots are updated by the indexed kernel. The pool may be
+    # much larger than the active batch, so never clone the whole pool.
+    saved_state = args["h0"].index_select(0, indices)
+    args["_gdn_autotune_state"] = indices, saved_state
+
+
+def _restore_autotune_state(args: dict, exception: Exception | None) -> None:
+    """Restore the trial's indexed slots, including after a kernel exception."""
+    saved = args.pop("_gdn_autotune_state", None)
+    if saved is not None:
+        indices, state = saved
+        args["h0"].index_copy_(0, indices, state)
+
+
 @triton.heuristics({
     "USE_G": lambda args: args["g"] is not None,
     "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+    "USE_INDEXED_STATE": lambda args: args["h0_i"] is not None,
     "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
     "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         for BV in [32, 64]
-#     ],
-#     key=["H", "K", "V", "BT", "USE_G"],
-#     use_cuda_graph=use_cuda_graph,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": BV}, num_warps=nw, num_stages=ns)
+        for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
+    ],
+    key=["H", "K", "V", "BT", "USE_G"],
+    # Custom hooks replace Triton's reset_to_zero/restore_value handling.
+    # Back up active slots only: h0 can be much larger than the batch.
+    pre_hook=_save_autotune_state,
+    post_hook=_restore_autotune_state,
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -42,10 +70,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     g,
     h,
     h0,
+    h0_i,
     ht,
     cu_seqlens,
     chunk_offsets,
     T,
+    stride_h0,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -54,10 +84,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
+    USE_INDEXED_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute chunk boundary states and optional final state updates."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
@@ -91,27 +123,35 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_h = H * K * V
     stride_k = Hg * K
     stride_w = H * K
+    if USE_INDEXED_STATE:
+        state_index = tl.load(h0_i + i_n).to(tl.int64)
+        h0 = h0 + state_index * stride_h0
+        ht = h0
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
+        h0 = h0 + ((i_h if USE_INDEXED_STATE else i_nh) * K * V)
     if STORE_FINAL_STATE:
         ht = ht + i_nh * K * V
+    elif USE_INDEXED_STATE:
+        ht = ht + i_h * K * V
 
     # load initial state
+    # Pool layout [slots, HV, V, K], K innermost: logical block (K, V) but K has
+    # stride 1, V has stride K, order=(0, 1) so Triton treats K as innermost.
     if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV),
-                                   (1, 0))
+        p_h0_1 = tl.make_block_ptr(h0, (K, V), (1, K), (0, i_v * BV), (64, BV),
+                                   (0, 1))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(h0, (K, V), (V, 1), (64, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_2 = tl.make_block_ptr(h0, (K, V), (1, K), (64, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
         if K > 128:
-            p_h0_3 = tl.make_block_ptr(h0, (K, V), (V, 1), (128, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_3 = tl.make_block_ptr(h0, (K, V), (1, K), (128, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
         if K > 192:
-            p_h0_4 = tl.make_block_ptr(h0, (K, V), (V, 1), (192, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_4 = tl.make_block_ptr(h0, (K, V), (1, K), (192, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # main recurrence
@@ -208,26 +248,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v_new)
 
-    # epilogue
-    if STORE_FINAL_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV),
-                                 (1, 0))
+    # epilogue — write final state back to pool-layout [slots, HV, V, K].
+    if STORE_FINAL_STATE or USE_INDEXED_STATE:
+        p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (0, i_v * BV), (64, BV),
+                                 (0, 1))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (64, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (64, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h2.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
         if K > 128:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (128, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (128, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h3.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
         if K > 192:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (192, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (192, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h4.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
@@ -239,7 +279,9 @@ def chunk_gated_delta_rule_fwd_h(
     u: torch.Tensor,
     g: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
+    inplace_indexed_state_update: bool = False,
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
@@ -262,8 +304,16 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
-    final_state = (k.new_empty(N, H, K, V, dtype=torch.float32)
-                   if output_final_state else None)
+    use_indexed_state = initial_state is not None and initial_state_indices is not None
+    if use_indexed_state and not inplace_indexed_state_update:
+        raise ValueError(
+            "Indexed chunk state updates require inplace_indexed_state_update=True."
+        )
+    store_final_state_in_kernel = output_final_state and not use_indexed_state
+    # Kernel writes final state in [V, K] layout (K innermost) to match the
+    # pool layout. Allocate accordingly so the tensor's shape reflects memory.
+    final_state = (k.new_empty(N, H, V, K, dtype=torch.float32)
+                   if store_final_state_in_kernel else None)
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -278,17 +328,21 @@ def chunk_gated_delta_rule_fwd_h(
         g=g,
         h=h,
         h0=initial_state,
+        h0_i=initial_state_indices,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        stride_h0=initial_state.stride(0) if initial_state is not None else 0,
         H=H,
         Hg=Hg,
         K=K,
         V=V,
         BT=BT,
-        BV=32,
-        num_warps=4,
-        num_stages=2,
     )
+    if output_final_state and use_indexed_state:
+        # The indexed kernel path updates h0 in-place, so returning
+        # the final state means gathering those updated slots back out.
+        final_state = initial_state.index_select(
+            0, initial_state_indices.to(torch.long))
     return h, v_new, final_state

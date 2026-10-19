@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 trtllm-serve
 ============
 
@@ -17,8 +20,12 @@ The server also supports the following endpoints:
 - ``/health``
 - ``/metrics``
 - ``/version``
+- ``/start_profile`` (prototype)
+- ``/stop_profile`` (prototype)
 
-The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
+The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below.
+
+For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
 Starting a Server
 -----------------
@@ -215,19 +222,28 @@ model.
 Visual Generation Serving
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``trtllm-serve`` supports diffusion-based visual generation models (Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
+``trtllm-serve`` supports diffusion-based visual generation models (FLUX.1, FLUX.2, Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
 
 .. note::
-   This is the initial release of TensorRT-LLM VisualGen. APIs, supported models, and optimization options are actively evolving and may change in future releases.
+   VisualGen is in **beta** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 
 .. code-block:: bash
 
-   trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-       --extra_visual_gen_options config.yml
+   # Video generation (Wan)
+   trtllm-serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+       --visual_gen_args config.yml
 
-The ``--extra_visual_gen_options`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.
+   # Image generation (FLUX)
+   trtllm-serve black-forest-labs/FLUX.2-dev \
+       --visual_gen_args config.yml
 
-For full details, see the :doc:`../../features/visual-generation` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
+   # Video generation (Cosmos3 hybrid checkpoint)
+   trtllm-serve nvidia/Cosmos3-Nano \
+       --enable_visual_gen
+
+For checkpoints that support both LLM and Visual Generation, such as Cosmos3, pass ``--enable_visual_gen`` to select the VisualGen runtime when ``--visual_gen_args`` is not specified. The ``--visual_gen_args`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/sync`` (with ``/v1/videos/generations`` kept as a deprecated alias), and video management APIs.
+
+For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
 Multi-node Serving with Slurm
 -----------------------------
@@ -254,11 +270,9 @@ Metrics Endpoint
 
 .. note::
 
-   The metrics endpoint for the default PyTorch backend are in beta and are not as comprehensive as those for the TensorRT backend.
+   The metrics endpoint is in beta. Some fields, such as CPU memory usage, are not yet available.
 
-   Some fields, such as CPU memory usage, are not yet available for the PyTorch backend.
-
-   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration.
+   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration. Setting ``iter_perf_stats_interval: N`` builds the statistics only every N iterations, which reduces this overhead.
 
 The ``/metrics`` endpoint provides runtime iteration statistics such as GPU memory usage and KV cache details.
 
@@ -307,29 +321,214 @@ Example output:
         }
     ]
 
+.. _runtime-profiling-endpoints:
+
+Runtime Profiling Endpoints
+---------------------------
+
+.. note::
+
+   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). APIs, parameters, and behaviour may change in future releases.
+
+The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting ``trtllm-serve`` and without setting ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``. Under TP/PP > 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a ``rank-<N>`` suffix in the filename) and all ranks profile the same iterations in lockstep.
+
+POST /start_profile
+~~~~~~~~~~~~~~~~~~~
+
+Start a profile window. All fields in the JSON body are optional.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 15 50
+
+   * - Field
+     - Type
+     - Description
+   * - ``output_dir``
+     - string
+     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise ``/tmp``. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
+   * - ``num_steps``
+     - int
+     - Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call ``/stop_profile``. When omitted, profiling runs until ``/stop_profile`` is called.
+   * - ``start_step``
+     - int (default ``0``)
+     - Iterations to skip after the call before profiling starts. Use to exclude warmup-like transients from the capture.
+   * - ``activities``
+     - list of string
+     - Subset of ``["CPU", "GPU", "CUDA_PROFILER"]`` (default ``["CPU", "GPU"]``). When ``["CUDA_PROFILER"]`` is specified, ``torch.profiler`` is not started and only ``cudaProfilerStart`` / ``cudaProfilerStop`` are called — this composes cleanly with ``nsys profile -c cudaProfilerApi``.
+
+Response: ``200`` with ``{"message": "Profiling started"}`` on success. ``409`` with ``{"success": false, "message": ...}`` if a profile window is already active or pending (the backend does not silently queue a second window).
+
+POST /stop_profile
+~~~~~~~~~~~~~~~~~~
+
+Stop an in-progress profile window and flush the chrome trace to disk. Takes no body. The call blocks until ``export_chrome_trace()`` has run on the backend thread, so by the time the handler returns the file is on disk. Call this only if ``/start_profile`` was invoked without ``num_steps``; otherwise the window self-terminates.
+
+Example
+~~~~~~~
+
+.. code-block:: bash
+
+   # Start a 30-iteration profile window into /tmp/traces.
+   curl -s -X POST http://127.0.0.1:8000/start_profile \
+       -H "Content-Type: application/json" \
+       -d '{"output_dir": "/tmp/traces", "num_steps": 30}'
+
+   # ... drive load via /v1/completions or /v1/chat/completions ...
+
+   # If you started the window without num_steps, stop it:
+   curl -s -X POST http://127.0.0.1:8000/stop_profile
+
+   # Inspect the resulting chrome traces.
+   ls /tmp/traces/
+   # trtllm-trace-1778480665-7993d824-rank-0.json
+   # trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)
+
+Open the trace files in `ui.perfetto.dev <https://ui.perfetto.dev/>`_ or ``chrome://tracing``. Each captured iteration is wrapped in a ``step[EXTEND bs=N toks=M]`` or ``step[DECODE bs=N]`` user-annotation scope.
+
+With the overlap scheduler enabled, sampling for an iteration runs after the previous batch is updated, so it cannot share the forward scope. That region is emitted as a separate ``step[...] sample`` scope. Only the bare ``step[...]`` labels mark iteration boundaries; ignore the ``sample``-suffixed ones when counting iterations.
+
+For a full benchmarking + profiling workflow (including multi-cycle capture under steady-state load), see :doc:`run-benchmark-with-trtllm-serve`.
+
 .. _configuring-with-yaml-files:
 
-Configuring with YAML Files
-----------------------------
+Configuring with YAML Files and ``--set``
+------------------------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
+Pass a YAML file with ``--config``. Explicit CLI flags override conflicting
+YAML values; otherwise, YAML values override the defaults.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias
    :end-before: .. end-note-config-flag-alias
 
-The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+The file configures
+`tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_.
+For example, set a top-level field as follows:
 
 .. code-block:: yaml
 
    max_batch_size: 8
 
-To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+Use YAML mappings for nested fields:
 
 .. code-block:: yaml
 
    moe_config:
        backend: CUTLASS
+
+Use repeatable ``--set PATH=YAML_VALUE`` options to override individual fields.
+Paths use exact, case-sensitive ``LlmArgs`` field names and dots for nesting:
+
+.. code-block:: bash
+
+   trtllm-serve MODEL \
+       --config base.yaml \
+       --video_pruning_rate 0.4 \
+       --set multimodal_config.video_pruning_rate=0.6 \
+       --set 'cuda_graph_config.batch_sizes=[1, 2, 4]'
+
+Precedence is fixed, regardless of command-line order:
+
+.. code-block:: text
+
+   LlmArgs defaults < --config < dedicated CLI flags < --set
+
+Values use YAML syntax and support ``null``, booleans, finite numbers, strings,
+lists, and string-keyed mappings. Quote arguments containing spaces or shell
+characters. An assignment replaces exactly the addressed value; assigning a
+mapping or list replaces it entirely. The last duplicate path wins, while
+conflicting parent and child paths are rejected.
+
+``--set`` supports public, YAML-serializable fields in ``TorchLlmArgs``, with
+the following exceptions:
+
+* ``model`` and ``backend``: use ``MODEL`` and ``--backend``.
+* ``telemetry_config``: use ``--telemetry`` or ``--no-telemetry``.
+* ``env_overrides`` and ``internal_request_auth_key``: use the YAML file.
+* ``allow_request_chat_template``: use ``--allow_request_chat_template``.
+* ``disagg_cluster``: use ``--disagg_cluster_uri`` or the YAML file.
+* ``batched_logits_processor``, ``checkpoint_loader``, ``mpi_session``,
+  ``ray_placement_config.placement_groups``,
+  ``speculative_config.drafter``, and
+  ``speculative_config.resource_manager``: use the Python LLM API.
+
+Assigning a whole parent mapping does not bypass these exclusions; a mapping
+that contains one of the excluded descendant paths is rejected.
+
+``--set`` is available only for normal LLM serving. It is unavailable for
+VisualGen and the ``embeddings``, ``mm_embedding_serve``, ``disaggregated``,
+and ``disaggregated_mpi_worker`` subcommands. Server-only YAML keys, list
+indexes, escaped dots, and Hydra/OmegaConf interpolation are also unsupported.
+Replace an enclosing mapping to set free-form keys that cannot be expressed as
+a path.
+
+Do not pass secrets through ``--set`` because arguments may appear in shell
+history, process listings, or logs. Eligible configuration fields may also be
+included in usage telemetry; use ``--no-telemetry`` to opt out. See
+:doc:`../../developer-guide/telemetry`.
+
+Editor Validation of YAML Files
+-------------------------------
+
+In VS Code, install `YAML by Red Hat <https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml>`_
+and add this comment to a serving config to enable validation, completion, and hover documentation:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json
+   max_batch_size: 8
+
+Other YAML language-server clients can use the same schema. The editor downloads
+the schema; it does not need a local TensorRT-LLM installation or a running server.
+Replace ``latest`` with the docs version matching your installation, once that
+release publishes schemas. Existing releases are not retroactively updated.
+
+Use ``trtllm-serve-disagg-config.schema.json`` for ``disaggregated --config`` and
+``trtllm-serve-visual-gen-config.schema.json`` for ``--visual_gen_args``, in the same
+schema directory. These describe YAML files, not CLI flags or ``--set`` assignments.
+
+View or download the JSON schemas for this documentation version:
+
+* `Serving schema <../../_static/schemas/trtllm-serve-config.schema.json>`_
+* `Disaggregated serving schema <../../_static/schemas/trtllm-serve-disagg-config.schema.json>`_
+* `VisualGen schema <../../_static/schemas/trtllm-serve-visual-gen-config.schema.json>`_
+
+To save a schema, right-click its link and select **Save link as**.
+
+Schemas check field names, nested structure, types, and declarative constraints.
+Runtime checks still determine model/GPU compatibility, file existence, and
+cross-field validity. Custom Python validators, free-form mappings, and the
+deprecated ``decoding_config`` have limited static validation; live Python
+objects are not configurable in YAML.
+
+For offline use, set ``$schema`` to a local JSON file (an absolute path or a path
+relative to your YAML file):
+
+* Source checkouts include the schemas in ``tensorrt_llm/schemas/``; no build is needed to use them.
+* Release containers expose them at ``/app/tensorrt_llm/schemas/``. The editor must be
+  attached to the container, or otherwise able to access those files.
+* Wheels include the same schemas. To locate them without importing TensorRT-LLM:
+
+.. code-block:: bash
+
+   python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))'
+
+When changing configuration definitions or bumping the package version in
+``tensorrt_llm/version.py``, regenerate and commit the snapshots using a
+TensorRT-LLM build and dependencies matching the checkout. Each schema's ``$id``
+and ``title`` include the package version.
+
+.. code-block:: bash
+
+   python3 scripts/generate_trtllm_serve_schemas.py
+   python3 scripts/generate_trtllm_serve_schemas.py --check
+
+The CPU schema tests reject stale snapshots. Wheel and HTML docs builds publish
+the checked-in files without importing configuration classes. ``--output-dir``
+can be used to generate a separate local preview.
+
+.. _syntax:
 
 Syntax
 ------

@@ -1,0 +1,685 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/cudaVirtMem.h"
+#include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/assert.h"
+
+#include <deque>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+
+// ---------------------------------------------------------------------------
+// Slot — represents ownership of one allocated slot in a pool group.
+// Mirrors _storage/_core.py::Slot.
+//
+// ready_event: completes when the slot's data is safe to use.
+//   - Newly allocated: completes when previous users are done.
+//   - After migration: completes when the copy is done.
+//   - Passed to release(): completes when current users are done.
+// ---------------------------------------------------------------------------
+struct Slot
+{
+    CachedCudaEvent readyEvent = CachedCudaEvent::makeNull();
+
+    Slot() = default;
+
+    ~Slot()
+    {
+        KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
+            !hasValidSlot(), "Slot %zu destroyed without being released", toSizeT(mSlotId.value()));
+    }
+
+    // A slot id has exactly one owner: transferring a Slot empties the source, so it cannot be
+    // released twice. Copying is not available for the same reason.
+    Slot(Slot&& other) noexcept
+        : readyEvent(std::move(other.readyEvent))
+        , mSlotId(std::exchange(other.mSlotId, std::nullopt))
+    {
+    }
+
+    Slot& operator=(Slot&& other) noexcept
+    {
+        if (this != &other)
+        {
+            readyEvent = std::move(other.readyEvent);
+            mSlotId = std::exchange(other.mSlotId, std::nullopt);
+        }
+        return *this;
+    }
+
+    Slot(Slot const&) = delete;
+    Slot& operator=(Slot const&) = delete;
+
+    // Mirrors Python @property slot_id: asserts valid, returns unwrapped value.
+    [[nodiscard]] SlotId slotId() const
+    {
+        return mSlotId.value();
+    }
+
+    [[nodiscard]] bool hasValidSlot() const noexcept
+    {
+        return mSlotId.has_value();
+    }
+
+    void setSlotId(SlotId id) noexcept
+    {
+        mSlotId = id;
+    }
+
+    void resetSlot() noexcept
+    {
+        mSlotId.reset();
+    }
+
+    bool queryReady()
+    {
+        return readyEvent.queryComplete();
+    }
+
+    // Transfer slot ownership into an empty slot. Overwriting an occupied slot would drop its
+    // id without releasing it, so that is rejected rather than silently allowed by the move.
+    void setSlot(Slot& src)
+    {
+        if (hasValidSlot())
+        {
+            throw LogicError("Slot::setSlot: already has a valid slot");
+        }
+        *this = std::move(src);
+    }
+
+    // Replace this slot, invalidate replacement, and return the previous slot.
+    [[nodiscard]] Slot exchangeSlot(Slot&& replacement)
+    {
+        TLLM_CHECK(hasValidSlot() && replacement.hasValidSlot());
+        Slot previous;
+        auto replacementId = std::exchange(replacement.mSlotId, std::nullopt);
+        previous.mSlotId = std::exchange(mSlotId, replacementId);
+        previous.readyEvent = std::exchange(readyEvent, std::move(replacement.readyEvent));
+        return previous;
+    }
+
+private:
+    std::optional<SlotId> mSlotId;
+};
+
+// ---------------------------------------------------------------------------
+// SlotAllocator — manages a fixed-capacity array of slot ids.
+// Mirrors _storage/_core.py::SlotAllocator.
+// ---------------------------------------------------------------------------
+class SlotAllocator
+{
+public:
+    explicit SlotAllocator(SlotCount capacity);
+    ~SlotAllocator();
+
+    [[nodiscard]] SlotCount numFreeSlots() const noexcept;
+    [[nodiscard]] SlotCount numOccupiedSlots() const noexcept;
+
+    [[nodiscard]] SlotCount numSlots() const noexcept
+    {
+        return mCapacity;
+    }
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
+    // here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
+
+    Slot allocate();
+    std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    void release(Slot slot);
+
+    void expand(SlotCount newNumSlots);
+    void prepareForShrink(SlotCount newNumSlots);
+    bool finishShrink();
+
+    [[nodiscard]] bool shrinkInProgress() const noexcept
+    {
+        return mTargetCapacity < mCapacity;
+    }
+
+    [[nodiscard]] std::vector<SlotId> getSlotsBlockingShrink() const;
+
+    // Read-only accessors for debug assertions (mirrors Python's direct attribute access).
+    [[nodiscard]] SlotCount numOverflowSlots() const noexcept
+    {
+        return slotCountValueFromSize(mOverflowSlots.size());
+    }
+
+    [[nodiscard]] SlotCount numActiveSlots() const noexcept
+    {
+        return mNumActiveSlots;
+    }
+
+    [[nodiscard]] SlotCount targetCapacity() const noexcept
+    {
+        return mTargetCapacity;
+    }
+
+    void synchronize();
+
+private:
+    void scrubEvents();
+    [[nodiscard]] bool check() const noexcept;
+
+    SlotCount mCapacity;
+    SlotCount mTargetCapacity;
+    SlotCount mNumActiveSlots;
+    SlotCount mNumReadyRecycledSlots;
+    std::deque<Slot> mRecycledSlots;
+    std::vector<Slot> mOverflowSlots;
+    DynamicBitset mOccupiedMask;
+};
+
+//! Granularity a disk pool is sized in. Disk has no allocation unit to match,
+//! so this is just a rounding quantum.
+inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
+
+//! Unit a tier of the given size allocates and releases physical memory in,
+//! and therefore the quantum its pool sizes are rounded to.
+//!
+//! For GPU and host it scales with the tier: 2 MiB for small tiers, rising to
+//! 32 MiB, beyond which larger units measure no faster. A resize can give
+//! memory back only in whole units, so this trades that precision against the
+//! per-allocation cost.
+//!
+//! This is the policy. What a given StorageManager actually uses for a tier can
+//! differ -- see StorageManager::tierCommitUnit -- because every GPU level
+//! shares one allocator.
+[[nodiscard]] size_t tierAllocationGranularity(CacheTier tier, size_t quota);
+
+// ---------------------------------------------------------------------------
+// SlotPoolBase — abstract base for a single memory pool.
+// Mirrors _storage/_core.py::SlotPoolBase.
+// ---------------------------------------------------------------------------
+class SlotPoolBase
+{
+public:
+    explicit SlotPoolBase(size_t slotSize)
+        : mSlotSize(slotSize)
+    {
+    }
+
+    virtual ~SlotPoolBase() = default;
+
+    size_t slotSize() const noexcept
+    {
+        return mSlotSize;
+    }
+
+    virtual SlotCount numSlots() const noexcept = 0;
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
+    // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
+
+    size_t numBytes() const noexcept
+    {
+        return mSlotSize * slotCountToSizeT(numSlots());
+    }
+
+    virtual void destroy() = 0;
+    virtual void resize(SlotCount newNumSlots) = 0;
+    virtual Address slotAddress(SlotId slot) const = 0;
+
+protected:
+    size_t mSlotSize;
+};
+
+// ---------------------------------------------------------------------------
+// GpuSlotPool — GPU virtual memory pool.
+// ---------------------------------------------------------------------------
+class GpuSlotPool : public SlotPoolBase
+{
+public:
+    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots);
+
+    SlotCount numSlots() const noexcept override;
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+    // Extend by exactly one physical memory chunk; returns new numSlots.
+    SlotCount extendByOnePhysMem();
+
+    static size_t computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept;
+    static SlotCount computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept;
+
+private:
+    VirtMem mVirtMem;
+};
+
+// ---------------------------------------------------------------------------
+// HostSlotPool — pinned host memory pool.
+// ---------------------------------------------------------------------------
+class HostSlotPool : public SlotPoolBase
+{
+public:
+    //! vmSize is the address space reserved up front, and so the bound on every
+    //! later resize. Reserving it all at once is what keeps the base address
+    //! fixed, as it does for GpuSlotPool.
+    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
+
+    SlotCount numSlots() const noexcept override;
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+    size_t alignedSize(SlotCount numSlots) const noexcept;
+
+    //! Blocks until `slot` is backed by physical memory.
+    //!
+    //! Rethrows the fill worker's exception if the fill failed.
+    void waitSlotUsable(SlotId slot) const;
+
+private:
+    //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
+    size_t mCommitUnit;
+    HostMem mHostMem;
+};
+
+// ---------------------------------------------------------------------------
+// DiskSlotPool — temp-file backed disk pool.
+// ---------------------------------------------------------------------------
+class DiskSlotPool : public SlotPoolBase
+{
+public:
+    // directory: path under which to create the temp file.
+    DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
+    ~DiskSlotPool() override;
+
+    SlotCount numSlots() const noexcept override;
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+    int fd() const noexcept
+    {
+        return mFd;
+    }
+
+private:
+    int mFd = kBadFileDescriptor;
+    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
+    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
+    // slotAddress() bounds-checks against it on every call, and querying the file would make that
+    // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
+};
+
+// ---------------------------------------------------------------------------
+// PoolGroupBase — manages multiple pools with mirrored slot allocation.
+// Mirrors _storage/_core.py::PoolGroupBase.
+// ---------------------------------------------------------------------------
+class PoolGroupBase
+{
+public:
+    explicit PoolGroupBase(SlotCount numSlots);
+    virtual ~PoolGroupBase();
+
+    PoolIndex numPools() const noexcept
+    {
+        return mPools.size();
+    }
+
+    SlotCount numSlots() const noexcept;
+
+    SlotCount numFreeSlots() const noexcept
+    {
+        return mSlotAllocator.numFreeSlots();
+    }
+
+    SlotAllocator& slotAllocator() noexcept
+    {
+        return mSlotAllocator;
+    }
+
+    SlotAllocator const& slotAllocator() const noexcept
+    {
+        return mSlotAllocator;
+    }
+
+    virtual Slot allocate();
+    virtual std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    void release(Slot slot);
+    void destroy();
+    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
+
+    // Addresses for all pools at a given slot id.
+    TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
+    // Sizes per pool.
+    TypedVec<PoolIndex, size_t> slotSize() const;
+
+    // Total bytes across all pools for one slot.
+    size_t numBytes() const noexcept
+    {
+        size_t total = 0;
+        for (auto const& pool : mPools)
+            total += pool->numBytes();
+        return total;
+    }
+
+    // Total bytes across all pools, rounding each pool's bytes up to granularity.
+    // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
+    size_t roundedNumBytes(size_t granularity) const noexcept
+    {
+        size_t total = 0;
+        for (auto const& pool : mPools)
+            total += roundUp(pool->numBytes(), granularity);
+        return total;
+    }
+
+protected:
+    // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
+    SlotCount getNumSlotsFromPools() const noexcept;
+
+    SlotAllocator mSlotAllocator;
+    TypedVec<PoolIndex, std::unique_ptr<SlotPoolBase>> mPools;
+    bool mDestroyed = false;
+};
+
+// ---------------------------------------------------------------------------
+// GpuPoolGroup / HostPoolGroup / DiskPoolGroup
+// ---------------------------------------------------------------------------
+class GpuPoolGroup : public PoolGroupBase
+{
+public:
+    GpuPoolGroup(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+};
+
+//! Host pools are committed progressively on a background thread, so a slot may
+//! be handed out before its memory is backed. Both allocation entry points block
+//! until the slots they return are usable.
+//!
+//! The wait is cheap in the steady state: fresh slot ids ascend from zero and
+//! recycled slots are reused first, so the Nth fresh allocation waits only for
+//! the chunk containing it, and once the fill completes every wait is a single
+//! relaxed load.
+class HostPoolGroup : public PoolGroupBase
+{
+public:
+    //! groupVmSize is the address space each pool here may grow into.
+    //!
+    //! Pools are sized by slot-size ratio, so with more than one pool the group
+    //! can reserve more than groupVmSize in total. Host groups hold exactly one
+    //! pool today, which makes the two equal.
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
+        HostMemBackingOptions const& options = {});
+
+    Slot allocate() override;
+    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
+
+private:
+    //! Blocks until every pool backs the byte range ending just past `slot`.
+    void waitSlotUsable(SlotId slot) const;
+};
+
+class DiskPoolGroup : public PoolGroupBase
+{
+public:
+    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+};
+
+// ---------------------------------------------------------------------------
+// CacheLevelStorage — manages all pool groups for one cache tier.
+// Mirrors _storage/_core.py::CacheLevelStorage.
+// ---------------------------------------------------------------------------
+class CacheLevelStorage
+{
+public:
+    virtual ~CacheLevelStorage() = default;
+
+    virtual CacheTier cacheTier() const noexcept = 0;
+
+    PoolGroupIndex numPoolGroups() const noexcept
+    {
+        return mPoolGroups.size();
+    }
+
+    std::vector<Slot> allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots);
+    void release(PoolGroupIndex pgIdx, Slot slot);
+    SlotCount numFreeSlots(PoolGroupIndex pgIdx) const;
+    TypedVec<PoolIndex, Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
+
+    // Additional accessors used by StorageManager and KvCacheManager.
+    virtual void destroy()
+    {
+        for (auto& pg : mPoolGroups)
+            pg->destroy();
+    }
+
+    PoolIndex numPools(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->numPools();
+    }
+
+    SlotCount numSlots(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->numSlots();
+    }
+
+    TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const
+    {
+        auto szl = mPoolGroups.at(pgIdx)->slotSize();
+        TypedVec<PoolIndex, size_t> ret;
+        ret.reserve(szl.size());
+        for (auto sz : szl)
+            ret.push_back(sz);
+        return ret;
+    }
+
+    PoolGroupBase& poolGroup(PoolGroupIndex pgIdx)
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
+    MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
+    {
+        return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
+    }
+
+    size_t totalQuota() const noexcept
+    {
+        size_t granularity = poolSizeGranularity();
+        size_t total = 0;
+        for (auto const& pg : mPoolGroups)
+            total += pg->roundedNumBytes(granularity);
+        return total;
+    }
+
+    // Returns numSlots() per pool group.
+    TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
+    {
+        TypedVec<PoolGroupIndex, SlotCount> ret;
+        ret.reserve(mPoolGroups.size());
+        for (auto const& pg : mPoolGroups)
+            ret.push_back(pg->numSlots());
+        return ret;
+    }
+
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists() const
+    {
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> ret;
+        ret.reserve(mPoolGroups.size());
+        for (auto const& pg : mPoolGroups)
+        {
+            auto szl = pg->slotSize();
+            TypedVec<PoolIndex, size_t> sizes;
+            sizes.reserve(szl.size());
+            for (auto sz : szl)
+                sizes.push_back(sz);
+            ret.push_back(std::move(sizes));
+        }
+        return ret;
+    }
+
+    // Current ratio list: proportion of bytes per pool group.
+    TypedVec<PoolGroupIndex, float> ratioList() const
+    {
+        TypedVec<PoolGroupIndex, float> ret(mPoolGroups.size(), 0.f);
+        float total = 0.f;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+        {
+            auto sz = static_cast<float>(mPoolGroups[pgIdx]->numBytes());
+            ret[pgIdx] = sz;
+            total += sz;
+        }
+        TLLM_CHECK_DEBUG(total > 0.f);
+        for (auto& r : ret)
+            r /= total;
+        return ret;
+    }
+
+    virtual size_t poolSizeGranularity() const noexcept
+    {
+        return kDiskPoolSizeGranularity;
+    }
+
+    //! Largest quota this level may be resized to, when it has one.
+    //!
+    //! Unset means unbounded here: GPU and disk levels are limited by the
+    //! device and the filesystem rather than by a reservation made up front.
+    [[nodiscard]] virtual std::optional<size_t> maxQuota() const noexcept
+    {
+        return std::nullopt;
+    }
+
+    // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
+    // Instance convenience method — delegates to the static version below.
+    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountList(TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt) const;
+
+    // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
+    // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
+    static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    // Distribute grains among pools within a pool group.
+    // Returns {num_slots, grains_consumed}.
+    static std::pair<SlotCount, size_t> grainsToSlots(
+        size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+
+    // Compute minimum grains needed for numSlots in a pool group.
+    static size_t grainsForSlots(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+
+protected:
+    TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
+};
+
+class GpuCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    size_t poolSizeGranularity() const noexcept override
+    {
+        return mPhysMemAllocator.physMemSize();
+    }
+
+private:
+    PooledPhysMemAllocator& mPhysMemAllocator;
+};
+
+class HostCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! `commitUnit` is the granularity memory is allocated and released in; it
+    //! is also what pool sizes are quantized to.
+    HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
+        HostMemBackingOptions const& options = {});
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+    size_t poolSizeGranularity() const noexcept override
+    {
+        return mOptions.commitUnit;
+    }
+
+    //! Always set: an unset configured maxQuota resolves to the host memory the
+    //! OS reports, and the pools reserve against that resolved value. Rounded
+    //! up to poolSizeGranularity(), which is the quantum quotas are expressed
+    //! in, so the configured bound is reachable.
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mMaxQuota;
+    }
+
+private:
+    HostMemBackingOptions mOptions;
+    size_t mMaxQuota = 0;
+};
+
+class DiskCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
+
+    std::string const& directory() const noexcept
+    {
+        return mDirectory;
+    }
+
+private:
+    std::string mDirectory;
+};
+
+// Factory: create appropriate CacheLevelStorage for a given tier config.
+//! `commitUnit` is the tier's allocation granularity, decided once from its
+//! quota and fixed for the tier's lifetime.
+std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {});
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

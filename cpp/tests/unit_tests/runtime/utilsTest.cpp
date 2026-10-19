@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -71,9 +72,9 @@ TEST_F(UtilsTest, LoadNpy)
 TEST_F(UtilsTest, LoadStoreNpy)
 {
     auto dims = ITensor::makeShape({2, 3, 4});
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
-    auto tensorRange = BufferRange<float>(*tensor);
+    auto tensorRange = tensor->getBufferRange<float>();
     std::iota(tensorRange.begin(), tensorRange.end(), 0);
 
     std::string filename{"tensor.npy"};
@@ -86,7 +87,7 @@ TEST_F(UtilsTest, LoadStoreNpy)
     EXPECT_EQ(loadedTensor->getShape().d[1], tensor->getShape().d[1]);
     EXPECT_EQ(loadedTensor->getShape().d[2], tensor->getShape().d[2]);
 
-    auto loadedTensorRange = BufferRange<float>(*loadedTensor);
+    auto loadedTensorRange = loadedTensor->getBufferRange<float>();
     for (size_t i = 0; i < tensor->getSize(); ++i)
     {
         EXPECT_EQ(loadedTensorRange[i], tensorRange[i]);
@@ -96,9 +97,9 @@ TEST_F(UtilsTest, LoadStoreNpy)
 TEST_F(UtilsTest, LoadStoreNpyGPU)
 {
     auto dims = ITensor::makeShape({2, 3, 4});
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
-    auto tensorRange = BufferRange<float>(*tensor);
+    auto tensorRange = tensor->getBufferRange<float>();
     std::iota(tensorRange.begin(), tensorRange.end(), 0);
 
     auto deviceTensor = mManager->copyFrom(*tensor, MemoryType::kGPU);
@@ -115,7 +116,7 @@ TEST_F(UtilsTest, LoadStoreNpyGPU)
 
     auto hostTensor = mManager->copyFrom(*loadedTensor, MemoryType::kCPU);
 
-    auto loadedTensorRange = BufferRange<float>(*hostTensor);
+    auto loadedTensorRange = hostTensor->getBufferRange<float>();
     for (size_t i = 0; i < tensor->getSize(); ++i)
     {
         EXPECT_EQ(loadedTensorRange[i], tensorRange[i]);

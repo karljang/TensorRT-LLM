@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import queue
 import subprocess
@@ -8,10 +23,37 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci
-from defs.conftest import llm_models_root, skip_no_hopper
+from defs.conftest import llm_models_root, skip_no_hopper, skip_pre_blackwell
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
+
+
+def _wait_for_server_ready(proc, http_port, timeout=7200, sleep_interval=0.5):
+    """Wait for server /health to return 200.
+
+    Fails immediately if the server process exits unexpectedly, rather than
+    waiting out the full timeout. Mirrors the pattern in openai_server.py.
+    """
+    url = f"http://0.0.0.0:{http_port}/health"
+    start = time.time()
+    while True:
+        try:
+            if requests.get(url, timeout=sleep_interval).status_code == 200:
+                break
+        except RequestException:
+            pass
+
+        result = proc.poll()
+        if result is not None and result != 0:
+            raise RuntimeError(
+                f"trtllm-serve exited unexpectedly with code {result}.")
+
+        if time.time() - start > timeout:
+            raise TimeoutError(
+                f"trtllm-serve did not become ready within {timeout}s.")
+
+        time.sleep(sleep_interval)
 
 
 def check_server_ready(http_port, timeout_timer=600, sleep_interval=5):
@@ -50,8 +92,7 @@ def wait_for_log(log_queue, expected_log, timeout=10):
     return False
 
 
-def check_openai_chat_completion(http_port,
-                                 model_name="TinyLlama-1.1B-Chat-v1.0"):
+def check_openai_chat_completion(http_port, model_name="Qwen3-0.6B"):
     """
     Test the launched trtllm-serve server using OpenAI client.
 
@@ -109,6 +150,126 @@ def check_openai_chat_completion(http_port,
         raise
 
 
+_SHORT_PROMPT = "What is the capital of France?"
+_LONG_PROMPT = ("Please summarize the following passage in one sentence.\n\n" +
+                ("The quick brown fox jumps over the lazy dog. " * 600))
+
+
+def check_mixed_prompt_batch(client,
+                             model_name,
+                             join_timeout=300,
+                             require_reasoning=True):
+    """Send 1 long + 3 short chat requests at once and check every reply.
+
+    Args:
+        require_reasoning: Require non-empty ``reasoning_content``; set False
+            where an empty thinking step is acceptable.
+    """
+    results = {}
+    errors = {}
+
+    def _complete(label, prompt):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }],
+                max_completion_tokens=1024,
+                stream=False,
+            )
+            assert len(resp.choices) == 1, \
+                f"[{label}] expected 1 choice, got {len(resp.choices)}"
+            results[label] = resp.choices[0].message
+        except Exception as exc:
+            errors[label] = str(exc)
+
+    threads = [
+        threading.Thread(name="long_0",
+                         target=_complete,
+                         args=("long_0", _LONG_PROMPT),
+                         daemon=True)
+    ]
+    for i in range(3):
+        threads.append(
+            threading.Thread(name=f"short_{i}",
+                             target=_complete,
+                             args=(f"short_{i}", _SHORT_PROMPT),
+                             daemon=True))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=join_timeout)
+
+    hung = [t.name for t in threads if t.is_alive()]
+    assert not hung, f"Timed out waiting for request threads: {hung}"
+    assert not errors, f"Requests failed: {errors}"
+    assert "long_0" in results, "Long prompt (chunked prefill) got no response"
+    assert all(f"short_{i}" in results
+               for i in range(3)), "One or more short prompts got no response"
+
+    for label, msg in results.items():
+        reasoning = msg.reasoning_content or ""
+        content = msg.content or ""
+        if require_reasoning:
+            # content may be empty if the token budget was consumed by
+            # thinking, which is expected model behaviour, not a server error.
+            assert len(reasoning) > 0, \
+                f"[{label}] empty reasoning_content — request did not complete"
+        else:
+            assert len(reasoning) + len(content) > 0, \
+                f"[{label}] empty response — request did not complete"
+        print_info(f"[{label}] reasoning: {reasoning!r}")
+        print_info(f"[{label}] content:   {content!r}")
+
+
+def test_config_override_precedence(llm_root, llm_venv, tmp_path) -> None:
+    """Verify YAML < dedicated CLI < --set with a single-GPU serving request."""
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(llm_root, "examples", "serve", "requirements.txt")
+    ])
+    model_path = os.environ.get("LLM_ENGINE_DIR") or os.path.join(
+        llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "tensor_parallel_size": 99,
+        "max_num_tokens": 16384,
+    }),
+                           encoding="utf-8")
+    port = get_free_port_in_ci()
+    # TP=99 or PP=2 would fail on one GPU, so startup checks both boundaries.
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--tp_size",
+        "1",
+        "--pp_size",
+        "2",
+        "--config",
+        str(config_path),
+        "--set",
+        "pipeline_parallel_size=1",
+    ]
+    with popen(cmd) as proc:
+        _wait_for_server_ready(proc, http_port=port)
+        with OpenAI(base_url=f"http://localhost:{port}/v1",
+                    api_key="tensorrt_llm",
+                    timeout=600) as client:
+            response = client.completions.create(
+                model="TinyLlama-1.1B-Chat-v1.0",
+                prompt="Where is New York?",
+                max_tokens=20,
+            )
+            assert response.choices, "Server returned no completion choices"
+
+
 @pytest.mark.parametrize("config_flag", ["--extra_llm_api_options", "--config"])
 @skip_no_hopper
 def test_config_file_loading(serve_test_root, config_flag):
@@ -159,7 +320,7 @@ def test_env_overrides_pdl(tmp_path):
     environment variables to the server workers. Specifically, it sets `TRTLLM_ENABLE_PDL=1`
     (Programmatic Dependent Launch) via config and verifies it overrides the env var initially set to 0.
 
-    1. This model (TinyLlama-1.1B-Chat-v1.0) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
+    1. This model (Qwen3-0.6B) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
     2. When `TRTLLM_ENABLE_PDL=1` is actually propagated into worker env, flashinfer custom ops log "PDL enabled" to stdout/stderr.
     """
     pdl_enabled = "1"
@@ -182,8 +343,7 @@ def test_env_overrides_pdl(tmp_path):
     })
 
     cmd = [
-        "trtllm-serve", "serve",
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "trtllm-serve", "serve", f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         "--host", "0.0.0.0", "--port",
         str(port), "--backend", "pytorch", "--config",
         str(config_file)
@@ -203,7 +363,7 @@ def test_env_overrides_pdl(tmp_path):
         check_server_ready(http_port=port, timeout_timer=300)
         response = OpenAI(base_url=f"http://localhost:{port}/v1",
                           api_key="tensorrt_llm").chat.completions.create(
-                              model="TinyLlama-1.1B-Chat-v1.0",
+                              model="Qwen3-0.6B",
                               messages=[{
                                   "role": "user",
                                   "content": "Test"
@@ -220,3 +380,419 @@ def test_env_overrides_pdl(tmp_path):
 
     logs = ''.join(output_queue.queue)
     assert "Overriding TRTLLM_ENABLE_PDL: '0' -> '1'" in logs
+
+
+@skip_pre_blackwell
+def test_nemotron3_super_120b_nvfp4(serve_test_root):
+    """Test Nemotron 3 Super 120B NVFP4 with chunked prefill + MTP=3.
+
+    Sends a mix of short and long prompts concurrently to verify that the server
+    starts successfully and all requests complete without errors.
+    """
+    model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    config_file = f"{serve_test_root}/test_configs/Nemotron3_Super_120B_NVFP4.yml"
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(config_file), f"Config not found: {config_file}"
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--max_batch_size",
+        "8",
+        "--tp_size",
+        "1",
+        "--ep_size",
+        "1",
+        "--max_num_tokens",
+        "8192",
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nano-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--extra_llm_api_options",
+        config_file,
+        "--max_seq_len",
+        "1048576",
+    ]
+
+    model_name = os.path.basename(model_path)
+    client = OpenAI(
+        base_url=f"http://localhost:{port}/v1",
+        api_key="tensorrt_llm",
+    )
+
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Server ready — sending mixed short+long prompt batch...")
+        check_mixed_prompt_batch(client, model_name)
+
+    print_info("test_nemotron3_super_120b_nvfp4 PASSED")
+
+
+_NEMOTRON35_LIGHTNING_COMMON_CONFIG = "Nemotron35_Lightning_30B.yml"
+_NEMOTRON35_LIGHTNING_VARIANTS = {
+    "nvfp4": {
+        "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+        "config_overrides": {
+            "moe_config": {
+                "backend": "CUTEDSL"
+            },
+            "nvfp4_gemm_config": {
+                "allowed_backends":
+                ["marlin", "cutlass", "cublaslt", "cuda_core"]
+            },
+        },
+    },
+    "bf16": {
+        "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "config_overrides": {
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+        },
+    },
+}
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("precision", list(_NEMOTRON35_LIGHTNING_VARIANTS))
+def test_nemotron35_lightning_30b(serve_test_root, tmp_path, precision):
+    """Nemotron 3.5 Lightning 30B-A3B with chunked prefill + MTP=3."""
+    variant = _NEMOTRON35_LIGHTNING_VARIANTS[precision]
+    model_path = f"{llm_models_root()}/{variant['model_dir']}"
+    common_config = (f"{serve_test_root}/test_configs/"
+                     f"{_NEMOTRON35_LIGHTNING_COMMON_CONFIG}")
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(common_config), f"Config not found: {common_config}"
+
+    with open(common_config) as f:
+        config = yaml.safe_load(f)
+    overlapping = set(config) & set(variant["config_overrides"])
+    assert not overlapping, \
+        f"[{precision}] overrides would replace common settings: {overlapping}"
+    config.update(variant["config_overrides"])
+
+    config_file = str(tmp_path / f"nemotron35_lightning_{precision}.yml")
+    with open(config_file, "w") as f:
+        yaml.dump(config, f)
+    print_info(f"[{precision}] merged serve config:\n{yaml.dump(config)}")
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--max_batch_size",
+        "8",
+        "--max_num_tokens",
+        "8192",
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nemotron-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--config",
+        config_file,
+    ]
+
+    model_name = os.path.basename(model_path)
+    client = OpenAI(
+        base_url=f"http://localhost:{port}/v1",
+        api_key="tensorrt_llm",
+    )
+
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Server ready — sending mixed short+long prompt batch...")
+        check_mixed_prompt_batch(client,
+                                 model_name,
+                                 join_timeout=600,
+                                 require_reasoning=False)
+
+    print_info(f"test_nemotron35_lightning_30b[{precision}] PASSED")
+
+
+_NEMOTRON3_NANO_OMNI_MODEL_DIR = "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
+# Public stable media URLs for multimodal tests.
+_OMNI_IMAGE_URL = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png"
+_OMNI_VIDEO_URL = "https://blogs.nvidia.com/wp-content/uploads/2023/04/nvidia-studio-itns-wk53-scene-in-omniverse-1280w.mp4"
+_NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.fixture(scope="module")
+def _nemotron3_nano_omni_server():
+    """Start the Nemotron-3-Nano-Omni-30B NVFP4 server once for all omni tests.
+
+    Module-scoped so the server starts once and stays alive across all four
+    test cases (text_reasoning_on, text_reasoning_off, image, video),
+    avoiding the cost of four separate server startups.
+    """
+    from defs.conftest import get_llm_root
+    llm_root = get_llm_root()
+    model_path = f"{llm_models_root()}/{_NEMOTRON3_NANO_OMNI_MODEL_DIR}"
+    config_file = (f"{llm_root}/tests/integration/defs/examples/serve/"
+                   f"test_configs/Nemotron3_Nano_Omni_30B_NVFP4.yml")
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(config_file), f"Config not found: {config_file}"
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nano-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--extra_llm_api_options",
+        config_file,
+    ]
+
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Nemotron-3-Nano-Omni server ready.")
+        client = OpenAI(
+            base_url=f"http://localhost:{port}/v1",
+            api_key="tensorrt_llm",
+        )
+        yield client, os.path.basename(model_path)
+
+
+# See the step-by-step recipe for Nemotron-3-Nano-Omni inference in the official usage guide:
+# https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Nemotron-3-Nano-Omni/trtllm_cookbook.ipynb
+@skip_pre_blackwell
+@pytest.mark.parametrize("modality", [
+    "text_reasoning_on",
+    "text_reasoning_off",
+    "text_streaming",
+    "tool_calling",
+    "image",
+    "video",
+])
+def test_nemotron3_nano_omni_nvfp4(modality, _nemotron3_nano_omni_server):
+    """Nemotron-3-Nano-Omni-30B NVFP4 multimodal functional tests.
+
+    Parametrized over six modality cases sharing a single server instance:
+      text_reasoning_on  — haiku prompt, thinking + answer both present.
+      text_reasoning_off — short prompt, no thinking step.
+      text_streaming     — streaming chat completion, token-by-token delivery.
+      tool_calling       — function calling via OpenAI tools schema.
+      image              — image URL, non-empty description.
+      video              — video URL, non-empty description (also exercises
+                           audio extraction from the video stream).
+    """
+    client, model_name = _nemotron3_nano_omni_server
+
+    if modality == "text_reasoning_on":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Write a haiku about GPUs"
+                },
+            ],
+            temperature=0.6,
+            max_completion_tokens=4096,
+            stream=False,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(msg.reasoning_content) > 0, \
+            "empty reasoning_content — thinking step did not run"
+        assert len(msg.content) > 0, "empty content — haiku response missing"
+        print_info(
+            f"[text_reasoning_on] thinking: {msg.reasoning_content[:500]!r}...")
+        print_info(f"[text_reasoning_on] content:  {msg.content[:500]!r}...")
+
+    elif modality == "text_reasoning_off":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Give me 3 bullet points about TensorRT-LLM."
+                },
+            ],
+            temperature=0.2,
+            max_completion_tokens=256,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(msg.content) > 0, "empty content — direct answer missing"
+        print_info(f"[text_reasoning_off] content: {msg.content[:500]!r}...")
+
+    elif modality == "text_streaming":
+        stream = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "What are the first 5 prime numbers?"
+                },
+            ],
+            temperature=0.6,
+            max_completion_tokens=1024,
+            stream=True,
+        )
+        chunks = []
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                chunks.append(chunk.choices[0].delta.content)
+        full_content = "".join(chunks)
+        assert len(chunks) > 1, "expected multiple streamed chunks"
+        assert len(full_content) > 0, "empty content — streaming failed"
+        print_info(f"[text_streaming] chunks={len(chunks)}, "
+                   f"content: {full_content[:500]!r}...")
+
+    elif modality == "tool_calling":
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "calculate_tip",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bill_total": {
+                            "type": "integer",
+                            "description": "The total amount of the bill"
+                        },
+                        "tip_percentage": {
+                            "type": "integer",
+                            "description": "The percentage of tip to be applied"
+                        },
+                    },
+                    "required": ["bill_total", "tip_percentage"],
+                },
+            },
+        }]
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": ""
+                },
+                {
+                    "role":
+                    "user",
+                    "content":
+                    "My bill is $50. What will be the amount for 15% tip?"
+                },
+            ],
+            tools=tools,
+            temperature=0.6,
+            top_p=0.95,
+            max_completion_tokens=512,
+            stream=False,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert msg.tool_calls is not None and len(msg.tool_calls) > 0, \
+            "no tool_calls — function calling failed"
+        tool_call = msg.tool_calls[0]
+        assert tool_call.function.name == "calculate_tip", \
+            f"expected calculate_tip, got {tool_call.function.name}"
+        print_info(f"[tool_calling] reasoning: "
+                   f"{msg.reasoning_content[:500]!r}...")
+        print_info(f"[tool_calling] function: {tool_call.function.name}, "
+                   f"args: {tool_call.function.arguments}")
+
+    elif modality == "image":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Describe what you see in this image."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _OMNI_IMAGE_URL
+                        }
+                    },
+                ],
+            }],
+            temperature=0.2,
+            max_completion_tokens=512,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(
+            msg.content) > 0, "empty content — image understanding failed"
+        print_info(f"[image] content: {msg.content[:500]!r}...")
+
+    elif modality == "video":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Describe what happens in this video."
+                    },
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": _OMNI_VIDEO_URL
+                        }
+                    },
+                ],
+            }],
+            temperature=0.2,
+            max_completion_tokens=2048,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(
+            msg.content) > 0, "empty content — video understanding failed"
+        print_info(f"[video] content: {msg.content[:500]!r}...")

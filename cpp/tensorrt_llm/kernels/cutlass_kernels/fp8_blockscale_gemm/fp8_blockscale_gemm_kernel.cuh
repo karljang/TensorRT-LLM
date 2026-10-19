@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
 #include "sm120_blockwise_gemm/sm120_fp8_gemm_1d1d.cuh"
+#include "sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -272,6 +273,131 @@ __global__ void scale_1x128_kernel(
 #endif
 }
 
+// Vectorized 1x128 quantization. A group is quantized by kLanes consecutive
+// lanes, each owning kVec contiguous inputs that fit one 16-byte load, so a
+// warp covers kGroupsPerWarp groups at once. The kernels need rows of whole
+// lane chunks (dim_x and any row stride divisible by kVec), a 16-byte aligned
+// input and an 8-byte aligned output; launch_scale_1x128 and
+// launch_scale_1x128_reshape fall back to the element-wise kernels otherwise.
+template <typename InputType>
+struct Quantize1x128Layout
+{
+    static_assert(sizeof(InputType) == 2, "1x128 quantization reads half or bf16 inputs");
+    static constexpr int kVec = 16 / sizeof(InputType);
+    static constexpr int kLanes = 128 / kVec;
+    static constexpr int kGroupsPerWarp = 32 / kLanes;
+};
+
+// Quantize the kVec inputs one lane owns in a 1x128 group, with the same
+// arithmetic as scale_1x128_kernel. Lanes past the row end or of an inactive
+// group pass in_row = false. Every lane of the warp must call this, since the
+// group amax is reduced with shuffles. The lane given a non-null ``scale``
+// writes the group's dequantization scale.
+template <typename InputType, typename OutputType, typename ScaleType, bool USE_UE8M0>
+__device__ __forceinline__ void quantize_1x128_lane(
+    InputType const* input, OutputType* output, ScaleType* scale, bool in_row)
+{
+    using Layout = Quantize1x128Layout<InputType>;
+    constexpr int kVec = Layout::kVec;
+    static_assert(sizeof(OutputType) == 1 && kVec * sizeof(OutputType) == sizeof(uint2),
+        "1x128 quantization writes 8-bit outputs");
+
+    union
+    {
+        uint4 pack;
+        InputType v[kVec];
+    } in;
+
+    in.pack = in_row ? *reinterpret_cast<uint4 const*>(input) : make_uint4(0, 0, 0, 0);
+
+    InputType lane_amax = InputType(0);
+#pragma unroll
+    for (int i = 0; i < kVec; i++)
+    {
+        lane_amax = __hmax(lane_amax, __habs(in.v[i]));
+    }
+    float group_amax = float(lane_amax);
+#pragma unroll
+    for (int mask = Layout::kLanes / 2; mask > 0; mask /= 2)
+    {
+        group_amax = std::max(group_amax, __shfl_xor_sync(0xFFFFFFFF, group_amax, mask));
+    }
+
+    InputType amax = tensorrt_llm::common::cuda_max(InputType(group_amax), InputType(1e-10f));
+    ScaleType quant_scale = 448.f / ScaleType(amax);
+    ScaleType dequant_scale;
+
+    if constexpr (USE_UE8M0)
+    {
+        // Round dequant scale to UE8M0 (power of 2)
+        ScaleType dequant_scale_raw = 1.f / quant_scale;
+        __nv_fp8_e8m0 ue8m0_scale;
+        ue8m0_scale.__x = __nv_cvt_float_to_e8m0(float(dequant_scale_raw), __NV_SATFINITE, cudaRoundPosInf);
+        // Cast back to float automatically decodes E8M0 format
+        dequant_scale = ScaleType(static_cast<float>(ue8m0_scale));
+        // Recompute quant scale from rounded dequant scale for consistency
+        quant_scale = dequant_scale != ScaleType(0.f) ? 1.f / dequant_scale : 1.f;
+    }
+    else
+    {
+        dequant_scale = 1.f / quant_scale;
+    }
+
+    if (scale != nullptr)
+    {
+        *scale = dequant_scale;
+    }
+    if (!in_row)
+    {
+        return;
+    }
+
+    union
+    {
+        uint2 pack;
+        OutputType v[kVec];
+    } out;
+
+#pragma unroll
+    for (int i = 0; i < kVec; i++)
+    {
+        out.v[i] = OutputType(ScaleType(in.v[i]) * quant_scale);
+    }
+    *reinterpret_cast<uint2*>(output) = out.pack;
+}
+
+template <typename InputType, typename OutputType, typename ScaleType = float, bool USE_UE8M0 = false>
+__global__ void scale_1x128_vec_kernel(
+    OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+    using Layout = Quantize1x128Layout<InputType>;
+    size_t const scales_along_dim_x = div_up(dim_x, 128);
+    size_t const num_groups = scales_along_dim_x * dim_y;
+    size_t const stride_scale_dim_y = div_up(dim_y, 4) * 4;
+    int const lane_id = threadIdx.x % 32;
+    int const sub_lane = lane_id % Layout::kLanes;
+    size_t const warp_idx = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    size_t const num_warps = (size_t) gridDim.x * blockDim.x / 32;
+
+    // Whole warps step together so every lane takes part in the group shuffles.
+    for (size_t first_group = warp_idx * Layout::kGroupsPerWarp; first_group < num_groups;
+         first_group += num_warps * Layout::kGroupsPerWarp)
+    {
+        size_t const group = first_group + lane_id / Layout::kLanes;
+        bool const active = group < num_groups;
+        size_t const scales_idx_y = active ? group / scales_along_dim_x : 0;
+        size_t const scales_idx_x = active ? group % scales_along_dim_x : 0;
+        size_t const col = scales_idx_x * 128 + sub_lane * Layout::kVec;
+        size_t const offset = scales_idx_y * dim_x + col;
+        ScaleType* scale
+            = active && sub_lane == 0 ? scales + scales_idx_x * stride_scale_dim_y + scales_idx_y : nullptr;
+        quantize_1x128_lane<InputType, OutputType, ScaleType, USE_UE8M0>(
+            input + offset, output + offset, scale, active && col < (size_t) dim_x);
+    }
+#endif
+}
+
 template <bool UseBinarySearch, typename InputType, typename OutputType>
 __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType const* input,
     int64_t const* problem_m_offsets, int num_problems, int dim_x, int64_t scale_leading_dim, uint32_t scale_dim_x_mul,
@@ -484,6 +610,41 @@ __global__ void scale_1x128_reshape_kernel(
 #endif
 }
 
+// Vectorized scale_1x128_reshape_kernel (see Quantize1x128Layout).
+template <typename InputType, typename OutputType, typename ScaleType = float>
+__global__ void scale_1x128_reshape_vec_kernel(
+    OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_h, int dim_y, int stride_x)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+    using Layout = Quantize1x128Layout<InputType>;
+    size_t const scales_along_dim_x = div_up(dim_x, 128);
+    size_t const num_groups = scales_along_dim_x * dim_h * dim_y;
+    size_t const stride_scale_dim_y = div_up(dim_y, 4) * 4;
+    int const lane_id = threadIdx.x % 32;
+    int const sub_lane = lane_id % Layout::kLanes;
+    size_t const warp_idx = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    size_t const num_warps = (size_t) gridDim.x * blockDim.x / 32;
+
+    // Whole warps step together so every lane takes part in the group shuffles.
+    for (size_t first_group = warp_idx * Layout::kGroupsPerWarp; first_group < num_groups;
+         first_group += num_warps * Layout::kGroupsPerWarp)
+    {
+        size_t const group = first_group + lane_id / Layout::kLanes;
+        bool const active = group < num_groups;
+        size_t const scales_idx_y = active ? group / (scales_along_dim_x * dim_h) : 0;
+        size_t const scales_idx_h = active ? group % (scales_along_dim_x * dim_h) / scales_along_dim_x : 0;
+        size_t const scales_idx_x = active ? group % scales_along_dim_x : 0;
+        size_t const col = scales_idx_x * 128 + sub_lane * Layout::kVec;
+        ScaleType* scale = active && sub_lane == 0
+            ? scales + (scales_idx_h * scales_along_dim_x + scales_idx_x) * stride_scale_dim_y + scales_idx_y
+            : nullptr;
+        quantize_1x128_lane<InputType, OutputType, ScaleType, false>(
+            input + (scales_idx_y * dim_h + scales_idx_h) * stride_x + col,
+            output + (scales_idx_h * dim_y + scales_idx_y) * dim_x + col, scale, active && col < (size_t) dim_x);
+    }
+#endif
+}
+
 template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_128x128_kernel(
     OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
@@ -595,34 +756,73 @@ __global__ void convert_kernel(OutputType* output, InputType const* const input,
 
 static int kNumDeviceSMs = -1;
 
-void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
-    cudaStream_t stream, bool use_ue8m0 = false)
+// Whether the vectorized 1x128 kernels apply: whole 16-byte lane chunks in
+// every row, a 16-byte aligned input and an 8-byte aligned output.
+template <typename InputType, typename OutputType>
+bool can_vectorize_1x128(OutputType const* output, InputType const* input, int dim_x, int stride_x)
+{
+    constexpr int kVec = Quantize1x128Layout<InputType>::kVec;
+    return dim_x % kVec == 0 && stride_x % kVec == 0 && reinterpret_cast<uintptr_t>(input) % sizeof(uint4) == 0
+        && reinterpret_cast<uintptr_t>(output) % sizeof(uint2) == 0;
+}
+
+template <bool USE_UE8M0 = false, typename InputType, typename OutputType, typename ScaleType>
+void launch_scale_1x128(
+    OutputType* output, ScaleType* scales, InputType const* input, int dim_x, int dim_y, cudaStream_t stream)
 {
     if (kNumDeviceSMs < 0)
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    if (use_ue8m0)
+    if (can_vectorize_1x128(output, input, dim_x, dim_x))
     {
-        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, true>
-            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+        scale_1x128_vec_kernel<InputType, OutputType, ScaleType, USE_UE8M0>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(output, scales, input, dim_x, dim_y);
     }
     else
     {
-        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, false>
-            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+        scale_1x128_kernel<InputType, OutputType, ScaleType, USE_UE8M0>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(output, scales, input, dim_x, dim_y);
+    }
+}
+
+template <typename InputType, typename OutputType, typename ScaleType>
+void launch_scale_1x128_reshape(OutputType* output, ScaleType* scales, InputType const* input, int dim_x, int dim_h,
+    int dim_y, int stride_x, cudaStream_t stream)
+{
+    if (kNumDeviceSMs < 0)
+    {
+        kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    if (can_vectorize_1x128(output, input, dim_x, stride_x))
+    {
+        scale_1x128_reshape_vec_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
+            output, scales, input, dim_x, dim_h, dim_y, stride_x);
+    }
+    else
+    {
+        scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
+            output, scales, input, dim_x, dim_h, dim_y, stride_x);
+    }
+}
+
+void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+    cudaStream_t stream, bool use_ue8m0 = false)
+{
+    if (use_ue8m0)
+    {
+        launch_scale_1x128<true>(mat_quant, scales, mat, shape_x, shape_y, stream);
+    }
+    else
+    {
+        launch_scale_1x128<false>(mat_quant, scales, mat, shape_x, shape_y, stream);
     }
 }
 
 void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
     int shape_y, int stride_x, cudaStream_t stream)
 {
-    if (kNumDeviceSMs < 0)
-    {
-        kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
-    }
-    scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
-        mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
+    launch_scale_1x128_reshape(mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x, stream);
 }
 
 void fp8_128x128_cs(
@@ -713,8 +913,11 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
-void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
-    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+template <int TileM, int TileN, int NumStages>
+void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b, int64_t ld_b,
+    int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, float* scales_a, int64_t stride_scales_a,
+    float* scales_b, int64_t stride_scales_b, uint32_t num_problems, uint32_t shape_m, uint32_t shape_n,
+    uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -724,25 +927,18 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<TileM, TileN, NumStages>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
     using ProblemShape = typename GemmKernel::ProblemShape;
-    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, 1);
+    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, (int) num_problems);
 
     auto ptr_A = reinterpret_cast<ElementInput*>(mat_a);
     auto ptr_B = reinterpret_cast<ElementInput*>(mat_b);
     auto ptr_SFA = reinterpret_cast<ElementBlockScale*>(scales_a);
     auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
     auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
-
-    int32_t ld_a = shape_k;
-    int32_t stride_a = shape_m * shape_k;
-    int32_t ld_b = shape_k;
-    int32_t stride_b = shape_n * shape_k;
-    int32_t ld_d = shape_n;
-    int32_t stride_d = shape_m * shape_n;
 
     typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
     typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
@@ -764,7 +960,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
@@ -775,6 +971,35 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
 
     result = cudaGetLastError();
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+}
+
+void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+
+    auto* a = reinterpret_cast<__nv_fp8_e4m3*>(mat_a);
+    auto* b = reinterpret_cast<__nv_fp8_e4m3*>(mat_b);
+    auto* d = reinterpret_cast<__nv_bfloat16*>(mat_d);
+    int64_t ld_a = shape_k;
+    int64_t ld_b = shape_k;
+    int64_t ld_d = shape_n;
+    constexpr int64_t stride = 0;
+    constexpr uint32_t num_problems = 1;
+
+    if (shape_m <= 64)
+    {
+        launch_sm120_gemm_kernel<32, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else
+    {
+        launch_sm120_gemm_kernel<64, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
@@ -816,7 +1041,7 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
 
     if (internal_quantize_a)
     {
-        scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(fp8_mat_a, scales_a, mat_a, shape_k, shape_m);
+        launch_scale_1x128(fp8_mat_a, scales_a, mat_a, shape_k, shape_m, stream);
     }
     if (internal_quantize_b)
     {
@@ -866,6 +1091,81 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
     }
 }
 
+void grouped_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    uint32_t num_problems, int64_t const* problem_m_offsets, uint32_t expected_m, uint32_t max_shape_m,
+    uint32_t max_shape_m_padded, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b,
+    cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+
+    int64_t total_tokens = static_cast<int64_t>(max_shape_m);
+    // max_shape_m_padded = (max_shape_m + num_problems * 31) / 32 * 32
+    // m_padded = (total_tokens + num_problems * 3) / 4 * 4;
+    // so we can promise m_padded < max_shape_m_padded
+    int64_t m_padded = sm120_blockscaled_gemm::compute_padded_offset(max_shape_m, num_problems);
+
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128, 4>;
+    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledMoeKernel<KT>;
+    using Params = typename GemmKernel::Params;
+    using Arguments = typename GemmKernel::Arguments;
+    using ProblemShape = typename GemmKernel::ProblemShape;
+
+    ProblemShape problem_shape = make_shape(static_cast<int>(total_tokens), static_cast<int>(shape_n),
+        static_cast<int>(shape_k), static_cast<int>(num_problems));
+
+    auto ptr_A = reinterpret_cast<typename KT::ElementA*>(mat_a);
+    auto ptr_B = reinterpret_cast<typename KT::ElementB*>(mat_b);
+    auto ptr_SFA = reinterpret_cast<typename KT::ElementSFLoad*>(scales_a);
+    auto ptr_SFB = reinterpret_cast<typename KT::ElementSFLoad*>(scales_b);
+    auto ptr_D = reinterpret_cast<typename KT::ElementD*>(mat_d);
+
+    int64_t ld_a = static_cast<int64_t>(shape_k);
+    int64_t ld_b = static_cast<int64_t>(shape_k);
+    int64_t ld_d = static_cast<int64_t>(shape_n);
+    int64_t stride_a = total_tokens * ld_a;
+    int64_t stride_b = static_cast<int64_t>(shape_n) * ld_b;
+    int64_t stride_d = total_tokens * ld_d;
+
+    typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
+    typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
+    auto sfa_shape = make_shape(static_cast<int>(m_padded), static_cast<int>(shape_n), static_cast<int>(shape_k), 1);
+    typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(sfa_shape).stride();
+    auto sfb_shape = make_shape(static_cast<int>(m_padded), static_cast<int>(shape_n), static_cast<int>(shape_k),
+        static_cast<int>(num_problems));
+    typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(sfb_shape).stride();
+    typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
+
+    Arguments args
+        = {ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD, const_cast<int64_t*>(problem_m_offsets)};
+
+    Params kernel_params = GemmKernel::to_underlying_arguments(problem_shape, args);
+    auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
+
+    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel cannot launch: %s", cudaGetErrorString(result));
+
+    cudaLaunchConfig_t launch_config;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
+    launch_config.blockDim = GemmKernel::get_block_shape();
+    launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 moe gemm kernel runtime error: %s", cudaGetErrorString(result));
+}
+
 void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a,
     __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, float* scales_b, __nv_bfloat16* mat_d,
     int64_t const* problem_m_offsets, int num_problems, int64_t expected_m, int64_t max_shape_m,
@@ -875,6 +1175,41 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
     if (kNumDeviceSMs < 0)
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+
+    int arch = tensorrt_llm::common::getSMVersion();
+
+    if (arch == 120)
+    {
+        if (internal_quantize_a)
+        {
+            constexpr int WarpsPerBlock = 4;
+            int num_k_blocks = div_up(shape_k, 512);
+            int64_t num_token_blocks = div_up(max_shape_m, static_cast<int64_t>(WarpsPerBlock));
+            int64_t scale_leading_dim = sm120_blockscaled_gemm::compute_padded_offset(max_shape_m, num_problems);
+
+            constexpr int kBlocksPerSM = 8;
+            int64_t max_blocks = static_cast<int64_t>(kNumDeviceSMs) * kBlocksPerSM;
+            int num_blocks_y = static_cast<int>(std::min(num_token_blocks, max_blocks));
+
+            dim3 grid(num_k_blocks, num_blocks_y);
+            dim3 block(WarpsPerBlock * 32);
+            int smem_size = (num_problems + 1) * sizeof(int64_t);
+            auto scale_kernel
+                = sm120_blockscaled_gemm::scale_1x128_kernel_sm120<__nv_bfloat16, __nv_fp8_e4m3, WarpsPerBlock>;
+            cudaFuncSetAttribute(scale_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            scale_kernel<<<grid, block, smem_size, stream>>>(fp8_mat_a, reinterpret_cast<int32_t*>(scales_a), mat_a,
+                problem_m_offsets, num_problems, shape_k, scale_leading_dim);
+        }
+        if (internal_quantize_b)
+        {
+            TLLM_CHECK_WITH_INFO(false, "sm120 moe gemm kernel does not support internal_quantize_b");
+            return;
+        }
+
+        grouped_gemm_dispatch_sm120(fp8_mat_a, fp8_mat_b, mat_d, num_problems, problem_m_offsets, expected_m,
+            max_shape_m, max_shape_m_padded, shape_n, shape_k, scales_a, scales_b, stream);
+        return;
     }
 
     if (internal_quantize_a)
@@ -994,54 +1329,17 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    using ElementInput = cute::float_e4m3_t;
-    using ElementOutput = cute::bfloat16_t;
-    using ElementAccum = float;
-    using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
-    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
-    using Params = typename GemmKernel::Params;
-    using Arguments = typename GemmKernel::Arguments;
-    using ProblemShape = typename GemmKernel::ProblemShape;
-    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, (int) num_problems);
 
-    auto ptr_A = reinterpret_cast<ElementInput*>(mat_a);
-    auto ptr_B = reinterpret_cast<ElementInput*>(mat_b);
-    auto ptr_SFA = reinterpret_cast<ElementBlockScale*>(scales_a);
-    auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
-    auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
-
-    typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
-    typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
-    typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
-    typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
-    typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
-
-    Arguments args = {ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD};
-
-    Params kernel_params = GemmKernel::to_underlying_arguments(problem_shape, args);
-    auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
-
-    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
-    auto result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: %s", cudaGetErrorString(result));
-
-    cudaLaunchConfig_t launch_config;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
-    launch_config.blockDim = GemmKernel::get_block_shape();
-    launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
-    launch_config.stream = stream;
-    launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
-
-    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
-
-    result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+    if (shape_m <= 64)
+    {
+        launch_sm120_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else
+    {
+        launch_sm120_gemm_kernel<64, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
 }
 
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,
@@ -1061,8 +1359,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
     if (internal_quantize_a)
     {
-        scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
-            fp8_mat_a, scales_a, mat_a, shape_k, shape_m * num_problems);
+        launch_scale_1x128(fp8_mat_a, scales_a, mat_a, shape_k, shape_m * num_problems, stream);
     }
     if (internal_quantize_b)
     {

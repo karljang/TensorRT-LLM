@@ -1,20 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import ExaoneMoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ...logger import logger
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
@@ -41,28 +56,72 @@ from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
-# fmt: off
-# TODO: Remove this once we have a proper transformers package
-from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
-class ExaoneMoEConfig(PretrainedConfig):
-    model_type = "exaone_moe"
+def _per_layer_list(
+    config: ExaoneMoeConfig, name: str, layer_idx: int
+) -> list[int | float | str] | None:
+    """Return `config.<name>` when it is a list long enough to cover `layer_idx`.
 
-logger.warning_once(
-    "transformers does not support 'ExaoneMoEConfig'. "
-    "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
-    key="EXAONE_MOE_REGISTER_WARNING"
-)
-AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
-# End of the config register.
-# fmt: on
+    K-EXAONE2 encodes its per-layer contracts as plain lists in config.json.
+    When such a list is present it is authoritative for every layer it covers;
+    a 0 entry is the config's spelling of "not enabled on this layer".
+    """
+    values = getattr(config, name, None)
+    if values is None or layer_idx >= len(values):
+        return None
+    return values
 
 
-def check_is_moe(config: ExaoneMoEConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
+def get_exaone_swiglu_limit(config: ExaoneMoeConfig, layer_idx: int) -> Optional[float]:
+    """Return the configured per-layer SwiGLU clamp."""
+    limits = _per_layer_list(config, "swiglu_limits", layer_idx)
+    if limits is not None:
+        return float(limits[layer_idx]) or None
+    return None
+
+
+def get_exaone_attention_window(
+    config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool
+) -> Optional[int]:
+    """Return the effective attention window for an EXAONE-MoE layer."""
+    if is_mtp_layer:
+        mtp_layer_idx = layer_idx - config.num_hidden_layers
+        if mtp_layer_idx < 0:
+            return None
+        mtp_layer_types = _per_layer_list(config, "mtp_layer_types", mtp_layer_idx)
+        if mtp_layer_types is None or mtp_layer_types[mtp_layer_idx] != "sliding_attention":
+            return None
+        mtp_windows = _per_layer_list(config, "mtp_sliding_windows", mtp_layer_idx)
+        if mtp_windows is None:
+            return None
+        return int(mtp_windows[mtp_layer_idx]) or None
+    if config.layer_types[layer_idx] != "sliding_attention":
+        return None
+    windows = _per_layer_list(config, "sliding_windows", layer_idx)
+    if windows is not None:
+        return int(windows[layer_idx]) or None
+    return config.sliding_window
+
+
+def check_is_moe(config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
     """
     Check if the current layer is a MoE layer.
     """
-    return not is_mtp_layer and hasattr(config, "is_moe_layer") and config.is_moe_layer[layer_idx]
+    # The MTP layer of K-EXAONE is always dense.
+    if is_mtp_layer:
+        return False
+
+    if hasattr(config, "mlp_layer_types") and config.mlp_layer_types is not None:
+        return config.mlp_layer_types[layer_idx] == "sparse"
+
+    # For backward compatibility, older K-EXAONE checkpoints do not include `mlp_layer_types`.
+    if hasattr(config, "is_moe_layer") and config.is_moe_layer is not None:
+        return config.is_moe_layer[layer_idx]
+
+    raise ValueError(
+        "Invalid configuration: Neither `mlp_layer_types` nor `is_moe_layer` found in config. "
+        "Please check if the checkpoint and config are compatible with ExaoneMoeConfig."
+    )
 
 
 def enable_attn_allreduce(mapping: Mapping):
@@ -72,7 +131,7 @@ def enable_attn_allreduce(mapping: Mapping):
 class ExaoneMoeAttention(QKNormRoPEAttention):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         layer_idx: Optional[int] = None,
         is_mtp_layer: bool = False,
         fuse_qk_norm_rope: bool = False,
@@ -80,14 +139,12 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
     ):
         config = model_config.pretrained_config
 
-        self.attention_window_size = None
-        # A MTP layer uses the global attention.
-        self.is_sliding = not is_mtp_layer and config.layer_types[layer_idx] == "sliding_attention"
+        self.attention_window_size = get_exaone_attention_window(config, layer_idx, is_mtp_layer)
+        self.is_sliding = self.attention_window_size is not None
 
         # NOTE: In ExaoneMoe, only sliding layers apply rope.
         pos_embd_params = None
         if self.is_sliding:
-            self.attention_window_size = config.sliding_window
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
@@ -145,7 +202,7 @@ class ExaoneMoeSparseMoEBlock(Deepseekv3MoE):
 class ExaoneMoeDecoderLayer(DecoderLayer):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         layer_idx: int,
     ):
@@ -194,6 +251,9 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         is_mtp_layer = False
         if layer_idx >= config.num_hidden_layers:
             is_mtp_layer = True
+        # The MTP block is dense but follows its own head contract; the K2
+        # late-layer clamp applies only to main decoder layers.
+        swiglu_limit = None if is_mtp_layer else get_exaone_swiglu_limit(config, layer_idx)
         self.self_attn = ExaoneMoeAttention(
             model_config, layer_idx=layer_idx, is_mtp_layer=is_mtp_layer
         )
@@ -215,6 +275,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 override_quant_config=quant_config,
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx,
+                swiglu_limit_scalar=swiglu_limit,
             )
         else:
             block_size = 1
@@ -237,6 +298,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 overridden_tp_size=self.mlp_tp_size,
                 layer_idx=layer_idx,
                 reduce_output=has_mlp_tp,
+                swiglu_limit=swiglu_limit,
             )
 
         self.disable_attn_allreduce = (
@@ -252,7 +314,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
-        self, model_config: ModelConfig[ExaoneMoEConfig], layer_idx: int
+        self, model_config: ModelConfig[ExaoneMoeConfig], layer_idx: int
     ):
         """
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
@@ -464,7 +526,7 @@ class ExaoneMoeMTPHead(DeepseekV3MTPHead):
 class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
@@ -528,6 +590,7 @@ class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP
@@ -567,7 +630,7 @@ class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
 
 
 class ExaoneMoeModel(DecoderModel):
-    def __init__(self, model_config: ModelConfig[ExaoneMoEConfig]):
+    def __init__(self, model_config: ModelConfig[ExaoneMoeConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
@@ -635,11 +698,14 @@ class ExaoneMoeModel(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("ExaoneMoEForCausalLM")
-class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoEConfig]):
+# K-EXAONE and K-EXAONE-2 both declare `ExaoneMoeForCausalLM`. K-EXAONE configs
+# downloaded before the 2026-08 rename declare `ExaoneMoEForCausalLM` and need a
+# refreshed config.json.
+@register_auto_model("ExaoneMoeForCausalLM")
+class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
     ):
         if (
             model_config.spec_config is not None
@@ -659,7 +725,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
             model_config.spec_config is not None
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             if ckpt_nextn == 0:
@@ -696,7 +762,9 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
         skip_modules: Optional[List[str]] = None,
         allow_partial_loading: bool = False,
     ):
-        assert isinstance(weight_mapper, ExaoneMoeWeightMapper)
+        if weight_mapper is None:
+            weight_mapper = ExaoneMoeWeightMapper()
+        weight_mapper.init_model_and_config(self, self.model_config)
 
         if self.draft_model is not None:
             weight_mapper.preprocess_weights(weights)
@@ -709,7 +777,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
             allow_partial_loading=allow_partial_loading,
         )
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         # For the cross-layer residual+LN fusion.
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

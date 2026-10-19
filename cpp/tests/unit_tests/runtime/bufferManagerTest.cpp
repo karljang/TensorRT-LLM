@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
 
@@ -85,7 +86,7 @@ void testRoundTrip(BufferManager& manager)
     auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNEDPOOL);
     EXPECT_EQ(inputCpu.size(), outputCpu->getSize());
     manager.getStream().synchronize();
-    auto outputCpuTyped = bufferCast<T>(*outputCpu);
+    auto outputCpuTyped = outputCpu->template getBufferPtr<T>();
     for (size_t i = 0; i < inputCpu.size(); ++i)
     {
         EXPECT_EQ(inputCpu[i], outputCpuTyped[i]);
@@ -121,7 +122,7 @@ TEST_F(BufferManagerTest, Pointers)
     static_assert(std::is_same_v<decltype(trtPointerType), BufferDataType const>);
     static_assert(trtPointerType.isPointer());
     static_assert(trtPointerType.getDataType() == TRTDataType<cppBaseType>::value);
-    static_assert(static_cast<nvinfer1::DataType>(trtPointerType) == BufferDataType::kTrtPointerType);
+    static_assert(static_cast<tensorrt_llm::DataType>(trtPointerType) == BufferDataType::kTrtPointerType);
     static_assert(trtPointerType == BufferDataType::kTrtPointerType); // uses implicit type conversion
     // The C++ type corresponding to the TensorRT type for storing pointers (int64_t)
     using cppStorageType = DataTypeTraits<trtPointerType>::type;
@@ -131,7 +132,7 @@ TEST_F(BufferManagerTest, Pointers)
     // This buffer is on the CPU for convenient testing. In real code, this would be on the GPU.
     auto pointers = mBufferManager->allocate(MemoryType::kCPU, batchSize, trtPointerType);
     // We cast to the correct C++ pointer type checking that the underlying storage type is int64_t.
-    auto pointerBuf = bufferCast<cppPointerType>(*pointers);
+    auto pointerBuf = pointers->getBufferPtr<cppPointerType>();
 
     // Create the GPU tensors.
     std::vector<ITensor::UniquePtr> tensors(batchSize);
@@ -141,7 +142,7 @@ TEST_F(BufferManagerTest, Pointers)
     for (auto i = 0u; i < batchSize; ++i)
     {
         tensors[i] = mBufferManager->allocate(MemoryType::kGPU, shape, TRTDataType<cppBaseType>::value);
-        pointerBuf[i] = bufferCast<cppBaseType>(*tensors[i]);
+        pointerBuf[i] = tensors[i]->getBufferPtr<cppBaseType>();
     }
 
     // Test that all pointers are valid

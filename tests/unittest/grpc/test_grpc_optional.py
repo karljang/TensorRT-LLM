@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Optional-dependency and lifecycle tests for the gRPC gateway adapters.
+
+These run correctly with or without the dependencies installed: the "missing" case is
+simulated so it is meaningful in every environment, and the "present" case is
+guarded with ``importorskip``. OpenEngine's generated bindings and gRPC runtime
+are base TensorRT-LLM dependencies; the simulated missing-runtime case below
+checks recovery guidance for an incomplete installation.
+"""
+
+import asyncio
+import builtins
+import importlib
+import sys
+import types
+from collections.abc import Sequence
+from typing import Optional
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from click.testing import CliRunner
+
+
+def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
+    """A missing 'smg-grpc-proto' yields an actionable install hint.
+
+    Importing the SMG bindings must fail with a ``pip install
+    "tensorrt_llm[grpc-smg]"`` hint rather than a bare ImportError.
+    """
+    real_import = builtins.__import__
+
+    def import_without_smg(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "smg_grpc_proto.generated":
+            raise ModuleNotFoundError("No module named 'smg_grpc_proto'", name="smg_grpc_proto")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "smg_grpc_proto", raising=False)
+    monkeypatch.delitem(sys.modules, "smg_grpc_proto.generated", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.smg.bindings", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_smg)
+
+    with pytest.raises(ModuleNotFoundError, match=r"tensorrt_llm\[grpc-smg\]") as exc_info:
+        import tensorrt_llm.grpc.smg.bindings  # noqa: F401
+
+    assert exc_info.value.name == "smg_grpc_proto"
+
+
+def test_smg_bindings_preserves_unrelated_import_error(monkeypatch):
+    """A transitive dependency failure is not rewritten as an install hint."""
+    smg_package = types.ModuleType("smg_grpc_proto")
+    smg_package.__path__ = []
+    generated_package = types.ModuleType("smg_grpc_proto.generated")
+
+    def missing_protobuf(_name):
+        raise ModuleNotFoundError("No module named 'google.protobuf'", name="google.protobuf")
+
+    generated_package.__getattr__ = missing_protobuf
+    monkeypatch.setitem(sys.modules, "smg_grpc_proto", smg_package)
+    monkeypatch.setitem(sys.modules, "smg_grpc_proto.generated", generated_package)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.smg.bindings", raising=False)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        importlib.import_module("tensorrt_llm.grpc.smg.bindings")
+
+    assert exc_info.value.name == "google.protobuf"
+    assert "tensorrt_llm[grpc-smg]" not in str(exc_info.value)
+
+
+def test_smg_bindings_present_smoke():
+    """When the dependency is installed, the bindings import cleanly.
+
+    They must expose the pb2 modules the SMG adapter depends on.
+    """
+    pytest.importorskip(
+        "smg_grpc_proto",
+        reason="SMG gRPC adapter dependency not installed",
+    )
+    from tensorrt_llm.grpc.smg import bindings
+
+    assert bindings.trtllm_service_pb2 is not None
+    assert bindings.trtllm_service_pb2_grpc is not None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failure_point", ["bind", "start"])
+def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
+    """Binding and startup failures stop both the gRPC server and LLM."""
+    pytest.importorskip(
+        "smg_grpc_proto",
+        reason="SMG gRPC adapter dependency not installed",
+    )
+    from tensorrt_llm.grpc.smg import server as server_module
+
+    llm = MagicMock()
+    grpc_server = MagicMock()
+    grpc_server.start = AsyncMock()
+    grpc_server.stop = AsyncMock()
+
+    if failure_point == "bind":
+        grpc_server.add_insecure_port.side_effect = RuntimeError("bind failed")
+    else:
+        grpc_server.add_insecure_port.return_value = 8000
+        grpc_server.start.side_effect = RuntimeError("start failed")
+
+    monkeypatch.setitem(sys.modules, "grpc_reflection", None)
+    monkeypatch.delitem(sys.modules, "grpc_reflection.v1alpha", raising=False)
+    monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
+    monkeypatch.setattr(server_module, "PyTorchLLM", MagicMock(return_value=llm))
+    monkeypatch.setattr(server_module, "GrpcRequestManager", MagicMock())
+    monkeypatch.setattr(server_module, "TrtllmServiceServicer", MagicMock())
+    monkeypatch.setattr(server_module.grpc.aio, "server", MagicMock(return_value=grpc_server))
+    monkeypatch.setattr(
+        server_module.trtllm_service_pb2_grpc,
+        "add_TrtllmServiceServicer_to_server",
+        MagicMock(),
+    )
+
+    with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
+        server_module.launch_smg_server(
+            host="127.0.0.1",
+            port=8000,
+            llm_args={"backend": "pytorch", "model": "test-model"},
+        )
+
+    grpc_server.stop.assert_awaited_once_with(grace=5.0)
+    llm.shutdown.assert_called_once_with()
+
+
+def test_openengine_server_missing_grpc_raises_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent gRPC runtime surfaces as ImportError, which serve.py catches.
+
+    ``trtllm-serve --grpc --grpc_protocol openengine`` wraps the import of
+    ``tensorrt_llm.grpc.openengine.server`` in ``except ImportError`` to
+    re-raise it as a ClickException carrying direct grpcio recovery guidance.
+    If the module ever fails with something outside that hierarchy, the hint
+    silently stops reaching users, so pin the contract the handler depends on.
+    """
+    real_import = builtins.__import__
+
+    def import_without_grpc(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "grpc" or name.startswith("grpc."):
+            raise ModuleNotFoundError("No module named 'grpc'", name="grpc")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_grpc)
+
+    with pytest.raises(ImportError) as exc_info:
+        importlib.import_module("tensorrt_llm.grpc.openengine.server")
+
+    assert exc_info.value.name == "grpc"
+
+
+def test_serve_openengine_missing_grpc_shows_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenEngine CLI path provides missing-runtime recovery guidance."""
+    import tensorrt_llm.commands.serve as serve_module
+
+    real_import = builtins.__import__
+
+    def import_without_grpc(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "grpc" or name.startswith("grpc."):
+            raise ModuleNotFoundError("No module named 'grpc'", name="grpc")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_grpc)
+
+    monkeypatch.setattr(serve_module, "get_llm_args", lambda **_: ({}, None))
+    monkeypatch.setattr(serve_module, "get_is_diffusion_only_model", lambda _model: False)
+    monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
+    monkeypatch.setattr(
+        serve_module,
+        "update_llm_args_with_extra_dict",
+        lambda llm_args, _extra, **_: llm_args,
+    )
+    monkeypatch.setattr(
+        serve_module._command_telemetry,
+        "apply_raw_config_telemetry_opt_out",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "_apply_effective_telemetry_config",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "parse_metadata_server_config_file",
+        lambda _path: None,
+    )
+
+    result = CliRunner().invoke(
+        serve_module.serve,
+        ["test-model", "--grpc", "--grpc-protocol", "openengine"],
+    )
+
+    assert result.exit_code == 1
+    assert 'python -m pip install "grpcio>=1.67.1,<2"' in result.output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("via_config", [False, True])
+def test_smg_rejects_multiple_frontends_before_engine_start(tmp_path, via_config):
+    """Config-file overrides must not bypass the SMG single-frontend guard."""
+    from click.testing import CliRunner
+
+    from tensorrt_llm.commands.serve import serve
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}'
+    )
+    args = [str(model), "--grpc", "--gpus_per_node", "1"]
+    if via_config:
+        config = tmp_path / "serve.yml"
+        config.write_text("num_serve_frontends: 4\n")
+        args.extend(["--config", str(config)])
+    else:
+        args.extend(["--num_serve_frontends", "4"])
+    result = CliRunner().invoke(serve, args)
+    assert result.exit_code != 0
+    assert "Multiple gRPC frontends require --grpc-protocol openengine" in result.output

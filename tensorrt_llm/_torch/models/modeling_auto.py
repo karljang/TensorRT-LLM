@@ -1,10 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from typing import Generic, Optional, Type
 
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
-from .modeling_utils import (MODEL_CLASS_MAPPING,
-                             MODEL_CLASS_VISION_ENCODER_MAPPING,
-                             DecoderModelForCausalLM, TConfig, TModel)
+from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
+                             get_registered_model_class,
+                             get_registered_vision_encoder)
 
 
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
@@ -19,8 +21,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         model_arch = pretrained_config.architectures[0]
 
         if config.mm_encoder_only:
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                model_arch)
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
             if vision_encoder_info is None:
                 return None
             vision_encoder_cls, _ = vision_encoder_info
@@ -34,13 +35,21 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
 
-        if model_arch in (
-                "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM",
-                "ExaoneMoEForCausalLM"
-        ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
-            model_arch = "MTPDraftModelForCausalLM"
+        # Set by the model loader when a modeling_v2 target claims this
+        # deployment; None leaves the default path unchanged.
+        #
+        # Precedence, since this runs last and would override the rewrite
+        # above: modeling_v2 wins. The decision was made on the *un-rewritten*
+        # architectures[0], so it is about the checkpoint rather than about
+        # what that rewrite made of it, and a target that claims a
+        # configuration carries that configuration's draft path itself. Not
+        # reachable today -- Eagle3 needs draft_vocab_size, and no draft
+        # checkpoint matches a target's shape fingerprint -- so this note is
+        # the contract, not a description of observed behaviour.
+        if config.modeling_v2_target is not None:
+            return config.modeling_v2_target
 
-        return MODEL_CLASS_MAPPING.get(model_arch)
+        return get_registered_model_class(model_arch)
 
     @staticmethod
     def from_config(
@@ -48,8 +57,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
         if config.mm_encoder_only:
             model_arch = config.pretrained_config.architectures[0]
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                model_arch)
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
             if vision_encoder_info is None:
                 raise ValueError(
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"

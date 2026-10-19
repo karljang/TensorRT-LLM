@@ -293,6 +293,7 @@ class MistralTokenizer(TransformersTokenizer):
         prev_text: str | None = None,
         states: dict | None = None,
         *,
+        flush: bool = False,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: bool | None = None,
     ) -> tuple[str, dict]:
@@ -301,4 +302,4 @@ class MistralTokenizer(TransformersTokenizer):
     def apply_chat_template(
         self, conversation: Union[list[dict[str, str]], list[list[dict[str, str]]]], *args, **kwargs
     ) -> Union[str, list[int], list[str], list[list[int]]]:
-        raise NotImplementedError
+        return self.transformers_tokenizer.apply_chat_template(conversation, *args, **kwargs)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,17 +17,18 @@ Scheduler module for TensorRT-LLM PyExecutor.
 
 This module contains:
 - Request schedulers (capacity, micro-batch, unified)
-- Waiting queues (FCFS)
+- Waiting queues (FCFS, Priority)
 """
 
 # Re-export from scheduler.py
-from .adp_router import ADPRouter, DefaultADPRouter, RankState
+from .adp_router import ADPRouter, DefaultADPRouter, KVCacheAwareADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
     CapacityScheduler,
-    KVCacheV2DummyScheduler,
     MicroBatchScheduler,
+    MultimodalEagerEncoderScheduler,
+    MultimodalScheduler,
     PyCapacityScheduler,
     PyMicroBatchScheduler,
     RequestList,
@@ -38,17 +39,25 @@ from .scheduler import (
     SimpleScheduler,
     SimpleUnifiedScheduler,
 )
+from .scheduler_v2 import KVCacheV2Scheduler
 
 # Re-export from waiting_queue.py
-from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
+from .waiting_queue import (
+    FCFSWaitingQueue,
+    PriorityWaitingQueue,
+    WaitingQueue,
+    create_waiting_queue,
+)
 
 __all__ = [
     # Schedulers
     "BindCapacityScheduler",
     "BindMicroBatchScheduler",
     "CapacityScheduler",
-    "KVCacheV2DummyScheduler",
+    "KVCacheV2Scheduler",
     "MicroBatchScheduler",
+    "MultimodalEagerEncoderScheduler",
+    "MultimodalScheduler",
     "PyCapacityScheduler",
     "PyMicroBatchScheduler",
     "RequestList",
@@ -61,9 +70,11 @@ __all__ = [
     # ADP
     "ADPRouter",
     "DefaultADPRouter",
+    "KVCacheAwareADPRouter",
     "RankState",
     # Waiting queues
     "FCFSWaitingQueue",
+    "PriorityWaitingQueue",
     "WaitingQueue",
     "create_waiting_queue",
 ]

@@ -7,6 +7,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import SchedulerConfig
 
 
 # A test case of mmlu_llama from lm_eval
@@ -18,18 +19,20 @@ def test_case():
 
 @pytest.fixture(scope="module")
 def model_path():
-    return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 def create_llm(model_dir,
                disable_overlap_scheduler,
-               sampler_type,
-               env_overrides=None):
+               scheduler_config=None,
+               enable_block_reuse=False):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
-                          sampler_type=sampler_type)
+    if scheduler_config is None:
+        scheduler_config = SchedulerConfig()
+    pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler)
 
-    trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
+    trt_kv_cache_config = TRT_KvCacheConfig(
+        enable_block_reuse=enable_block_reuse)
 
     return LLM(
         model=str(model_dir),
@@ -41,21 +44,21 @@ def create_llm(model_dir,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
         128,  # Only one request longer than max_num_tokens is required to test chunked prefill
-        env_overrides=env_overrides,
+        scheduler_config=scheduler_config,
     )
 
 
-@pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
 @pytest.mark.parametrize("use_python_scheduler", [False, True],
                          ids=["cpp_scheduler", "python_scheduler"])
+@pytest.mark.parametrize("enable_block_reuse", [False, True],
+                         ids=["no_reuse", "block_reuse"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
-def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
-                                       use_python_scheduler):
-    # Use env_overrides to pass env var to MPI subprocess
-    env_overrides = {
-        "TLLM_USE_PYTHON_SCHEDULER": "1"
-    } if use_python_scheduler else {}
+def test_overlap_scheduler_consistency(model_path, test_case,
+                                       use_python_scheduler,
+                                       enable_block_reuse):
+    scheduler_config = SchedulerConfig(
+        use_python_scheduler=use_python_scheduler)
 
     # Test configuration
     prompts = test_case["prompts"]
@@ -74,8 +77,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     # Test with overlap scheduler enabled
     with create_llm(model_path,
                     disable_overlap_scheduler=False,
-                    sampler_type=sampler_type,
-                    env_overrides=env_overrides) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_with_overlap = llm.generate(prompts,
                                             sampling_params=sampling_config,
                                             use_tqdm=True)
@@ -86,8 +89,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     # Test with overlap scheduler disabled
     with create_llm(model_path,
                     disable_overlap_scheduler=True,
-                    sampler_type=sampler_type,
-                    env_overrides=env_overrides) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_without_overlap = llm.generate(prompts,
                                                sampling_params=sampling_config,
                                                use_tqdm=True)
@@ -97,8 +100,44 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
 
     # Verify outputs are consistent
     for with_overlap, without_overlap in zip(texts_with_overlap,
-                                             texts_without_overlap):
+                                             texts_without_overlap,
+                                             strict=True):
         assert with_overlap == without_overlap
+
+
+@pytest.mark.high_cuda_memory
+@pytest.mark.mpi_ray_parity
+def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case):
+    """Verify that blocks are actually reused when sending the same prompt
+    twice with the overlap scheduler enabled. Uses a single prompt to avoid
+    batch-internal cache hits that could make the cold-cache check flaky."""
+    prompt = test_case["prompts"][0]
+    max_new_tokens = test_case["max_new_tokens"]
+    temperature = test_case["temperature"]
+    top_p = test_case["top_p"]
+    stop_words = test_case["stop_words"]
+
+    sampling_config = SamplingParams(max_tokens=max_new_tokens,
+                                     stop=stop_words,
+                                     temperature=temperature,
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
+
+    with create_llm(model_path,
+                    disable_overlap_scheduler=False,
+                    enable_block_reuse=True) as llm:
+        output_first = llm.generate([prompt],
+                                    sampling_params=sampling_config,
+                                    use_tqdm=True)[0]
+        assert output_first.cached_tokens == 0, (
+            "First pass should have no cached tokens (cold cache)")
+
+        output_second = llm.generate([prompt],
+                                     sampling_params=sampling_config,
+                                     use_tqdm=True)[0]
+        assert output_second.cached_tokens > 0, (
+            "Second pass should reuse cached blocks")
 
 
 if __name__ == "__main__":

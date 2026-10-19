@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdint>
 #ifdef ENABLE_FP8
@@ -36,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <type_traits>
 #include <typeinfo>
 #include <vector>
@@ -88,13 +87,13 @@ struct MemoryTypeString<MemoryType::kPINNEDPOOL>
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.
-template <nvinfer1::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
+template <tensorrt_llm::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
 struct DataTypeTraits
 {
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kFLOAT>
+struct DataTypeTraits<tensorrt_llm::DataType::kFLOAT>
 {
     using type = float;
     static char constexpr name[] = "float";
@@ -102,7 +101,7 @@ struct DataTypeTraits<nvinfer1::DataType::kFLOAT>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kHALF>
+struct DataTypeTraits<tensorrt_llm::DataType::kHALF>
 {
     using type = half;
     static char constexpr name[] = "half";
@@ -110,7 +109,7 @@ struct DataTypeTraits<nvinfer1::DataType::kHALF>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT8>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT8>
 {
     using type = std::int8_t;
     static char constexpr name[] = "int8";
@@ -118,7 +117,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT8>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT32>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT32>
 {
     using type = std::int32_t;
     static char constexpr name[] = "int32";
@@ -126,7 +125,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT32>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT64>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT64>
 {
     using type = std::int64_t;
     static char constexpr name[] = "int64";
@@ -134,7 +133,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT64>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT32, true>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT32, true>
 {
     using type = std::uint32_t;
     static char constexpr name[] = "uint32";
@@ -142,7 +141,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT32, true>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT64, true>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT64, true>
 {
     using type = std::uint64_t;
     static char constexpr name[] = "uint64";
@@ -150,7 +149,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT64, true>
 };
 
 template <bool kUnsigned>
-struct DataTypeTraits<nvinfer1::DataType::kBOOL, kUnsigned>
+struct DataTypeTraits<tensorrt_llm::DataType::kBOOL, kUnsigned>
 {
     using type = bool;
     static char constexpr name[] = "bool";
@@ -158,7 +157,7 @@ struct DataTypeTraits<nvinfer1::DataType::kBOOL, kUnsigned>
 };
 
 template <bool kUnsigned>
-struct DataTypeTraits<nvinfer1::DataType::kUINT8, kUnsigned>
+struct DataTypeTraits<tensorrt_llm::DataType::kUINT8, kUnsigned>
 {
     using type = std::uint8_t;
     static char constexpr name[] = "uint8";
@@ -167,7 +166,7 @@ struct DataTypeTraits<nvinfer1::DataType::kUINT8, kUnsigned>
 
 #ifdef ENABLE_BF16
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kBF16>
+struct DataTypeTraits<tensorrt_llm::DataType::kBF16>
 {
     using type = __nv_bfloat16;
     static char constexpr name[] = "bfloat16";
@@ -177,7 +176,7 @@ struct DataTypeTraits<nvinfer1::DataType::kBF16>
 
 #ifdef ENABLE_FP8
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kFP8>
+struct DataTypeTraits<tensorrt_llm::DataType::kFP8>
 {
     using type = __nv_fp8_e4m3;
     static char constexpr name[] = "fp8";
@@ -185,7 +184,7 @@ struct DataTypeTraits<nvinfer1::DataType::kFP8>
 };
 #endif
 
-template <nvinfer1::DataType kDataType, bool kUnsigned>
+template <tensorrt_llm::DataType kDataType, bool kUnsigned>
 struct DataTypeTraits<kDataType, kUnsigned, true>
 {
     using type = typename DataTypeTraits<kDataType, kUnsigned, false>::type*;
@@ -193,26 +192,26 @@ struct DataTypeTraits<kDataType, kUnsigned, true>
     static auto constexpr size = sizeof(type);
 };
 
-//! \brief A wrapper around `nvinfer1::DataType` that provides a support for pointer types.
+//! \brief A wrapper around `tensorrt_llm::DataType` that provides a support for pointer types.
 class BufferDataType
 {
 public:
     constexpr BufferDataType( // NOLINT(*-explicit-constructor)
-        nvinfer1::DataType dataType, bool _unsigned = false, bool pointer = false)
+        tensorrt_llm::DataType dataType, bool _unsigned = false, bool pointer = false)
         : mDataType{dataType}
         , mUnsigned{_unsigned}
         , mPointer{pointer}
     {
     }
 
-    static auto constexpr kTrtPointerType = nvinfer1::DataType::kINT64;
+    static auto constexpr kTrtPointerType = tensorrt_llm::DataType::kINT64;
 
-    constexpr operator nvinfer1::DataType() const noexcept // NOLINT(*-explicit-constructor)
+    constexpr operator tensorrt_llm::DataType() const noexcept // NOLINT(*-explicit-constructor)
     {
         return mPointer ? kTrtPointerType : mDataType;
     }
 
-    [[nodiscard]] constexpr nvinfer1::DataType getDataType() const noexcept
+    [[nodiscard]] constexpr tensorrt_llm::DataType getDataType() const noexcept
     {
         return mDataType;
     }
@@ -226,24 +225,24 @@ public:
     {
         switch (mDataType)
         {
-        case nvinfer1::DataType::kBOOL: [[fallthrough]];
-        case nvinfer1::DataType::kUINT8: return true;
+        case tensorrt_llm::DataType::kBOOL: [[fallthrough]];
+        case tensorrt_llm::DataType::kUINT8: return true;
         default: return mUnsigned;
         }
     }
 
     [[nodiscard]] constexpr std::size_t getSize() const noexcept
     {
-        return tensorrt_llm::common::getDTypeSize(static_cast<nvinfer1::DataType>(*this));
+        return tensorrt_llm::common::getDTypeSize(static_cast<tensorrt_llm::DataType>(*this));
     }
 
     [[nodiscard]] constexpr std::size_t getSizeInBits() const noexcept
     {
-        return tensorrt_llm::common::getDTypeSizeInBits(static_cast<nvinfer1::DataType>(*this));
+        return tensorrt_llm::common::getDTypeSizeInBits(static_cast<tensorrt_llm::DataType>(*this));
     }
 
 private:
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     bool mUnsigned;
     bool mPointer;
 };
@@ -257,62 +256,62 @@ struct TRTDataType
 template <>
 struct TRTDataType<float>
 {
-    static constexpr auto value = nvinfer1::DataType::kFLOAT;
+    static constexpr auto value = tensorrt_llm::DataType::kFLOAT;
 };
 
 template <>
 struct TRTDataType<half>
 {
-    static constexpr auto value = nvinfer1::DataType::kHALF;
+    static constexpr auto value = tensorrt_llm::DataType::kHALF;
 };
 
 template <>
 struct TRTDataType<std::int8_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT8;
+    static constexpr auto value = tensorrt_llm::DataType::kINT8;
 };
 
 template <>
 struct TRTDataType<std::int32_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT32;
+    static constexpr auto value = tensorrt_llm::DataType::kINT32;
 };
 
 template <>
 struct TRTDataType<std::uint32_t>
 {
-    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT32, true};
+    static constexpr auto value = BufferDataType{tensorrt_llm::DataType::kINT32, true};
 };
 
 template <>
 struct TRTDataType<std::int64_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT64;
+    static constexpr auto value = tensorrt_llm::DataType::kINT64;
 };
 
 template <>
 struct TRTDataType<std::uint64_t>
 {
-    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT64, true};
+    static constexpr auto value = BufferDataType{tensorrt_llm::DataType::kINT64, true};
 };
 
 template <>
 struct TRTDataType<bool>
 {
-    static constexpr auto value = nvinfer1::DataType::kBOOL;
+    static constexpr auto value = tensorrt_llm::DataType::kBOOL;
 };
 
 template <>
 struct TRTDataType<std::uint8_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kUINT8;
+    static constexpr auto value = tensorrt_llm::DataType::kUINT8;
 };
 
 #ifdef ENABLE_BF16
 template <>
 struct TRTDataType<__nv_bfloat16>
 {
-    static constexpr auto value = nvinfer1::DataType::kBF16;
+    static constexpr auto value = tensorrt_llm::DataType::kBF16;
 };
 #endif
 
@@ -320,7 +319,7 @@ struct TRTDataType<__nv_bfloat16>
 template <>
 struct TRTDataType<__nv_fp8_e4m3>
 {
-    static constexpr auto value = nvinfer1::DataType::kFP8;
+    static constexpr auto value = tensorrt_llm::DataType::kFP8;
 };
 #endif
 
@@ -328,12 +327,6 @@ template <>
 struct TRTDataType<kernels::KVCacheIndex>
 {
     static constexpr auto value = TRTDataType<kernels::KVCacheIndex::UnderlyingType>::value;
-};
-
-template <>
-struct TRTDataType<kernels::FinishedState>
-{
-    static constexpr auto value = TRTDataType<kernels::FinishedState::UnderlyingType>::value;
 };
 
 template <>
@@ -380,7 +373,7 @@ public:
     using SharedPtr = std::shared_ptr<IBuffer>;
     using UniqueConstPtr = std::unique_ptr<IBuffer const>;
     using SharedConstPtr = std::shared_ptr<IBuffer const>;
-    using DataType = nvinfer1::DataType;
+    using DataType = tensorrt_llm::DataType;
 
     //!
     //! \brief Returns a pointer to underlying array.
@@ -443,6 +436,42 @@ public:
     [[nodiscard]] virtual MemoryType getMemoryType() const = 0;
 
     [[nodiscard]] virtual char const* getMemoryTypeName() const;
+
+    //! \brief Gets a typed pointer to the underlying data, or throws std::bad_cast if the type does not match.
+    template <typename T>
+    [[nodiscard]] T* getBufferPtr()
+    {
+        if (TRTDataType<std::remove_cvref_t<T>>::value != getDataType())
+        {
+            throw std::bad_cast();
+        }
+        return static_cast<T*>(data());
+    }
+
+    //! \brief Gets a typed pointer to constant data, or throws std::bad_cast if the type does not match.
+    template <typename T>
+    [[nodiscard]] T const* getBufferPtr() const
+    {
+        if (TRTDataType<std::remove_cvref_t<T>>::value != getDataType())
+        {
+            throw std::bad_cast();
+        }
+        return static_cast<T const*>(data());
+    }
+
+    //! \brief Gets a typed view of the buffer's elements. The view does not own the underlying data.
+    template <typename T>
+    [[nodiscard]] std::span<T> getBufferRange()
+    {
+        return {getBufferPtr<T>(), getSize()};
+    }
+
+    //! \brief Gets a read-only typed view of the buffer's elements. The view does not own the underlying data.
+    template <typename T>
+    [[nodiscard]] std::span<T const> getBufferRange() const
+    {
+        return {getBufferPtr<T>(), getSize()};
+    }
 
     //!
     //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.
@@ -574,123 +603,6 @@ protected:
     [[nodiscard]] std::size_t toBytes(std::size_t size) const
     {
         return size * BufferDataType(getDataType()).getSizeInBits() / 8;
-    }
-};
-
-/// @brief Gets a typed pointer to the constant underlying data of the buffer.
-/// @tparam T The type of the underlying data.
-/// @param buffer The buffer to get a pointer to.
-/// @return A pointer to constant @p T.
-template <typename T>
-T const* bufferCast(IBuffer const& buffer)
-{
-    if (TRTDataType<typename std::remove_cv<T>::type>::value != buffer.getDataType())
-    {
-        throw std::bad_cast();
-    }
-    return static_cast<T const*>(buffer.data());
-}
-
-/// @brief Gets a typed pointer to the underlying data of the buffer.
-/// @tparam T The type of the underlying data.
-/// @param buffer The buffer to get a pointer to.
-/// @return A pointer to @p T.
-template <typename T>
-T* bufferCast(IBuffer& buffer)
-{
-    if (TRTDataType<typename std::remove_cv<T>::type>::value != buffer.getDataType())
-    {
-        throw std::bad_cast();
-    }
-    return static_cast<T*>(buffer.data());
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or nullptr if
-/// the bufferPtr is null.
-/// @tparam T The type of the underlying data.
-/// @param bufferPtr A possibly null shared ptr.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(IBuffer::SharedPtr const& bufferPtr)
-{
-    if (bufferPtr)
-    {
-        return bufferCast<T>(*bufferPtr);
-    }
-
-    return static_cast<T*>(nullptr);
-}
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or
-/// nullptr if the bufferPtr is null.
-/// @tparam T The type of the underlying data.
-/// @param bufferPtr A possibly null shared ptr.
-/// @return A pointer to const T, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(IBuffer::SharedConstPtr const& bufferPtr)
-{
-    if (bufferPtr)
-    {
-        return bufferCast<T>(*bufferPtr);
-    }
-
-    return static_cast<T const*>(nullptr);
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the buffer pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(std::optional<IBuffer::SharedPtr> const& optionalBufferPtr)
-{
-    if (optionalBufferPtr)
-    {
-        return bufferCast<T>(*optionalBufferPtr.value());
-    }
-
-    return static_cast<T*>(nullptr);
-}
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the buffer pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to const T, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(std::optional<IBuffer::SharedConstPtr> const& optionalBufferPtr)
-{
-    if (optionalBufferPtr)
-    {
-        return bufferCast<T>(*optionalBufferPtr.value());
-    }
-
-    return static_cast<T const*>(nullptr);
-}
-
-template <typename T>
-class BufferRange : public tensorrt_llm::common::ArrayView<T>
-{
-public:
-    using Base = tensorrt_llm::common::ArrayView<T>;
-    using typename Base::size_type;
-
-    BufferRange(T* data, size_type size)
-        : Base{data, size}
-    {
-    }
-
-    template <typename U = T, std::enable_if_t<!std::is_const_v<U>, bool> = true>
-    explicit BufferRange(IBuffer& buffer)
-        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
-    {
-    }
-
-    template <typename U = T, std::enable_if_t<std::is_const_v<U>, bool> = true>
-    explicit BufferRange(IBuffer const& buffer)
-        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
-    {
     }
 };
 

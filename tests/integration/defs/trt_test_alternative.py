@@ -1,8 +1,23 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # An alternative lib to trt_test to let TRT_LLM developer run test using pure pytest command
 import contextlib
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -12,6 +27,82 @@ from collections.abc import Generator
 from typing import List, Optional
 
 import psutil
+
+# Match env-var names / CLI flag names that carry credentials, used to redact
+# values from subprocess invocation logs (env dumps + `--flag=value` args).
+# Patterns matched as case-insensitive substrings of the key/flag name.
+_SENSITIVE_NAME_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|psw|credential"
+    r"|api[_-]?key|private[_-]?key|access[_-]?key)")
+_REDACTED = "***"
+
+
+def _is_sensitive_name(name: str) -> bool:
+    return isinstance(name, str) and bool(_SENSITIVE_NAME_RE.search(name))
+
+
+def redact_env(env):
+    """Return a shallow copy of ``env`` with sensitive values masked."""
+    if env is None:
+        return env
+    try:
+        items = env.items()
+    except AttributeError:
+        return env
+    return {k: (_REDACTED if _is_sensitive_name(k) else v) for k, v in items}
+
+
+def redact_args(args):
+    """Return a copy of ``args`` (list of CLI tokens) with sensitive values masked.
+
+    Handles both ``--flag=value`` and ``--flag value`` forms.
+    """
+    if not args:
+        return args
+    try:
+        seq = list(args)
+    except TypeError:
+        return args
+    out = []
+    i = 0
+    while i < len(seq):
+        a = seq[i]
+        if isinstance(a, str) and a.startswith("-") and "=" in a:
+            flag, sep, _ = a.partition("=")
+            if _is_sensitive_name(flag):
+                out.append(f"{flag}{sep}{_REDACTED}")
+                i += 1
+                continue
+        if (isinstance(a, str) and a.startswith("-") and _is_sensitive_name(a)
+                and i + 1 < len(seq)):
+            out.append(a)
+            out.append(_REDACTED)
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def redact_popenargs(popenargs):
+    """Return a copy of ``popenargs`` with the first arg (the command list) redacted."""
+    if not popenargs:
+        return popenargs
+    first = popenargs[0]
+    if isinstance(first, (list, tuple)):
+        return (redact_args(first), ) + tuple(popenargs[1:])
+    return popenargs
+
+
+def redact_kwargs(kwargs):
+    """Return a copy of ``kwargs`` with ``env`` redacted."""
+    if not kwargs:
+        return kwargs
+    new_kw = dict(kwargs)
+    if "env" in new_kw:
+        new_kw["env"] = redact_env(new_kw["env"])
+    return new_kw
+
 
 general_logger = logging.getLogger("general")
 general_logger.setLevel(logging.CRITICAL)
@@ -201,7 +292,8 @@ def popen(*popenargs,
           suppress_output_info=False,
           **kwargs) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
-        print(f"Start subprocess with popen({popenargs}, {kwargs})")
+        print(f"Start subprocess with popen({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
 
     with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
@@ -227,7 +319,8 @@ def call(*popenargs,
          **kwargs):
     poll_procs = poll_procs or []
     if not suppress_output_info:
-        print(f"Start subprocess with call({popenargs}, {kwargs})")
+        print(f"Start subprocess with call({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
     with popen(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
@@ -248,7 +341,8 @@ def call(*popenargs,
 
 
 def check_call(*popenargs, **kwargs):
-    print(f"Start subprocess with check_call({popenargs}, {kwargs})")
+    print(f"Start subprocess with check_call({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
     retcode = call(*popenargs, suppress_output_info=True, **kwargs)
     if retcode:
         cmd = kwargs.get("args")
@@ -259,7 +353,8 @@ def check_call(*popenargs, **kwargs):
 
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
-    print(f"Start subprocess with check_output({popenargs}, {kwargs})")
+    print(f"Start subprocess with check_output({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
@@ -322,21 +417,3 @@ def print_error(message: str) -> None:
     print(f"[ERROR] {message}")
     sys.stdout.flush()
     general_logger.error(message)
-
-
-# custom test checker
-def check_call_negative_test(*popenargs, **kwargs):
-    print(
-        f"Start subprocess with check_call_negative_test({popenargs}, {kwargs})"
-    )
-    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-    if retcode:
-        return 0
-    else:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        print(
-            f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
-        )
-        raise subprocess.CalledProcessError(1, cmd)

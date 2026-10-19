@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param slot_mapping_fp8  Flat element index for FP8 data start position [num_tokens]
  * @param slot_mapping_scale Flat element index for scale data start position [num_tokens]
  * @param num_tokens        Number of tokens
- * @param head_dim          Head dimension (must be 128)
+ * @param head_dim          Payload byte width (128 for FP8, 64 for packed FP4)
  * @param scale_size        Scale size in bytes (must be 4)
  * @param cache_stride_0    Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1    Stride for k_cache dimension 1 (in bytes)
@@ -103,7 +103,7 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
     // Convert flat index to memory offset using strides (k cache pool from cpp kv cache manager is non-contiguous)
     int64_t dst_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
         cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-    int64_t src_offset = token_idx * head_dim + head_dim_idx;
+    int64_t src_offset = static_cast<int64_t>(token_idx) * head_dim + head_dim_idx;
 
     // 4 bytes write
     *reinterpret_cast<uint32_t*>(&k_cache[dst_offset]) = *reinterpret_cast<uint32_t const*>(&k_fp8_bytes[src_offset]);
@@ -113,7 +113,7 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
     {
         int64_t dst_offset_scale = flatIndexToMemoryOffset(flat_idx_scale_base, cache_dim_0, cache_dim_1, cache_dim_2,
             cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-        int64_t src_offset_scale = token_idx * scale_size; // scale_size = 4
+        int64_t src_offset_scale = static_cast<int64_t>(token_idx) * scale_size; // scale_size = 4
 
         // 4 bytes write for scale
         *reinterpret_cast<uint32_t*>(&k_cache[dst_offset_scale])
@@ -131,17 +131,19 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
         return;
     }
 
-    // Assertions for DeepSeek-V3.2 configuration
-    constexpr int32_t QUANT_BLOCK_SIZE = 128;
-    TLLM_CHECK_WITH_INFO(
-        head_dim == QUANT_BLOCK_SIZE, "head_dim must equal 128 for DeepSeek-V3 indexer cache (got %d)", head_dim);
-    TLLM_CHECK_WITH_INFO(
-        scale_size == 4, "scale_size must equal 4 bytes (1 float32 scale per token, got %d)", scale_size);
+    // Each thread writes 4 bytes (VEC_SIZE in the kernel). head_dim is the
+    // number of bytes per token (128 for FP8, 64 for FP4 packed). Scale is a
+    // single 4-byte word per token, written by thread 0.
+    constexpr int32_t VEC_SIZE = 4;
+    TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 64,
+        "head_dim must be 128 (FP8) or 64 (FP4 packed) for the indexer cache (got %d)", head_dim);
+    TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim (%d) must be a multiple of %d", head_dim, VEC_SIZE);
+    TLLM_CHECK_WITH_INFO(scale_size == 4,
+        "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got %d)", scale_size);
 
-    // For head_dim=128, we use 32 threads to handle 128 bytes per token and extra 4 bytes for scale
-    constexpr int32_t THREADS_PER_BLOCK = 32;
+    int32_t const threads_per_block = head_dim / VEC_SIZE;
 
-    dim3 block(THREADS_PER_BLOCK);
+    dim3 block(threads_per_block);
     dim3 grid(num_tokens);
 
     indexerKCacheScatterUnifiedKernel<<<grid, block, 0, stream>>>(k_fp8_bytes, k_scale_bytes, k_cache, slot_mapping_fp8,

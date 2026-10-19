@@ -43,7 +43,6 @@ docker run --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864  \
            --gpus=all \
            --env "CCACHE_DIR=/code/tensorrt_llm/cpp/.ccache" \
            --env "CCACHE_BASEDIR=/code/tensorrt_llm" \
-           --env "CONAN_HOME=/code/tensorrt_llm/cpp/.conan" \
            --workdir /code/tensorrt_llm \
            --tmpfs /tmp:exec \
            --volume .:/code/tensorrt_llm \
@@ -82,7 +81,7 @@ pip install ./build/tensorrt_llm*.whl
 ```
 
 For additional information on building the TensorRT LLM wheel, refer to
-the [official documentation on building from source](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#option-1-full-build-with-c-compilation).
+the [official documentation on building from source](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#build-tensorrt-llm).
 
 ### Security CVEs
 

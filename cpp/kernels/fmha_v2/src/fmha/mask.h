@@ -39,15 +39,9 @@ struct Mask<Traits, Cta_tile, 1>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -118,15 +112,9 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1>
     using Mma_tile = typename Traits::Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -492,9 +480,62 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Assume we only pay attention to bidirectional sliding-window-size long sequence.
+// v v v x x x x x x
+// v v v v x x x x x
+// v v v v v x x x x
+// x v v v v v x x x
+// x v v v v v x x x
+// x x v v v v v x x
+// x x x v v v v v x
+// x x x x v v v v v
+// x x x x x v v v v
+// x x x x x x v v v
+
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 4>
+{
+    // V5 mask is the bidirectional sliding window mask.
+    using Base = Mask<Traits, Cta_tile, 4>;
+
+    // The shape of the MMA tile.
+    using Mma_tile = typename Base::Mma_tile;
+
+    // Ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , seqlen_(block_info.actual_seqlen)
+    {
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
+        int row, col;
+        this->get_row_col(row, col, mi, ni, ii, jj);
+
+        // Is it a valid position in the sequence?
+        return is_valid(row, col);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int row, int col) const
+    {
+        // Is it a valid position in the sequence, i.e. are we in the lower triangle?
+        return (col >= max(0, row - Base::sliding_window_size_ / 2))
+            && (col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2));
+    }
+
+    // The sequence length.
+    int seqlen_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // The custom mask (from global memory).
 template <typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3>
+struct Mask<Traits, Cta_tile, 6> : public Mask<Traits, Cta_tile, 3>
 {
 
     using Base = Mask<Traits, Cta_tile, 3>;
@@ -503,33 +544,18 @@ struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3>
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // One 32-bit packed mask holds 4 MMAS_N as one group.
-    enum
-    {
-        MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE
-    };
+    static constexpr int MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE;
 
     // The MMAS_N in the group.
-    enum
-    {
-        MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE
-    };
+    static constexpr int MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE;
 
     // MMAS_N uses full 32-bit integer packed masks.
-    enum
-    {
-        FULL_PACKED_MASK = (MMAS_N % 4 == 0)
-    };
+    static constexpr int FULL_PACKED_MASK = (MMAS_N % 4 == 0);
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -956,6 +982,46 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
 
     // The sliding window size for attention.
     int sliding_window_size_;
+};
+
+template <typename Traits, typename Cta_tile>
+struct Mask_hopper<Traits, Cta_tile, 5> : public Mask_hopper<Traits, Cta_tile, 4>
+{
+
+    // V5 mask is the bidirectional sliding window mask.
+    using Base = Mask_hopper<Traits, Cta_tile, 4>;
+
+    // The shape of the MMA tile.
+    using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+
+    // Ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , seqlen_(block_info.actual_seqlen)
+    {
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
+        int row, col;
+        this->get_row_col(row, col, mi, ni, ii, jj);
+
+        // Is it a valid position in the sequence?
+        return is_valid(row, col);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int row, int col) const
+    {
+        // Is it a valid position in the sequence?
+        return col >= max(0, row - Base::sliding_window_size_ / 2)
+            && col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2);
+    }
+
+    // The sequence length.
+    int seqlen_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
