@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
@@ -47,6 +48,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .fused_out_quant import OUT_QUANT_ENABLED, h3_out_quant_fp4
+from .fused_out_quant import static_nvfp4_input as _l17_static_nvfp4_input
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -247,7 +250,22 @@ class MiniMaxH3Attention(Attention):
             key_padding_mask=key_padding_mask,
             timestep=timestep,
         )
-        return self.to_out[0](hidden_states)
+        return self._out_proj(hidden_states)
+
+    def _out_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``to_out`` on the attention output; with a static-NVFP4 ``to_out`` the BF16 output is quantized
+        by ``fused_out_quant`` (lever 17) instead of the Linear's ``fp4_quantize`` and handed over as
+        ``Fp4QuantizedTensor``. ``H3_OUT_QUANT=0`` keeps the Linear's own quantize."""
+        out = self.to_out[0]
+        if (
+            OUT_QUANT_ENABLED
+            and torch.is_tensor(hidden_states)
+            and hidden_states.dtype == torch.bfloat16
+            and _l17_static_nvfp4_input(out)
+        ):
+            codes, scales = h3_out_quant_fp4(hidden_states, out.input_scale)
+            return out(Fp4QuantizedTensor(codes, scales))
+        return out(hidden_states)
 
     def forward_async(
         self,
@@ -288,7 +306,7 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
-        return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
+        return self._out_proj(out_4d.reshape(batch_size, local_seq_len, -1))
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
