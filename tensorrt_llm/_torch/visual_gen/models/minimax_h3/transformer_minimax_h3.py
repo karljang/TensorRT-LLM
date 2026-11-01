@@ -278,7 +278,7 @@ class MiniMaxH3Attention(Attention):
         # Pairing with the lever 8 per-tensor norm + RoPE kernel when its overlay is present:
         # "bf16" fuses norm and RoPE per projection; "fp8" (H3_L13_PAIR=fp8, FP8 attention
         # backend) also casts to e4m3 before the push, so the all-to-all carries 1-byte codes
-        # viewed as bf16 and the receiver views them back (recv_view_dtype).
+        # (the async ops accept 1-byte element types since sweep/nvfp4/lever13c).
         pair = None
         if _l8_norm_rope_tensor is not None and rotary_emb is not None and _l8_fusion_mode() != "off":
             backend = getattr(self.attn, "inner_backend", self.attn)
@@ -318,7 +318,7 @@ class MiniMaxH3Attention(Attention):
                     valid_len=valid_len,
                 )
                 descales[index : index + 1].copy_(descale)
-                return codes.view(torch.bfloat16)
+                return codes
             if norm is None:
                 return states
             if pair == "bf16":
@@ -337,11 +337,7 @@ class MiniMaxH3Attention(Attention):
         def compute_v() -> torch.Tensor:
             return project(self.to_v, self.local_num_key_value_heads, None, 2)
 
-        fp8_kwargs = (
-            {"fp8_descales": descales, "recv_view_dtype": torch.float8_e4m3fn}
-            if pair == "fp8"
-            else {}
-        )
+        fp8_kwargs = {"fp8_descales": descales} if pair == "fp8" else {}
         out_4d = self.attn.forward_async(
             compute_q,
             compute_k,
