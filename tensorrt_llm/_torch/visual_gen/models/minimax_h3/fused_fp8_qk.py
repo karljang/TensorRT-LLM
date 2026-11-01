@@ -21,6 +21,9 @@ RoPE arithmetic follows the compiled eager path: fp32 math, one rounding to BF16
 ``cos`` / ``sin``, one rounding to BF16 before the cast.
 
 Control: ``H3_FP8_SCALE_FUSION`` = ``0`` (off, default) | ``dynamic`` | ``static``.
+Launch: ``H3_FP8_FUSION_SPLIT=1`` (one launch per tensor), ``H3_FP8_FUSION_BLOCK_H`` / ``_WARPS`` /
+``_ROWS`` (heads per program tile, warps, rows per program; 8 / 4 / 1) or a token-count table
+``H3_FP8_FUSION_TABLE="0:8,4,1;32768:8,4,4;..."`` (see ``_launch_config``).
 Calibration: ``H3_FP8_AMAX_LOG=<json>`` records the running maximum descale per layer and
 writes it at interpreter exit (input for the static mode).
 """
@@ -266,11 +269,35 @@ def _reduce_amax(amax: torch.Tensor) -> None:
         torch.distributed.all_reduce(amax, op=torch.distributed.ReduceOp.MAX, group=_REDUCE_GROUP)
 
 
-def _launch_config() -> Tuple[int, int]:
-    return (
+def _launch_config(rows: Optional[int] = None) -> Tuple[int, int, int]:
+    """``(BLOCK_H, num_warps, rows_per_program)`` for the per-tensor kernels.
+
+    ``H3_FP8_FUSION_TABLE`` selects by token count: ``"<min_rows>:<block_h>,<warps>,<rows>;..."``,
+    the entry with the largest ``min_rows`` not above ``rows`` wins (``0:`` is the floor). Without
+    a table, or when ``rows`` is unknown, ``H3_FP8_FUSION_BLOCK_H`` / ``_WARPS`` / ``_ROWS`` apply
+    (defaults 8 / 4 / 1, the launch tuned at 19k). Every entry computes the same bits as long as
+    ``block_h / warps`` keeps two heads per warp (the fp32 row-norm sum order) and the per-program
+    amax is an exact max over its rows.
+    """
+    default = (
         int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "8")),
         int(os.environ.get("H3_FP8_FUSION_WARPS", "4")),
+        int(os.environ.get("H3_FP8_FUSION_ROWS", "1")),
     )
+    table = os.environ.get("H3_FP8_FUSION_TABLE", "").strip()
+    if not table or rows is None:
+        return default
+    best = None
+    for entry in table.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, _, cfg = entry.partition(":")
+        min_rows = int(key)
+        if min_rows <= rows and (best is None or min_rows >= best[0]):
+            block_h, warps, rpp = (int(v) for v in cfg.split(","))
+            best = (min_rows, (block_h, warps, rpp))
+    return default if best is None else best[1]
 
 
 def _split_launch() -> bool:
@@ -296,9 +323,10 @@ def _qk_norm_rope_fp8_split(
     block_h,
     num_warps,
     valid_len=None,
+    rows_per_program=1,
 ):
     width = h * d
-    grid = (rows,)
+    grid = (triton.cdiv(rows, rows_per_program),)
     static = static_descale is not None
     if static:
         # A custom op's output may not alias an input: copy the static table.
@@ -320,6 +348,7 @@ def _qk_norm_rope_fp8_split(
                 amax[i : i + 1],
                 valid_len if valid_len is not None else amax,
                 s,
+                rows,
                 eps,
                 HAS_LEN=valid_len is not None,
                 NORM_ROPE=i < 2,
@@ -327,6 +356,7 @@ def _qk_norm_rope_fp8_split(
                 D=d,
                 ROT=rot,
                 BLOCK_H=block_h,
+                ROWS=rows_per_program,
                 ROW_STRIDE=3 * width,
                 num_warps=num_warps,
             )
@@ -343,6 +373,7 @@ def _qk_norm_rope_fp8_split(
             outs[i],
             sat[i : i + 1] if sat is not None else descale,
             s,
+            rows,
             eps,
             NORM_ROPE=i < 2,
             OUT_FP8=True,
@@ -352,6 +383,7 @@ def _qk_norm_rope_fp8_split(
             D=d,
             ROT=rot,
             BLOCK_H=block_h,
+            ROWS=rows_per_program,
             ROW_STRIDE=3 * width,
             num_warps=num_warps,
         )
@@ -389,7 +421,7 @@ def qk_norm_rope_fp8(
     q8 = torch.empty((b, s, h * d), dtype=torch.float8_e4m3fn, device=qkv.device)
     k8 = torch.empty_like(q8)
     v8 = torch.empty_like(q8)
-    block_h, num_warps = _launch_config()
+    block_h, num_warps, rows_per_program = _launch_config(rows)
     grid = (rows,)
     if _split_launch():
         descale, static, sat = _qk_norm_rope_fp8_split(
@@ -408,6 +440,7 @@ def qk_norm_rope_fp8(
             block_h,
             num_warps,
             valid_len,
+            rows_per_program,
         )
         if _AMAX_LOG is not None and not static:
             _record_descale(layer_idx, descale)
@@ -503,6 +536,7 @@ def _tensor_amax_kernel(
     amax_ptr,
     len_ptr,
     S,
+    R,
     eps,
     HAS_LEN: tl.constexpr,
     NORM_ROPE: tl.constexpr,
@@ -510,33 +544,42 @@ def _tensor_amax_kernel(
     D: tl.constexpr,
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ROWS: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
 ):
-    r = tl.program_id(0)
-    t = r % S
-    valid = _row_valid(len_ptr, r // S, t, HAS_LEN)
+    """Per-tensor amax over ``ROWS`` consecutive rows per program (an exact max, so the grouping
+    does not change the result); one atomic per program."""
+    r0 = tl.program_id(0) * ROWS
     d = tl.arange(0, D)
     hh = tl.arange(0, BLOCK_H)
-    row = x_ptr + r.to(tl.int64) * ROW_STRIDE
-    m = tl.zeros((BLOCK_H, D), dtype=tl.float32)
     if NORM_ROPE:
-        partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
         w_d = tl.load(w_ptr + d).to(tl.float32)
-        w_p = tl.load(w_ptr + partner).to(tl.float32)
         inv_d = 1.0 / D
-    for h0 in range(0, H, BLOCK_H):
-        h = h0 + hh
-        mask = (h < H)[:, None] & (d < D)[None, :]
-        offs = h[:, None] * D + d[None, :]
+    acc = tl.full((1,), 0.0, dtype=tl.float32)
+    for rr in range(ROWS):
+        r = r0 + rr
+        row_ok = r < R
+        t = r % S
+        valid = _row_valid(len_ptr, r // S, t, HAS_LEN)
+        row = x_ptr + r.to(tl.int64) * ROW_STRIDE
+        m = tl.zeros((BLOCK_H, D), dtype=tl.float32)
         if NORM_ROPE:
-            offs_p = h[:, None] * D + partner[None, :]
-            y = _norm_rope_tile(
-                row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
-            )
-        else:
-            y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
-        m = tl.maximum(m, tl.abs(y))
-    tl.atomic_max(amax_ptr, tl.max(tl.max(m, axis=1), axis=0) * valid)
+            partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
+            w_p = tl.load(w_ptr + partner).to(tl.float32)
+        for h0 in range(0, H, BLOCK_H):
+            h = h0 + hh
+            mask = (h < H)[:, None] & (d < D)[None, :] & row_ok
+            offs = h[:, None] * D + d[None, :]
+            if NORM_ROPE:
+                offs_p = h[:, None] * D + partner[None, :]
+                y = _norm_rope_tile(
+                    row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
+                )
+            else:
+                y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
+            m = tl.maximum(m, tl.abs(y))
+        acc = tl.maximum(acc, tl.max(tl.max(m, axis=1), axis=0) * valid)
+    tl.atomic_max(amax_ptr, tl.max(acc, axis=0))
 
 
 @triton.jit
@@ -550,6 +593,7 @@ def _tensor_cast_kernel(
     out_ptr,
     sat_ptr,
     S,
+    R,
     eps,
     NORM_ROPE: tl.constexpr,
     OUT_FP8: tl.constexpr,
@@ -559,48 +603,53 @@ def _tensor_cast_kernel(
     D: tl.constexpr,
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ROWS: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
 ):
-    r = tl.program_id(0)
-    t = r % S
+    r0 = tl.program_id(0) * ROWS
     d = tl.arange(0, D)
     hh = tl.arange(0, BLOCK_H)
-    row = x_ptr + r.to(tl.int64) * ROW_STRIDE
-    out_row = out_ptr + r.to(tl.int64) * (H * D)
     if NORM_ROPE:
-        partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
         w_d = tl.load(w_ptr + d).to(tl.float32)
-        w_p = tl.load(w_ptr + partner).to(tl.float32)
         inv_d = 1.0 / D
     if OUT_FP8:
         if STATIC:
             s = tl.load(descale_ptr)
         else:
             s = _scale_from_amax(tl.load(amax_ptr))
-            if r == 0:
+            if r0 == 0:
                 tl.store(descale_ptr, s)
         f = _div_rn(1.0, s)
     if SAT_COUNT:
         nsat = tl.zeros((BLOCK_H, D), dtype=tl.int32)
-    for h0 in range(0, H, BLOCK_H):
-        h = h0 + hh
-        mask = (h < H)[:, None] & (d < D)[None, :]
-        offs = h[:, None] * D + d[None, :]
+    for rr in range(ROWS):
+        r = r0 + rr
+        row_ok = r < R
+        t = r % S
+        row = x_ptr + r.to(tl.int64) * ROW_STRIDE
+        out_row = out_ptr + r.to(tl.int64) * (H * D)
         if NORM_ROPE:
-            offs_p = h[:, None] * D + partner[None, :]
-            y = _norm_rope_tile(
-                row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
-            )
-        else:
-            y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
-        if OUT_FP8:
-            scaled = y * f
-            if SAT_COUNT:
-                # Elements beyond the E4M3 range are clamped by the saturating cast.
-                nsat += (tl.abs(scaled) > 448.0).to(tl.int32)
-            tl.store(out_row + offs, scaled.to(tl.float8e4nv), mask=mask)
-        else:
-            tl.store(out_row + offs, y.to(tl.bfloat16), mask=mask)
+            partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
+            w_p = tl.load(w_ptr + partner).to(tl.float32)
+        for h0 in range(0, H, BLOCK_H):
+            h = h0 + hh
+            mask = (h < H)[:, None] & (d < D)[None, :] & row_ok
+            offs = h[:, None] * D + d[None, :]
+            if NORM_ROPE:
+                offs_p = h[:, None] * D + partner[None, :]
+                y = _norm_rope_tile(
+                    row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
+                )
+            else:
+                y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
+            if OUT_FP8:
+                scaled = y * f
+                if SAT_COUNT:
+                    # Elements beyond the E4M3 range are clamped by the saturating cast.
+                    nsat += ((tl.abs(scaled) > 448.0) & mask).to(tl.int32)
+                tl.store(out_row + offs, scaled.to(tl.float8e4nv), mask=mask)
+            else:
+                tl.store(out_row + offs, y.to(tl.bfloat16), mask=mask)
     if SAT_COUNT:
         tl.atomic_add(sat_ptr, tl.sum(tl.sum(nsat, axis=1), axis=0))
 
@@ -639,8 +688,8 @@ def norm_rope_fp8_tensor(
     out = torch.empty(
         (b, s, h, d), dtype=torch.float8_e4m3fn if out_fp8 else torch.bfloat16, device=x.device
     )
-    block_h, num_warps = _launch_config()
-    grid = (rows,)
+    block_h, num_warps, rows_per_program = _launch_config(rows)
+    grid = (triton.cdiv(rows, rows_per_program),)
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     if out_fp8 and static_descale is None:
         descale = torch.empty(1, dtype=torch.float32, device=x.device)
@@ -652,6 +701,7 @@ def norm_rope_fp8_tensor(
             amax,
             valid_len if valid_len is not None else amax,
             s,
+            rows,
             eps,
             HAS_LEN=valid_len is not None,
             NORM_ROPE=norm_rope,
@@ -659,6 +709,7 @@ def norm_rope_fp8_tensor(
             D=d,
             ROT=rot,
             BLOCK_H=block_h,
+            ROWS=rows_per_program,
             ROW_STRIDE=h * d,
             num_warps=num_warps,
         )
@@ -680,6 +731,7 @@ def norm_rope_fp8_tensor(
         out,
         descale,
         s,
+        rows,
         eps,
         NORM_ROPE=norm_rope,
         OUT_FP8=out_fp8,
@@ -689,6 +741,7 @@ def norm_rope_fp8_tensor(
         D=d,
         ROT=rot,
         BLOCK_H=block_h,
+        ROWS=rows_per_program,
         ROW_STRIDE=h * d,
         num_warps=num_warps,
     )
