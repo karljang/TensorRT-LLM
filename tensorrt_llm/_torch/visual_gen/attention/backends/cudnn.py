@@ -46,6 +46,7 @@ import cudnn
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -909,6 +910,11 @@ class CuDNNAttention(AttentionBackend):
                 and cached[1] == version
             ):
                 return cached[2]
+        # Under a CUDA-graph runner the model resolved the lengths host-side before capture
+        # and publishes them under this key; the device read below is illegal while capturing.
+        resolved = resolved_extra_key("key_padding_prefix_lengths")
+        if resolved is not None and len(resolved) == key_padding_mask.shape[0]:
+            return [int(length) for length in resolved]
         mask = key_padding_mask.cpu()
         lengths = mask.sum(dim=1).tolist()
         expected = torch.arange(mask.shape[1]).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)

@@ -339,10 +339,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         if pipeline_config.cuda_graph.enable and pipeline_config.attention.backend not in (
             "VANILLA",
             "FA4",
+            "CUDNN",
         ):
             raise NotImplementedError(
                 "MiniMax-H3 CUDA graphs pad the packed sequence to a fixed bucket, which "
-                "needs an attention backend that honours key_padding_mask: VANILLA or FA4."
+                "needs an attention backend that honours key_padding_mask: VANILLA, FA4 or CUDNN."
             )
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         vae_size = pipeline_config.parallel.parallel_vae_size

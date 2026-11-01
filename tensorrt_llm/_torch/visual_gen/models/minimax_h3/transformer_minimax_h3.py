@@ -941,9 +941,42 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             token_tags = _pad_tensor_dim(token_tags, 0, pad, -1)
         return self._layout_flags(token_tags)
 
+    # Key under which the per-item valid-prefix lengths of the padded layout are published to
+    # the attention backends (``CuDNNAttention._padding_prefix_lengths`` reads it): the cuDNN
+    # prefix path otherwise reads the lengths from the device, which graph capture forbids.
+    CUDA_GRAPH_PADDING_PREFIX_KEY = "key_padding_prefix_lengths"
+
+    def _cuda_graph_padding_prefix_key(self, *args, **kwargs) -> Optional[tuple[int, ...]]:
+        """Valid-prefix length per batch item of the padded packed layout, or None unpadded.
+
+        Resolved host-side by the CUDA-graph runner before capture (same contract as
+        ``_cuda_graph_layout_key``); the value is the ``key_padding_mask.sum(1)`` the forward
+        builds, so backends can skip the device read inside the captured region.
+        """
+        bound = inspect.signature(MiniMaxH3Transformer3DModel.forward).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        token_tags = arguments["token_tags"]
+        position_ids = arguments["position_ids"]
+        static_context = arguments["static_context"]
+        sequence_length = (
+            position_ids.shape[0] if position_ids is not None else static_context.sequence_length
+        )
+        pad = _padding_to_multiple(sequence_length, self.sharder.size)
+        if pad:
+            token_tags = _pad_tensor_dim(token_tags, 0, pad, -1)
+        valid = int((token_tags >= 0).sum())  # one device read per call, outside capture
+        if valid == token_tags.shape[0]:
+            return None
+        batch = arguments["hidden_states"].shape[0]
+        return (valid,) * batch
+
     def register_cuda_graph_extra_key_fns(self, runner: "CUDAGraphRunner") -> None:
         super().register_cuda_graph_extra_key_fns(runner)
         runner.register_extra_key_fn(self.CUDA_GRAPH_LAYOUT_KEY, self._cuda_graph_layout_key)
+        runner.register_extra_key_fn(
+            self.CUDA_GRAPH_PADDING_PREFIX_KEY, self._cuda_graph_padding_prefix_key
+        )
 
     def _validate_layout(
         self,
