@@ -414,7 +414,12 @@ std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prep
     TORCH_CHECK(input_4d.is_cuda(), "input must be on CUDA");
     TORCH_CHECK(input_4d.is_contiguous(), "input must be contiguous");
     TORCH_CHECK(input_4d.dim() == 4, "input must be [B, S_local, H, D]");
-    TORCH_CHECK(input_4d.scalar_type() == at::ScalarType::BFloat16, "bf16 only");
+    // Byte-moving op: any 1- or 2-byte element type rides unchanged (bf16 / fp16 activations, e4m3 /
+    // e5m2 / uint8 FP8 codes). The permute+scatter kernel is written in 2-byte units, so the row
+    // width handed to it is D * itemsize / 2 and must be a whole number of 16-byte vectors.
+    int64_t const elem_bytes = static_cast<int64_t>(input_4d.element_size());
+    TORCH_CHECK(elem_bytes == 1 || elem_bytes == 2, "ulysses_a2a_async_prepare: 1- or 2-byte element types only, got ",
+        input_4d.scalar_type());
 
     // Bind current device + slot allocator + kernel launch to the input's
     // device. `getOrAllocSlot` reads `cudaGetDevice()`, and the kernel stream
@@ -427,7 +432,9 @@ std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prep
     int const S_local = static_cast<int>(input_4d.size(1));
     int const H = static_cast<int>(input_4d.size(2));
     int const D = static_cast<int>(input_4d.size(3));
-    TORCH_CHECK(D % 8 == 0, "D must be divisible by 8 (int4 vec)");
+    TORCH_CHECK((D * elem_bytes) % 16 == 0, "D * itemsize must be a multiple of 16 bytes (int4 vec), got D=", D,
+        " itemsize=", elem_bytes);
+    int const D_units = static_cast<int>(D * elem_bytes / 2); // row width in 2-byte kernel units
 
     auto op = getOrCreateOp(pg);
 
@@ -441,7 +448,7 @@ std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prep
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(input_4d.get_device()).stream();
     tensorrt_llm::kernels::launchUlyssesPermuteScatter(
-        input_4d.data_ptr(), send_t.data_ptr(), recv_t.data_ptr(), my_rank, B, S_local, H, D, P, stream);
+        input_4d.data_ptr(), send_t.data_ptr(), recv_t.data_ptr(), my_rank, B, S_local, H, D_units, P, stream);
 
     auto send_h = c10::make_intrusive<SendHandle>();
     send_h->send_t = std::move(send_t);

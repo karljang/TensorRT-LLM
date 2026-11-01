@@ -41,7 +41,8 @@ namespace kernels
 //   send_buf : [P, B, S_local, H/P,   D]   row-major
 //   recv_buf : [P, B, S_local, H/P,   D]   row-major
 //
-// Requires: D % 8 == 0 (int4 vec load); H % P == 0; bf16 only.
+// Requires: D % 8 == 0 (int4 vec load); H % P == 0. D counts 2-byte units: the op layer passes
+// D * itemsize / 2, so 1-byte element types (FP8 codes) ride through unchanged.
 void launchUlyssesPermuteScatter(void const* input, // bf16 [B, S_local, H, D]
     void* send_buf,                                 // bf16 [P, B, S_local, H/P, D]
     void* recv_buf,                                 // bf16 [P, B, S_local, H/P, D]

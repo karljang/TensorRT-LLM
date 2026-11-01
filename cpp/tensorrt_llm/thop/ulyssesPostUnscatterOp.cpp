@@ -66,9 +66,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
         "ulysses_post_unscatter_qkv expects 5D tensors [P, B, Sp, H, D]");
     TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
 
-    CHECK_INPUT(q_in, torch::kBFloat16);
-    CHECK_INPUT(k_in, torch::kBFloat16);
-    CHECK_INPUT(v_in, torch::kBFloat16);
+    CHECK_TH_CUDA(q_in);
+    CHECK_CONTIGUOUS(q_in);
+    CHECK_TH_CUDA(k_in);
+    CHECK_CONTIGUOUS(k_in);
+    CHECK_TH_CUDA(v_in);
+    CHECK_CONTIGUOUS(v_in);
+    // Byte-moving op: any 1- or 2-byte element type (bf16 / fp16, e4m3 / e5m2 / uint8 FP8 codes); the
+    // kernel is written in 2-byte units, so the row width it receives is D * itemsize / 2.
+    TORCH_CHECK(k_in.scalar_type() == q_in.scalar_type() && v_in.scalar_type() == q_in.scalar_type(),
+        "Q/K/V must share a dtype, got ", q_in.scalar_type(), " / ", k_in.scalar_type(), " / ", v_in.scalar_type());
+    int64_t const elem_bytes = static_cast<int64_t>(q_in.element_size());
+    TORCH_CHECK(elem_bytes == 1 || elem_bytes == 2, "ulysses_post_unscatter_qkv: 1- or 2-byte element types only, got ",
+        q_in.scalar_type());
 
     // P (ulysses degree), B (batch), D (head dim) are shared across Q/K/V; Sp (seq shard)
     // and H (heads/rank) may differ (cross-attn: Q=audio vs K/V=video). The launcher's
@@ -79,8 +89,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     TORCH_CHECK(k_in.size(0) == P && v_in.size(0) == P, "Q/K/V must share P (ulysses degree)");
     TORCH_CHECK(k_in.size(1) == B && v_in.size(1) == B, "Q/K/V must share B (batch)");
     TORCH_CHECK(k_in.size(4) == D && v_in.size(4) == D, "Q/K/V must share D (head dim)");
-    // D % 8 enforced at the op boundary: vec width is 8 bf16 (16-byte vectorized stores).
-    TORCH_CHECK(D % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+    // Enforced at the op boundary: the kernel moves 16-byte vectors, so a row must be a whole number of them.
+    TORCH_CHECK((D * elem_bytes) % 16 == 0, "D * itemsize must be a multiple of 16 bytes, got D=", D, " itemsize=",
+        elem_bytes);
+    int64_t const D_units = D * elem_bytes / 2; // row width in 2-byte kernel units
 
     int64_t const Sp_q = q_in.size(2), H_q = q_in.size(3);
     int64_t const Sp_k = k_in.size(2), H_k = k_in.size(3);
@@ -121,7 +133,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchUlyssesPostUnscatter(q_in.data_ptr(), k_in.data_ptr(), v_in.data_ptr(),
         q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B),
-        static_cast<int>(D), static_cast<int>(Sp_q), static_cast<int>(H_q), static_cast<int>(Sp_k),
+        static_cast<int>(D_units), static_cast<int>(Sp_q), static_cast<int>(H_q), static_cast<int>(Sp_k),
         static_cast<int>(H_k), static_cast<int>(Sp_v), static_cast<int>(H_v), stream);
 
     // HND callers get a transpose-view of the NHD storage (zero-copy stride
@@ -143,14 +155,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_
     TORCH_CHECK(qkv_in.size(3) == 3, "ulysses_packed_qkv_post_unscatter expects qkv dim size 3, got ", qkv_in.size(3));
     TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
 
-    CHECK_INPUT(qkv_in, torch::kBFloat16);
+    CHECK_TH_CUDA(qkv_in);
+    CHECK_CONTIGUOUS(qkv_in);
+    int64_t const elem_bytes = static_cast<int64_t>(qkv_in.element_size());
+    TORCH_CHECK(elem_bytes == 1 || elem_bytes == 2,
+        "ulysses_packed_qkv_post_unscatter: 1- or 2-byte element types only, got ", qkv_in.scalar_type());
 
     int64_t const P = qkv_in.size(0);
     int64_t const B = qkv_in.size(1);
     int64_t const Sp = qkv_in.size(2);
     int64_t const H = qkv_in.size(4);
     int64_t const D = qkv_in.size(5);
-    TORCH_CHECK(D % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+    TORCH_CHECK((D * elem_bytes) % 16 == 0, "D * itemsize must be a multiple of 16 bytes, got D=", D, " itemsize=",
+        elem_bytes);
+    int64_t const D_units = D * elem_bytes / 2; // row width in 2-byte kernel units
     checkInt32Dim("P", P);
     checkInt32Dim("B", B);
     checkInt32Dim("Sp", Sp);
@@ -170,7 +188,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_
         auto stream = at::cuda::getCurrentCUDAStream();
         tensorrt_llm::kernels::launchUlyssesPackedQkvPostUnscatter(qkv_in.data_ptr(), q_out.data_ptr(),
             k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B), static_cast<int>(Sp),
-            static_cast<int>(H), static_cast<int>(D), stream);
+            static_cast<int>(H), static_cast<int>(D_units), stream);
     }
 
     if (is_hnd)

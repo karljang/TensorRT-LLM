@@ -25,6 +25,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+// D counts 2-byte units: the op layer passes D * itemsize / 2, so 1-byte element types (FP8
+// codes) ride through unchanged; rows must be whole 16-byte vectors.
 // Post-Ulysses A2A unscatter for Q/K/V. Pairs with ulyssesPermuteScatter:
 // PermuteScatter prepares send_buf pre-A2A; PostUnscatter consumes recv_buf
 // post-A2A and produces SDPA-ready tensors in NHD layout.
