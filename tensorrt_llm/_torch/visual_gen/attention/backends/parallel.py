@@ -20,22 +20,137 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import os
 from itertools import count
-from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
+from typing import TYPE_CHECKING, Callable, ClassVar, Dict, List, Optional
 from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from ...mapping import VisualGenMapping
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
+from tensorrt_llm.logger import logger
 
 from ....attention.backends.interface import PredefinedAttentionMask
 from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
+
+# Ulysses communication options (sweep-nvfp4 lever 13b). Read once per process; the
+# executor's spawned workers inherit the environment.
+#   H3_ULYSSES_FP8_A2A=1      cast Q/K/V to FP8 e4m3 before the tokens->heads all-to-all when
+#                             the inner backend runs per-tensor FP8 attention (half the bytes;
+#                             scales equal the inner backend's own per-tensor scales, so the
+#                             result is bit-identical to the BF16 payload).
+#   H3_ULYSSES_HEAD_GROUPS=G  split the heads into G groups and overlap the all-to-all of group
+#                             g+1 with the attention of group g on a side stream (sync NCCL).
+_ULYSSES_FP8_A2A = os.environ.get("H3_ULYSSES_FP8_A2A") == "1"
+_ULYSSES_HEAD_GROUPS = max(1, int(os.environ.get("H3_ULYSSES_HEAD_GROUPS", "1")))
+_ULYSSES_FP8_PACK = os.environ.get("H3_ULYSSES_FP8_PACK", "triton")
+_ULYSSES_EAGER_CONTROL = os.environ.get("H3_ULYSSES_EAGER_CONTROL") == "1"
+_ULYSSES_VERIFY = os.environ.get("H3_ULYSSES_VERIFY") == "1"
+_ULYSSES_VERIFY_LOG = os.environ.get("H3_ULYSSES_VERIFY_LOG", "/tmp/ulysses_verify")
+_FP8_E4M3_MAX = 448.0
+
+
+@triton.jit
+def _ulysses_absmax_kernel(
+    x_ptr, out_ptr, valid_ptr, stride_b, stride_s, width, P, ROWS: tl.constexpr, W: tl.constexpr
+):
+    """max |x| over the valid rows (``valid[b]`` leading rows, the padding excluded as the
+    backend's prefix path excludes it) of one (batch item, destination rank) head shard
+    -> out[b, p]."""
+    bp = tl.program_id(0)
+    b = bp // P
+    p = bp % P
+    nvalid = tl.load(valid_ptr + b)
+    row0 = tl.program_id(1) * ROWS
+    rows = row0 + tl.arange(0, ROWS)
+    cols = tl.arange(0, W)
+    ptrs = x_ptr + b * stride_b + rows[:, None] * stride_s + p * width + cols[None, :]
+    x = tl.load(ptrs, mask=(rows[:, None] < nvalid) & (cols[None, :] < width), other=0.0)
+    m = tl.max(tl.max(tl.abs(x.to(tl.float32)), axis=1), axis=0)
+    tl.atomic_max(out_ptr + bp, m)
+
+
+# Reciprocal of the fused cast. The vendor kernel's ``1.0f / s`` is the correctly rounded
+# reciprocal even under --use_fast_math: with ``rcp.rn.f32`` every exchanged FP8 code equals
+# the backend's own cast (verify hook, 2,656 of 2,656 calls); ``rcp.approx.ftz.f32`` and
+# ``div.approx.f32`` differ by one FP8 step in a few codes at the subnormal floor.
+_ULYSSES_RCP = os.environ.get("H3_ULYSSES_RCP", "rn")
+_RCP_ASM = {
+    "approx_ftz": "rcp.approx.ftz.f32 $0, $1;",
+    "approx": "div.approx.f32 $0, $2, $1;",  # fast-math a/b (the lead's candidate for 1.0f / s)
+    "rn": "rcp.rn.f32 $0, $1;",
+    "div": "div.full.f32 $0, $2, $1;",
+}[_ULYSSES_RCP]
+
+
+@triton.jit
+def _ulysses_rcp_approx_ftz(value, ASM: tl.constexpr):
+    one = value * 0.0 + 1.0
+    return tl.inline_asm_elementwise(
+        ASM, constraints="=f,f,f", args=[value, one], dtype=tl.float32, is_pure=True, pack=1,
+    )
+
+
+@triton.jit
+def _ulysses_scale_pack_e4m3x2(even, odd, factor):
+    """bf16 pairs -> (x * factor) in fp32 with ftz -> e4m3x2, the arithmetic of
+    ``scaleMatrixPerTensorVec`` (``f *= 1/s`` then ``__nv_cvt_float2_to_fp8x2`` satfinite)."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .f32 e0, o0, e1, o1;
+            .reg .b16 p0, p1;
+            mul.ftz.f32 e0, $1, $5;
+            mul.ftz.f32 o0, $3, $5;
+            mul.ftz.f32 e1, $2, $6;
+            mul.ftz.f32 o1, $4, $6;
+            cvt.rn.satfinite.e4m3x2.f32 p0, o0, e0;
+            cvt.rn.satfinite.e4m3x2.f32 p1, o1, e1;
+            mov.b32 $0, {p0, p1};
+        }
+        """,
+        constraints="=r,f,f,f,f,f,f",
+        args=[even.to(tl.float32), odd.to(tl.float32), factor],
+        dtype=tl.uint16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _ulysses_fp8_pack_kernel(
+    x_ptr, out_ptr, descale_ptr, batch, seq_local, stride_b, stride_s, head_offset, width, P,
+    ROWS: tl.constexpr, W: tl.constexpr, RCP_ASM: tl.constexpr,
+):
+    """x[b, s, heads of destination p in this group, :] (bf16) -> out[p, b, s, :, :] (e4m3,
+    scale descale[b, p]). ``width`` = heads per rank per group * head_dim, even; ``W`` its
+    power-of-two cover. out is a uint16 pointer over the [P, B, S/P, width] byte buffer."""
+    bp = tl.program_id(0)
+    b = bp // P
+    p = bp % P
+    s = tl.load(descale_ptr + bp)
+    factor = _ulysses_rcp_approx_ftz(s, RCP_ASM)
+    row0 = tl.program_id(1) * ROWS
+    rows = row0 + tl.arange(0, ROWS)
+    cols = tl.arange(0, W)
+    mask = (rows[:, None] < seq_local) & (cols[None, :] < width)
+    ptrs = x_ptr + b * stride_b + rows[:, None] * stride_s + head_offset + p * width + cols[None, :]
+    x = tl.load(ptrs, mask=mask, other=0.0)
+    even, odd = tl.split(tl.reshape(x, (ROWS, W // 2, 2)))
+    fac = tl.full((ROWS, W // 2), 0.0, tl.float32) + factor
+    packed = _ulysses_scale_pack_e4m3x2(even, odd, fac)
+    cols2 = tl.arange(0, W // 2)
+    mask2 = (rows[:, None] < seq_local) & (cols2[None, :] * 2 < width)
+    out_ptrs = out_ptr + ((p * batch + b) * seq_local + rows[:, None]) * (width // 2) + cols2[None, :]
+    tl.store(out_ptrs, packed, mask=mask2)
 
 _flash_attn_combine_import_error = None
 try:
@@ -441,6 +556,334 @@ class UlyssesAttention(AttentionBackend):
             self._async_side_stream = UlyssesAttention._side_stream_by_device[device]
             if process_group is not None:
                 self._pg_boxed = process_group.boxed()
+        # Lever 13b options (module defaults from the environment; tests set the attributes).
+        self.fp8_a2a = _ULYSSES_FP8_A2A
+        self.head_groups = _ULYSSES_HEAD_GROUPS
+        self.fp8_pack = _ULYSSES_FP8_PACK  # "triton" (fused permute + cast) or "ops" (vendor kernels)
+        self._grouped_warned = False
+
+    # ------------------------------------------------------------------
+    # Lever 13b: FP8 all-to-all payload and head-group pipelining
+    # ------------------------------------------------------------------
+
+    def _fp8_payload_active(self) -> bool:
+        """FP8 payload applies when the inner backend quantizes Q/K/V per tensor to FP8 itself."""
+        inner = self.inner_backend
+        return (
+            self.fp8_a2a
+            and getattr(inner, "quant_dtype", None) == "fp8"
+            and getattr(inner, "accepts_fp8_inputs", False)
+        )
+
+    def _grouped_path_active(self, q, k, v, kwargs) -> bool:
+        if self.world_size <= 1:
+            return False
+        if not (self._fp8_payload_active() or self.head_groups > 1):
+            return False
+        if q.shape != k.shape or q.shape != v.shape or q.dtype != torch.bfloat16:
+            return False
+        if kwargs.get("kv") is not None or kwargs.get("gate_compress") is not None:
+            return False
+        if kwargs.get("gate_fine") is not None:
+            return False
+        if any(kwargs.get(key) is not None for key in _REPLICATED_KV_KWARGS):
+            return False
+        if self.inner_backend.preferred_layout != AttentionTensorLayout.NHD:
+            return False
+        return True
+
+    def _comm_stream(self) -> torch.cuda.Stream:
+        device = torch.cuda.current_device()
+        stream = UlyssesAttention._side_stream_by_device.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            UlyssesAttention._side_stream_by_device[device] = stream
+        return stream
+
+    def _fp8_payload_scales(
+        self, q, k, v, heads_per_rank: int, key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Per-(tensor, batch item, destination rank) FP8 descales, equal to the ones the
+        inner backend would compute on its post-exchange [B, S, H/P, D] tensors.
+
+        The amax of each destination's head shard is reduced across the senders (one
+        all-reduce of 3 * B * P floats), then turned into a scale by the dynamic
+        quantization kernel itself (``quantize_e4m3_activation`` on the amax vector),
+        so the ``bf16(max(amax / 448, min))`` arithmetic, including the compiler's
+        fast-math division, is the kernel's own. Returns float32 [3, B, P].
+        """
+        batch, seq_local, heads, head_dim = q.shape
+        P = self.world_size
+        # Valid rows of this rank's shard: a trailing-padding mask over the whole sequence
+        # gives item b its prefix length; rows past it are padding the backend never reads
+        # (its prefix path slices them away before the amax), so they are excluded here too.
+        if key_padding_mask is not None:
+            lengths = key_padding_mask.sum(dim=1)
+            local_valid = (lengths - self._ulysses_rank * seq_local).clamp_(0, seq_local).to(torch.int32)
+        else:
+            local_valid = torch.full((batch,), seq_local, dtype=torch.int32, device=q.device)
+        amax = torch.zeros(3, batch, P, dtype=torch.float32, device=q.device)
+        width = heads_per_rank * head_dim
+        rows = 32
+        grid = (batch * P, triton.cdiv(seq_local, rows))
+        for i, t in enumerate((q, k, v)):
+            assert t.stride(3) == 1 and t.stride(2) == head_dim
+            _ulysses_absmax_kernel[grid](
+                t, amax[i], local_valid, t.stride(0), t.stride(1), width, P,
+                ROWS=rows, W=triton.next_power_of_2(width), num_warps=8,
+            )
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=self.process_group)
+        _, scales = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+            amax.to(torch.bfloat16).reshape(-1, 1).contiguous()
+        )
+        return scales.float().reshape(3, batch, P)
+
+    @torch.compiler.disable
+    def _forward_grouped(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Ulysses forward with an optional FP8 payload and head-group pipelining.
+
+        Heads are split into ``head_groups`` groups; for each group the tokens->heads
+        all-to-all runs on a side stream so it overlaps the attention of the previous
+        group, and the heads->tokens all-to-all of a finished group overlaps the next
+        group's attention. Every exchange is ``all_to_all_single`` on NCCL, issued in
+        the same order on every rank. With one group and a BF16 payload the result is
+        the plain synchronous path.
+        """
+        batch, seq_local, heads, head_dim = q.shape
+        P = self.world_size
+        heads_per_rank = heads // P
+        groups = self.head_groups
+        if heads % (P * groups) != 0:
+            if not self._grouped_warned:
+                logger.warning(
+                    f"UlyssesAttention: {heads} heads cannot be split into {groups} groups of "
+                    f"{P}-divisible size; running one group."
+                )
+                self._grouped_warned = True
+            groups = 1
+        heads_per_group = heads // groups  # local heads in one group (pre-exchange)
+        group_heads_per_rank = heads_per_group // P  # heads of one group on one rank
+        seq_full = seq_local * P
+        fp8 = self._fp8_payload_active()
+        rank = self._ulysses_rank
+        pg = self.process_group
+        comm = self._comm_stream()
+        compute = torch.cuda.current_stream()
+
+        kwargs["batch_size"] = batch
+        kwargs["seq_len"] = seq_full
+        kwargs["seq_len_kv"] = seq_full
+
+        descales = None
+        if fp8:
+            descales = self._fp8_payload_scales(
+                q, k, v, heads_per_rank, kwargs.get("key_padding_mask")
+            )  # [3, B, P]
+
+        def send_buffer(t: torch.Tensor, g: int, tensor_idx: int) -> torch.Tensor:
+            # [B, S/P, Hg, D] slice -> [P, B, S/P, Hg/P, D] grouped by destination rank.
+            if fp8 and self.fp8_pack != "ops":
+                # One kernel: strided read of the group's heads, FP8 cast with the
+                # destination's scale, permuted write.
+                assert t.stride(3) == 1 and t.stride(2) == head_dim
+                width = group_heads_per_rank * head_dim
+                out = torch.empty(
+                    (P, batch, seq_local, group_heads_per_rank, head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=t.device,
+                )
+                rows = 16
+                _ulysses_fp8_pack_kernel[(batch * P, triton.cdiv(seq_local, rows))](
+                    t, out.view(torch.int16), descales[tensor_idx], batch, seq_local,
+                    t.stride(0), t.stride(1), g * heads_per_group * head_dim, width, P,
+                    ROWS=rows, W=triton.next_power_of_2(width), RCP_ASM=_RCP_ASM, num_warps=8,
+                )
+                return out
+            sl = t[:, :, g * heads_per_group : (g + 1) * heads_per_group, :]
+            sl = sl.reshape(batch, seq_local, P, group_heads_per_rank, head_dim)
+            buf = sl.permute(2, 0, 1, 3, 4).contiguous()
+            if not fp8:
+                return buf
+            out = torch.empty(buf.shape, dtype=torch.float8_e4m3fn, device=buf.device)
+            for p in range(P):
+                for b in range(batch):
+                    q8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                        buf[p, b], descales[tensor_idx, b, p].reshape(1)
+                    )
+                    out[p, b].copy_(q8)
+            return out
+
+        def a2a(send: torch.Tensor, recv: torch.Tensor) -> None:
+            # Runs on the comm stream; the caller recorded the producer event. Buffers are
+            # allocated on the compute stream and kept alive until the forward's final
+            # waits, so the caching allocator needs no record_stream bookkeeping (which
+            # defers every block's reuse and makes the pool grow across generations).
+            send_flat = send.view(torch.uint8).flatten() if send.dtype == torch.float8_e4m3fn else send.flatten()
+            recv_flat = recv.view(torch.uint8).flatten() if recv.dtype == torch.float8_e4m3fn else recv.flatten()
+            dist.all_to_all_single(recv_flat, send_flat, group=pg)
+
+        output = torch.empty(
+            (batch, seq_local, heads, head_dim), dtype=torch.bfloat16, device=q.device
+        )
+        output_grouped = output.view(batch, seq_local, groups, P, group_heads_per_rank, head_dim)
+
+        # Phase 1: every group's tokens->heads exchange, issued in order on the comm stream.
+        recv_qkv: List[List[torch.Tensor]] = []
+        recv_events: List[torch.cuda.Event] = []
+        keep_alive: List[torch.Tensor] = []
+        for g in range(groups):
+            sends = [send_buffer(t, g, i) for i, t in enumerate((q, k, v))]
+            recvs = [torch.empty_like(s) for s in sends]
+            ready = torch.cuda.Event()
+            ready.record(compute)
+            with torch.cuda.stream(comm):
+                ready.wait(comm)
+                for s, r in zip(sends, recvs):
+                    a2a(s, r)
+                done = torch.cuda.Event()
+                done.record(comm)
+            keep_alive.extend(sends)
+            recv_qkv.append(recvs)
+            recv_events.append(done)
+
+        # Phase 2: attention per group on the compute stream; the finished group's
+        # heads->tokens exchange goes to the comm stream behind the pending exchanges.
+        # Backends validate the head count they were built with (cuDNN); a group carries
+        # Hg/P of the rank's H/P heads, so the configured count is narrowed for the loop.
+        inner = self.inner_backend
+        saved_heads = (getattr(inner, "num_heads", None), getattr(inner, "num_kv_heads", None))
+        if groups > 1:
+            if saved_heads[0] is not None:
+                inner.num_heads = group_heads_per_rank
+            if saved_heads[1] is not None:
+                inner.num_kv_heads = group_heads_per_rank
+        out_recv: List[torch.Tensor] = []
+        out_events: List[torch.cuda.Event] = []
+        try:
+            self._grouped_attention(
+                groups, recv_qkv, recv_events, descales, fp8, batch, seq_full, seq_local,
+                group_heads_per_rank, head_dim, P, rank, compute, comm, pg, kwargs,
+                out_recv, out_events, keep_alive,
+            )
+        finally:
+            if groups > 1:
+                if saved_heads[0] is not None:
+                    inner.num_heads = saved_heads[0]
+                if saved_heads[1] is not None:
+                    inner.num_kv_heads = saved_heads[1]
+
+        # Phase 3: place each group's rows into the output [B, S/P, H, D].
+        for g in range(groups):
+            out_events[g].wait(compute)
+            # [P, B, S/P, Hg/P, D] -> [B, S/P, P, Hg/P, D]
+            output_grouped[:, :, g].copy_(out_recv[g].permute(1, 2, 0, 3, 4))
+        del keep_alive
+        if _ULYSSES_VERIFY and groups == 1 and fp8:
+            return self._verify_against_control(q, k, v, kwargs, output, descales)
+        return output
+
+    def _verify_against_control(self, q, k, v, kwargs, output, descales):
+        """Diagnostic: run the unchanged sync path on the same inputs, compare the exchanged
+        FP8 codes, the descales and the outputs bitwise, log one line per call, and return
+        the control's output so the run stays on the control's trajectory."""
+        from .cudnn import _quantize_fp8
+
+        pg = self.process_group
+        rank = self._ulysses_rank
+        ref = self._forward_unfused(q, k, v, **dict(kwargs))
+        mask = kwargs.get("key_padding_mask")
+        batch = q.shape[0]
+        seq_full = q.shape[1] * self.world_size
+        lengths = mask.sum(dim=1).tolist() if mask is not None else [seq_full] * batch
+        mine = getattr(self, "_verify_recv", None)
+        codes_eq, desc_eq = [], []
+        for i, t in enumerate((q, k, v)):
+            t2 = all_to_all_4d(t, scatter_dim=2, gather_dim=1, process_group=pg)
+            for b in range(batch):
+                n = lengths[b]
+                ref_codes, ref_desc = _quantize_fp8(t2[b : b + 1, :n].contiguous())
+                my_codes = mine[i][b : b + 1, :n] if mine is not None else None
+                if my_codes is None:
+                    codes_eq.append("none")
+                else:
+                    rf, mf = ref_codes.float(), my_codes.float()
+                    ndiff = int((rf != mf).sum().item())
+                    if ndiff == 0:
+                        codes_eq.append(True)
+                    else:
+                        d = (rf - mf).abs()
+                        sel = rf != mf
+                        # size of the difference relative to the FP8 spacing at the value
+                        ulps = (d[sel] / torch.ldexp(torch.ones_like(rf[sel]), torch.floor(torch.log2(rf[sel].abs().clamp_min(2**-9))) - 3)).max().item()
+                        codes_eq.append(f"{ndiff}/{rf.numel()} max_ulp={ulps:.2f} max|x|={rf[sel].abs().max().item():.3g} ex=({rf[sel][0].item():.4g}->{mf[sel][0].item():.4g})")
+                desc_eq.append(torch.equal(ref_desc.reshape(-1).float(), descales[i, b, rank].reshape(-1).float()))
+        out_eq = torch.equal(ref, output)
+        rel = 0.0 if out_eq else ((ref.float() - output.float()).norm() / ref.float().norm().clamp_min(1e-12)).item()
+        self._verify_calls = getattr(self, "_verify_calls", 0) + 1
+        line = (
+            f"call {self._verify_calls} q{tuple(q.shape)} mask={'y' if mask is not None else 'n'} lengths={lengths} "
+            f"codes_equal={codes_eq} descales_equal={desc_eq} output_equal={out_eq} relL2={rel:.3e}\n"
+        )
+        with open(f"{_ULYSSES_VERIFY_LOG}-rank{rank}.log", "a") as f:
+            f.write(line)
+        self._verify_recv = None
+        return ref
+
+    def _grouped_attention(
+        self, groups, recv_qkv, recv_events, descales, fp8, batch, seq_full, seq_local,
+        group_heads_per_rank, head_dim, P, rank, compute, comm, pg, kwargs,
+        out_recv, out_events, keep_alive,
+    ) -> None:
+        for g in range(groups):
+            recv_events[g].wait(compute)
+            # [P, B, S/P, Hg/P, D] -> [B, S, Hg/P, D]; with one batch item the receive
+            # buffer already is the [S, Hg/P, D] row order (rank-major rows), no copy.
+            if batch == 1:
+                qg, kg, vg = (
+                    r.view(1, seq_full, group_heads_per_rank, head_dim) for r in recv_qkv[g]
+                )
+            else:
+                qg, kg, vg = (
+                    r.permute(1, 0, 2, 3, 4).contiguous().view(batch, seq_full, group_heads_per_rank, head_dim)
+                    for r in recv_qkv[g]
+                )
+            inner_kwargs = dict(kwargs)
+            if fp8:
+                inner_kwargs["descale_q"] = descales[0, :, rank]
+                inner_kwargs["descale_k"] = descales[1, :, rank]
+                inner_kwargs["descale_v"] = descales[2, :, rank]
+            if _ULYSSES_VERIFY and groups == 1:
+                self._verify_recv = (qg, kg, vg)
+            out_g = self.inner_backend.forward(q=qg, k=kg, v=vg, **inner_kwargs)
+            if out_g.dim() == 3:
+                out_g = out_g.view(batch, seq_full, group_heads_per_rank, head_dim)
+            # [B, S, Hg/P, D] -> [P, B, S/P, Hg/P, D] grouped by destination rank; with one
+            # batch item the row blocks of S are already the destination order, no copy.
+            if batch == 1:
+                send = out_g.contiguous().view(P, 1, seq_local, group_heads_per_rank, head_dim)
+            else:
+                send = (
+                    out_g.view(batch, P, seq_local, group_heads_per_rank, head_dim)
+                    .permute(1, 0, 2, 3, 4)
+                    .contiguous()
+                )
+            r = torch.empty_like(send)
+            ready = torch.cuda.Event()
+            ready.record(compute)
+            with torch.cuda.stream(comm):
+                ready.wait(comm)
+                dist.all_to_all_single(r.flatten(), send.flatten(), group=pg)
+                done = torch.cuda.Event()
+                done.record(comm)
+            keep_alive.append(send)
+            out_recv.append(r)
+            out_events.append(done)
 
     def forward(
         self,
@@ -468,6 +911,18 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
+        if self._grouped_path_active(q, k, v, kwargs):
+            return self._forward_grouped(q, k, v, **kwargs)
+        if _ULYSSES_EAGER_CONTROL and self.world_size > 1:
+            # Diagnostic: the unchanged sync path outside the compiled region, to tell a
+            # graph-break effect on the surrounding fusions from a numeric change.
+            return self._forward_sync_eager(q, k, v, **kwargs)
+        if self.inner_backend.support_fused_qkv():
+            return self._forward_fused(q, k, v, **kwargs)
+        return self._forward_unfused(q, k, v, **kwargs)
+
+    @torch.compiler.disable
+    def _forward_sync_eager(self, q, k, v, **kwargs):
         if kwargs.get("kv") is not None:
             # The plan counts the real tokens of the whole sequence and rows past it are
             # padding. Only the upper bound can be checked here: a heavily padded short

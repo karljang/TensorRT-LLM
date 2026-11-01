@@ -237,6 +237,9 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
     _scales_cache: ClassVar[Dict[Tuple[int, str | None], Any]] = {}
+    # The per-tensor FP8 recipe takes FP8 e4m3 Q/K/V with caller-supplied descales
+    # (``forward(descale_q=..., ...)``); UlyssesAttention's FP8 payload relies on it.
+    accepts_fp8_inputs: ClassVar[bool] = True
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -780,13 +783,23 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        descales: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
         out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        # Pre-quantized FP8 inputs (Ulysses FP8 payload): the caller supplies the per-tensor
+        # descales and the cast is skipped; everything else is the per-tensor FP8 recipe.
+        prequantized = q.dtype == torch.float8_e4m3fn
+        if prequantized:
+            if self.quant_dtype != "fp8" or descales is None:
+                raise ValueError(
+                    "FP8 Q/K/V inputs need the per-tensor FP8 recipe and their descales."
+                )
+        else:
+            q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
         # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
@@ -799,7 +812,12 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and is_fused_qkv(q, k, v):
+            if prequantized:
+                q_q, k_q, v_q = q.contiguous(), k.contiguous(), v.contiguous()
+                descale_q, descale_k, descale_v = (
+                    d.reshape(1, 1, 1, 1).to(torch.float32) for d in descales
+                )
+            elif d_qk == d_v and is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
                 qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
@@ -890,6 +908,9 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        descale_q: Optional[torch.Tensor] = None,
+        descale_k: Optional[torch.Tensor] = None,
+        descale_v: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -907,14 +928,29 @@ class CuDNNAttention(AttentionBackend):
                 blocks. The first ``kv.num_tokens`` rows are real; rows past them are
                 padding added so the sequence splits evenly across ranks, neither written
                 to the cache nor attended, and their output rows are zero.
+            descale_q / descale_k / descale_v: ``[B]`` float32 per-tensor descales of
+                FP8 e4m3 ``q`` / ``k`` / ``v`` that the caller quantized already (the
+                Ulysses FP8 payload); the per-tensor FP8 recipe then skips its own cast.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
+        descales = None
+        if q.dtype == torch.float8_e4m3fn:
+            if descale_q is None or descale_k is None or descale_v is None:
+                raise ValueError("FP8 e4m3 inputs need descale_q, descale_k and descale_v.")
+            descales = (descale_q, descale_k, descale_v)
         if kv is not None:
+            if descales is not None:
+                raise NotImplementedError("FP8 e4m3 inputs are not supported with a K/V cache.")
             return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
         output, _ = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
+            q,
+            k,
+            v,
+            is_causal=self._resolve_mask(attention_mask, key_padding_mask),
+            with_lse=False,
+            descales=descales,
         )
         return output
 
