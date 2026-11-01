@@ -267,9 +267,6 @@ def _reduce_amax(amax: torch.Tensor) -> None:
 
 
 def _launch_config() -> Tuple[int, int]:
-    """Heads per tile and warps per program for the per-tensor kernels; two heads per warp keeps the
-    fp32 row-norm reduction order, so 4 / 2 and 8 / 4 produce the same FP8 codes and 4 / 2 is the
-    faster launch at every H3 sequence length measured on R200."""
     return (
         int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "4")),
         int(os.environ.get("H3_FP8_FUSION_WARPS", "2")),
