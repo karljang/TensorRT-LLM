@@ -198,6 +198,10 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
         }
+        # FA4's CuTe FP8 forward: per-tensor E4M3 Q / K / V, compute capability 10.x.
+        FA4_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
+        }
 
         if self.quant_attention_config is None:
             return self
@@ -257,10 +261,19 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(FLASHINFER_RECIPES)}."
                 )
+        elif self.backend == "FA4":
+            if recipe not in FA4_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='FA4'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(FA4_RECIPES)}. Omit quant_attention_config to run "
+                    f"unquantized attention."
+                )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUDNN', 'FLASHINFER', 'CUTEDSL'), "
-                f"got backend='{self.backend}'. Either change backend or "
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUDNN', 'FLASHINFER', "
+                f"'CUTEDSL', 'FA4'), got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )
         return self

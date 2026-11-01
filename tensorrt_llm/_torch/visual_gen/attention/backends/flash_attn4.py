@@ -16,7 +16,9 @@
 Flash Attention 4 Backend for Visual Generation Models
 
 Uses Flash Attention 4 with the CUTE JIT kernel.
-Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
+Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16. With the per-tensor FP8
+recipe (``quant_attention_config`` qk_dtype=fp8, v_dtype=fp8) Q, K and V are quantized to
+E4M3 with one scale each and run through FA4's FP8 forward on compute capability 10.x.
 """
 
 import contextlib
@@ -164,6 +166,7 @@ class FlashAttn4Attention(AttentionBackend):
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         use_2cta: Optional[bool] = None,
+        quant_attention_config=None,
         **kwargs,
     ):
         """
@@ -172,6 +175,11 @@ class FlashAttn4Attention(AttentionBackend):
                 backend instance; ``None`` keeps FA4's process default. Ignored when
                 FA_DISABLE_2CTA is set explicitly in the environment. FA4 still applies its
                 own eligibility rules (non-causal, head_dim 128 / 192, long enough sequence).
+            quant_attention_config: ``None`` runs unquantized. The per-tensor FP8 recipe
+                (``qk_dtype="fp8"``, ``v_dtype="fp8"``, block sizes 0) quantizes Q, K and V to
+                E4M3 with one amax scale each (the cuDNN backend's quantizer) and runs FA4's
+                FP8 forward, which keeps the softmax probabilities in FP8 for the PV GEMM and
+                writes a BF16 output. No other recipe is served here.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
@@ -179,6 +187,23 @@ class FlashAttn4Attention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.quant_dtype: Optional[str] = None
+        if quant_attention_config is not None:
+            recipe = (
+                quant_attention_config.qk_dtype,
+                quant_attention_config.v_dtype,
+                (
+                    quant_attention_config.q_block_size,
+                    quant_attention_config.k_block_size,
+                    quant_attention_config.v_block_size,
+                ),
+            )
+            if recipe != ("fp8", "fp8", (0, 0, 0)):
+                raise ValueError(
+                    "FlashAttn4Attention serves only the per-tensor FP8 recipe "
+                    f"(qk_dtype='fp8', v_dtype='fp8', block sizes 0); got {recipe!r}."
+                )
+            self.quant_dtype = "fp8"
         self.use_2cta = use_2cta if fa4_2cta_requestable() else None
         if use_2cta is not None and self.use_2cta is None and layer_idx == 0:
             logger.info(
@@ -199,6 +224,10 @@ class FlashAttn4Attention(AttentionBackend):
         seqused_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
+        descales = {}
+        if self.quant_dtype == "fp8":
+            q, k, v, q_descale, k_descale, v_descale = self._quantize_fp8_qkv(q, k, v)
+            descales = dict(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
         # FA4's private forward API may append diagnostics that this backend does not consume.
         with _fa4_2cta_request(self.use_2cta):
             output, lse, *_ = _flash_attn_fwd(
@@ -217,8 +246,42 @@ class FlashAttn4Attention(AttentionBackend):
                 block_sparse_tensors=None,
                 return_lse=True,
                 num_splits=0,
+                **descales,
             )
         return output, lse
+
+    @staticmethod
+    def _quantize_fp8_qkv(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
+        """Per-tensor E4M3 Q / K / V plus the ``[B, H_kv]`` float32 descales FA4 expects.
+
+        Shares the cuDNN backend's quantizer so both FP8 attention backends see the same
+        quantized inputs: one amax + cast over the packed buffer when Q, K and V are slices of
+        one fused-QKV projection, else one per tensor.
+        """
+        from .cudnn import CuDNNAttention, _quantize_fp8
+
+        b, _, h_q, d = q.shape
+        h_kv = k.shape[2]
+        if d == v.shape[3] and CuDNNAttention._is_fused_qkv(q, k, v):
+            qkv_q, descale = _quantize_fp8(CuDNNAttention._as_fused_qkv(q, k, v))
+            q_q, k_q, v_q = (
+                t.unflatten(-1, (h, d))
+                for t, h in zip(
+                    qkv_q.split([h_q * d, h_kv * d, h_kv * d], dim=-1), (h_q, h_kv, h_kv)
+                )
+            )
+            descale_q = descale_k = descale_v = descale
+        else:
+            q_q, descale_q = _quantize_fp8(q)
+            k_q, descale_k = _quantize_fp8(k)
+            v_q, descale_v = _quantize_fp8(v)
+
+        def per_kv_head(descale: torch.Tensor) -> torch.Tensor:
+            return descale.reshape(1, 1).expand(b, h_kv).contiguous()
+
+        return q_q, k_q, v_q, per_kv_head(descale_q), per_kv_head(descale_k), per_kv_head(descale_v)
 
     def _prepare_inputs(
         self,
