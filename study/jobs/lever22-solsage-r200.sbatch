@@ -47,8 +47,8 @@ export H3_GATE_RERUN_ARM=${H3_GATE_RERUN_ARM:-p-solsage-16}
 export H3_SHIP_ARMS=${H3_SHIP_ARMS:-"p-solsage-16 p-f8"}
 export H3_SHIP_PROMPTS=${H3_SHIP_PROMPTS:-$H/study/hecate/requests/ship-prompts-544x960x124.json}
 export H3_SOL_TAU=${H3_SOL_TAU:-2}
-export H3_SOL_CUT_A=${H3_SOL_CUT_A:-}                      # normalized timestep cutoffs; empty = derive from the probe's timestep log
-export H3_SOL_CUT_B=${H3_SOL_CUT_B:-}
+export H3_SOL_CUT_A=${H3_SOL_CUT_A:-0.9877}                # lever 21's cutoffs (¶15574): t_k = 12s/(1+11s), s = 1 - k/27; A = 4 dense steps,
+export H3_SOL_CUT_B=${H3_SOL_CUT_B:-0.9566}                # B = 10 dense steps; the probe's timestep log confirms them (results.json sol.dense_steps)
 export H3_SOL_DENSE_A=${H3_SOL_DENSE_A:-4}                 # dense-prefix lengths the cutoffs are derived for
 export H3_SOL_DENSE_B=${H3_SOL_DENSE_B:-10}
 export PDIR=$S/study/patches/recipe
