@@ -26,6 +26,9 @@
 # H3_SHIP_ARMS), cmp (hashes, bitcmp p1 vs p2 per arm, gate seed 42 vs rerun).
 # Study overrides, all logged in results.json: H3_UNGATE_TRTLLM=1 (pipeline SM gate), H3_UNGATE_SAGE=1 (recipe table),
 # H3_UNGATE_CUDNN=1 (cuDNN FP8 arm), TLLM_FMHA_LIBS=+prims_ts, CUTE_DSL_ARCH=sm_100f when the pin's DSL < 4.8.
+# Pin fix applied in every overlay mode (the TRTLLM Sol arms need it under torch.compile, ¶15584 defect 1): H3_PIN_FIXES =
+# study/patches/lever22-sol-kernels-pin.patch (sparse/sol/kernels.py do_not_specialize num_blocks; lever 21's overlay 11, same
+# hunk, committed on this branch as 5b7125bc39b). The pin already carries #20224's @torch.compiler.disable (lever 21's overlay 12).
 set -uo pipefail
 export H=/lustre/fsw/coreai_comparch_trtllm/kanghwanj/h3
 export S=$H/sweep-nvfp4
@@ -63,6 +66,8 @@ if [[ -z "${H3_PATCHES:-}" && $H3_OVERLAY_MODE != off ]]; then
   done < <(grep -E "^[0-9]+[[:space:]]+[0-9a-f]{16}[[:space:]]" "$H3_MANIFEST" | sort -n)
   export H3_PATCHES; echo "manifest $(sha256sum "$H3_MANIFEST" | cut -c1-16) -> $(echo $H3_PATCHES | wc -w) overlays verified"
 fi
+export H3_PIN_FIXES=${H3_PIN_FIXES:-$WT/study/patches/lever22-sol-kernels-pin.patch}   # applied to the pin package in every overlay mode
+for f in $H3_PIN_FIXES; do [[ -f $f ]] || { echo "PIN_FIXES: missing $f"; exit 2; }; done
 export H3_MARKERS=${H3_MARKERS:-"FUSED_QUANT H3_LEVER10_FOLD async_ulysses=use_async_ulysses _l8_norm_rope_tensor recv_view_dtype _l8_rank _use_fused_fp8_qk _out_proj fused_out_quant"}
 export H3_L14_MARKERS=${H3_L14_MARKERS:-"H3_L14_SCHED H3_L14_VAE_FP8 H3_L14_VAE_TILE"}
 mkdir -p "$R/e2e" "$R/gate" "$R/ship-u1" "$R/probe" "$H/cache"
@@ -132,9 +137,17 @@ if [[ $mode != off ]]; then
   else echo "[patch] chain rejected on the pin package: every arm runs the BF16 checkpoint without overlays (H3_OVERLAY_MODE=auto -> off)"; mode=off; fi
 fi
 if [[ $mode == on ]]; then apply_patches $H3_PATCHES; MODEL=$MODEL_NVFP4; COMMON=$NVFP4_ON; else MODEL=$MODEL_BF16; COMMON="H3_CUDNN_PREFIX_INPLACE=0"; fi
-echo "overlay_mode=$mode model=$MODEL" | tee "$R/overlay-mode.txt"
+# Pin fixes (every mode): the Sol predictor kernel fix the compiled TRTLLM Sol arms need (¶15584 defect 1).
+if dryrun_patches $H3_PIN_FIXES; then
+  for p in $H3_PIN_FIXES; do
+    patch -p1 -d "$pkg" --forward --batch < "$p" > "$R/patch-$(basename "$p").log" 2>&1 && ! grep -qE "FAILED|rejects" "$R/patch-$(basename "$p").log" || { echo "[pinfix] APPLY FAILED: $p"; cat "$R/patch-$(basename "$p").log"; exit 2; }
+    echo "[pinfix] $(basename "$p") applied"
+  done
+  grep -q "do_not_specialize" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py" || { echo "[pinfix] marker missing in sol/kernels.py"; exit 2; }
+else echo "[pinfix] rejected on the pin package: abort (the compiled Sol arms would die on the one-block refiner call)"; exit 2; fi
+echo "overlay_mode=$mode model=$MODEL pin_fixes=$(for p in $H3_PIN_FIXES; do basename $p; done | tr "\n" " ")" | tee "$R/overlay-mode.txt"
 M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3
-sha256sum ${H3_PATCHES:-} "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $WT/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
+sha256sum ${H3_PATCHES:-} $H3_PIN_FIXES "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $WT/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
 tag="$(basename "$SQSH") + overlays:$mode $( [[ $mode == on ]] && sha256sum $H3_MANIFEST | cut -c1-16 )"
 
 arm_backend() {  # arm -> harness attention flags
