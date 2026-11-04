@@ -163,7 +163,9 @@ def block_pool(x: torch.Tensor, out: torch.Tensor, *, block_size: int, reduce: _
 
 
 # --------------------------------------------------------------------------- block thresholds
-@triton.jit
+# num_blocks stays a runtime scalar: Triton turns an integer argument equal to 1 into a constexpr,
+# and num_blocks.to(tl.float32) below cannot compile for a one-block sequence.
+@triton.jit(do_not_specialize=["num_blocks"])
 def _block_statistics_kernel(
     x_ptr,
     mean_ptr,
