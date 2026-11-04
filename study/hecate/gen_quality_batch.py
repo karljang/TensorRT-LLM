@@ -60,8 +60,8 @@ def main():
         attention_config["sparse_attention_config"] = sparse
     provenance = {
         "arm": args.arm, "variant": args.variant, "backend": backend, "quant_attention_config": quant, "sparse_attention_config": sparse,
+        "h3_ungate_trtllm": os.environ.get("H3_UNGATE_TRTLLM"), "h3_ungate_sage": os.environ.get("H3_UNGATE_SAGE"), "tllm_fmha_libs": os.environ.get("TLLM_FMHA_LIBS"), "cute_dsl_arch": os.environ.get("CUTE_DSL_ARCH"),
         "fa_disable_2cta": os.environ.get("FA_DISABLE_2CTA"), "cudnn_ungate": cudnn_ungate, "model": args.model,
-        "study_overrides": {k: os.environ.get(k) for k in ("H3_UNGATE_CUDNN", "H3_UNGATE_TRTLLM", "H3_UNGATE_SAGE", "TLLM_FMHA_LIBS", "CUTE_DSL_ARCH", "H3_SOL_STATS")},
         "prompt_set": str(args.prompts), "prompt_ids": sorted(prompts), "seed": spec["seed"],
         "steps": spec["num_inference_steps"], "compile": args.compile, "cuda_graph": args.cuda_graph,
         "ulysses": args.ulysses, "async_ulysses": args.async_ulysses, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),

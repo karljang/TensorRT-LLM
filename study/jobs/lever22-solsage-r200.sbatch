@@ -19,8 +19,8 @@
 #   p-tsage-16   TRTLLM dense + Sage fp8/fp8 (1,16,1) (Sage cost / gain on the dense path, 19k only)
 #   p-sol-t2-dB  Sol tau 2, dense prefix B (~10 of 27 steps), BF16 PrimsTS block-sparse (Sage off)
 #   p-solsage-16 the same Sol + Sage fp8/fp8 (1,16,1)   p-solsage-4: (1,4,1), 19k only
-# Phases (H3_PARTS): probe (DSL version, ops, one eager Sol + Sage generation with H3_SOL_STATS -> the 27 normalized timesteps
-# and the achieved sparsity; derives the cutoffs A (4 dense) / B (10 dense) unless H3_SOL_CUT_B is given), e2e (GPU 0: 19k
+# Phases (H3_PARTS): probe (DSL version, ops, one eager Sol + Sage generation with lever 21's --sol-probe -> the 27 normalized
+# timesteps and the achieved sparsity; derives the cutoffs A (4 dense) / B (10 dense) unless H3_SOL_CUT_B is given), e2e (GPU 0: 19k
 # x 2 rotated passes, 104k x 1, 38k x 1 last), nsys (GPU 0, timed generation only, 19k + 104k, p-f8 / p-sol-t2-dB /
 # p-solsage-16), side (GPUs 1-3: gate seeds 42 / 42-rerun / 7 / 123 for every arm in H3_GATE_ARMS, ship prompts for
 # H3_SHIP_ARMS), cmp (hashes, bitcmp p1 vs p2 per arm, gate seed 42 vs rerun).
@@ -83,7 +83,7 @@ has() { [[ " $H3_PARTS " == *" $1 "* ]]; }
 export HF_HUB_OFFLINE=1 TLLM_DISABLE_MPI=1 PYTHONDONTWRITEBYTECODE=1 PYTHONFAULTHANDLER=1 OMP_NUM_THREADS=8 TORCHINDUCTOR_COMPILE_THREADS=4
 ulimit -c 0
 unset FA_DISABLE_2CTA H3_UNGATE_CUDNN H3_UNGATE_TRTLLM H3_UNGATE_SAGE
-export PYTHONPATH=$WT/study/hecate/probe22:$H/study/hecate/probe${PYTHONPATH:+:$PYTHONPATH}   # lever-22 shim chains the base shim
+export PYTHONPATH=$WT/study/hecate/probe22:$WT/study/hecate/probe${PYTHONPATH:+:$PYTHONPATH}   # lever-22 shim chains lever 21'"'"'s shim (both in the worktree)
 pkg=$(python -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])" | tail -n 1)
 echo "[job] $(hostname) sm=$(python -c "import torch; print(torch.cuda.get_device_capability())" | tail -n 1) tensorrt_llm $(python -c "import tensorrt_llm; print(tensorrt_llm.__version__)" 2>/dev/null | tail -n 1) site=$pkg"
 dsl=$(python -c "import importlib.metadata as m; print(m.version(\"nvidia-cutlass-dsl\"))" 2>/dev/null | tail -n 1)
@@ -134,7 +134,7 @@ fi
 if [[ $mode == on ]]; then apply_patches $H3_PATCHES; MODEL=$MODEL_NVFP4; COMMON=$NVFP4_ON; else MODEL=$MODEL_BF16; COMMON="H3_CUDNN_PREFIX_INPLACE=0"; fi
 echo "overlay_mode=$mode model=$MODEL" | tee "$R/overlay-mode.txt"
 M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3
-sha256sum ${H3_PATCHES:-} "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $H/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
+sha256sum ${H3_PATCHES:-} "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $WT/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
 tag="$(basename "$SQSH") + overlays:$mode $( [[ $mode == on ]] && sha256sum $H3_MANIFEST | cut -c1-16 )"
 
 arm_backend() {  # arm -> harness attention flags
@@ -190,23 +190,23 @@ from tensorrt_llm._torch.attention.backends.prims_ts import context
 print("prims_ts supported cc", context._SUPPORTED_COMPUTE_CAPABILITIES)
 EOF
   out=$R/probe/solsage-eager-s19k; mkdir -p "$out"
-  echo "[probe] eager Sol + Sage (no dense prefix) with H3_SOL_STATS start $(date -Is)"
-  env $(arm_env p-solsage-16) H3_SOL_STATS=$out/sol-stats.json python -u h3_e2e_bench.py --model "$MODEL" --request "requests/$(req_e2e s19k)" --output "$out" --label probe-solsage-16-eager \
-    --attention-backend TRTLLM --sol $H3_SOL_TAU,none --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,16,1 --compile off --cuda-graph off --warmup 0 --timed 1 --save-output off --container "$tag" > "$out.log" 2>&1
-  echo "[probe] rc=$? $(date -Is)"; grep -E "H3_E2E_BENCH_DONE|probe22|sol stats|Error|error" "$out.log" | grep -v "error_" | tail -6 | cut -c1-240
-  if [[ -f $out/sol-stats.json ]]; then
-    read -r cutA cutB <<< "$(python - "$out/sol-stats.json" "$H3_SOL_DENSE_A" "$H3_SOL_DENSE_B" <<EOF
+  echo "[probe] eager Sol + Sage (no dense prefix) with --sol-probe start $(date -Is)"
+  env $(arm_env p-solsage-16) python -u h3_e2e_bench.py --model "$MODEL" --request "requests/$(req_e2e s19k)" --output "$out" --label probe-solsage-16-eager \
+    --attention-backend TRTLLM --sol $H3_SOL_TAU,none --sol-probe --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,16,1 --compile off --cuda-graph off --warmup 1 --timed 1 --save-output off --container "$tag" > "$out.log" 2>&1
+  echo "[probe] rc=$? $(date -Is)"; grep -E "H3_E2E_BENCH_DONE|probe22|sitecustomize|sol_probe|\"sol\"|Error|error" "$out.log" | grep -v "error_" | tail -8 | cut -c1-300
+  if python -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(\"timesteps\") and d.get(\"sol_probe\") else 1)" "$out/results.json" 2>/dev/null; then
+    read -r cutA cutB <<< "$(python - "$out/results.json" "$H3_SOL_DENSE_A" "$H3_SOL_DENSE_B" <<EOF
 import json, sys
-d = json.load(open(sys.argv[1])); ts = [t for t in d["timesteps"] if t is not None]   # descending
+d = json.load(open(sys.argv[1])); ts = sorted(d["timesteps"], reverse=True)   # descending noise in [0, 1]
 def cut(n):  # cutoff so that the first n steps (largest timesteps) run dense: midpoint between step n and n+1
     return (ts[n - 1] + ts[n]) / 2 if 0 < n < len(ts) else (ts[0] + 1e-6 if n >= len(ts) else 0.0)
 print(f"{cut(int(sys.argv[2])):.6f} {cut(int(sys.argv[3])):.6f}")
 EOF
 )"
     [[ -z $H3_SOL_CUT_A ]] && H3_SOL_CUT_A=$cutA; [[ -z $H3_SOL_CUT_B ]] && H3_SOL_CUT_B=$cutB
-    python -c "import json,sys; d=json.load(open(sys.argv[1])); print(\"[probe] timesteps\", [round(t,4) for t in d[\"timesteps\"]]); print(\"[probe] kept fraction (all sparse)\", d[\"kept_fraction_sparse_mean\"], \"per step\", [round(s[\"kept_fraction_mean\"],3) for s in d[\"per_step\"]])" "$out/sol-stats.json"
+    python -c "import json,sys; d=json.load(open(sys.argv[1])); p=d[\"sol_probe\"]; print(\"[probe] timesteps\", [round(t,4) for t in d[\"timesteps\"]]); print(\"[probe] route\", p[\"route\"], \"calls\", p[\"calls\"], \"kept fraction (all sparse, mean)\", p[\"kept_fraction_mean_all_sparse_calls\"]); print(\"[probe] per step\", [round(v[\"kept_fraction_mean\"],3) for k,v in sorted(p[\"by_transformer_call\"].items(), key=lambda kv:int(kv[0]))])" "$out/results.json"
   else
-    echo "[probe] no sol-stats.json: the Sol + Sage path did not run; see $out.log"; tail -30 "$out.log" | cut -c1-240
+    echo "[probe] no timesteps / sol_probe in results.json: the Sol + Sage path did not run; see $out.log"; tail -30 "$out.log" | cut -c1-240
     [[ -z $H3_SOL_CUT_B ]] && { echo "LEVER22: no cutoff and no probe: abort"; exit 5; }
   fi
   echo "cutA=$H3_SOL_CUT_A (dense $H3_SOL_DENSE_A) cutB=$H3_SOL_CUT_B (dense $H3_SOL_DENSE_B) tau=$H3_SOL_TAU" | tee "$R/probe/cutoffs.txt"

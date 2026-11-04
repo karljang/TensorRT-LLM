@@ -35,6 +35,7 @@ timed generation, for a later LPIPS comparison with ``quality_compare.py``).
 import argparse
 import functools
 import hashlib
+import math
 import importlib.metadata
 import json
 import os
@@ -183,7 +184,12 @@ def provenance(args, device_index):
             text=True,
         ).stdout,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "env": {k: os.environ.get(k) for k in ("FA_DISABLE_2CTA", "TLLM_FMHA_LIBS", "TORCHINDUCTOR_CACHE_DIR", "PYTHONPATH")},
+        "env": {
+            k: v
+            for k, v in sorted(os.environ.items())
+            if k in ("FA_DISABLE_2CTA", "TLLM_FMHA_LIBS", "TORCHINDUCTOR_CACHE_DIR", "PYTHONPATH")
+            or k.startswith(("H3_", "TLLM_", "CUTE_", "TRTLLM_", "FA_"))
+        },
         "sys_path": sys.path,
     }
     try:
@@ -224,9 +230,28 @@ def main():
     parser.add_argument("--attention-backend", default=None, help="VisualGenArgs attention backend; default = pipeline default")
     parser.add_argument("--qk-dtype", default=None, help="quantized attention recipe (cuDNN FP8: fp8 / fp8); SM 107 needs H3_UNGATE_CUDNN=1 with the probe shim on PYTHONPATH")
     parser.add_argument("--v-dtype", default=None)
-    parser.add_argument("--quant-blocks", default=None, help="SageAttention block sizes Q,K,V of the quant recipe (TRTLLM backend), e.g. 1,16,1; unset = per-tensor (0,0,0)")
-    parser.add_argument("--sol", default=None, help="Sol-Attn: TAU,CUTOFF[,THRESH] -> sparse_attention_config {algorithm: sol_attn, tau, disabled_until_timestep: CUTOFF (steps with normalized timestep >= CUTOFF run dense; 'none' = no dense prefix), thresh_type: THRESH (diag)}; SM 107 needs H3_UNGATE_TRTLLM=1 with the probe shim")
+    parser.add_argument("--quant-blocks", default=None, metavar="Q,K,V", help="SageAttention block sizes of the quant recipe (TRTLLM backend), e.g. 1,16,1; unset = per-tensor (0,0,0). SM 107 needs H3_UNGATE_SAGE=1 with the lever-22 shim (probe22) on PYTHONPATH")
     parser.add_argument("--quant-algo", default=None, help="dynamic quantization of a BF16 checkpoint (FP8, FP8_BLOCK_SCALES, NVFP4); leave unset for BF16 or a pre-quantized export")
+    parser.add_argument(
+        "--sol",
+        default=None,
+        metavar="TAU,CUTOFF",
+        help="Sol-Attn: attention_config.sparse_attention_config = {algorithm: sol_attn, tau: TAU, disabled_until_timestep: CUTOFF} "
+        "(CUTOFF on the normalized timestep the H3 transformer passes, descending noise in [0, 1]; dense while timestep >= CUTOFF; 'none' = no dense prefix). "
+        "Served by SOLTrtllmAttention (--attention-backend TRTLLM: predictor op + PrimsTS block-sparse FMHA) or SOLCuTeDSLAttention (CUTEDSL: the fused kernel)",
+    )
+    parser.add_argument("--sol-thresh", choices=["diag", "exact"], default="diag", help="Sol-Attn thresh_type")
+    parser.add_argument(
+        "--sol-dense-layers",
+        default=None,
+        help="Sol-Attn dense_layers: 'all' (every layer forced dense: the no-op control, expected bit-identical to the dense backend) or a comma list of layer indices",
+    )
+    parser.add_argument(
+        "--sol-probe",
+        action="store_true",
+        help="record the achieved sparsity per transformer call from the predictor's exact_block_bits (kept-block fraction per step and layer); "
+        "needs --compile off, the wrapper would change the compiled graphs; on the CUTEDSL route it reports the predictor-implied route for the same q/k/v",
+    )
     parser.add_argument("--compile", choices=["on", "off"], default="on")
     parser.add_argument("--cuda-graph", choices=["on", "off"], default="off")
     parser.add_argument("--ulysses", type=int, default=1, help="ulysses_size (single process launch only; >1 needs the VisualGen multi-worker launch)")
@@ -320,20 +345,28 @@ def main():
         vg["attention_config"] = {"backend": args.attention_backend}
     if args.qk_dtype or args.v_dtype:
         quant = {"qk_dtype": args.qk_dtype, "v_dtype": args.v_dtype}
-        if args.quant_blocks:
+        if args.quant_blocks:  # lever 22: SageAttention per-block recipe on the TRTLLM backend
             qb, kb, vb = (int(x) for x in args.quant_blocks.split(","))
             quant.update({"q_block_size": qb, "k_block_size": kb, "v_block_size": vb})
         vg.setdefault("attention_config", {})["quant_attention_config"] = quant
         results["config"]["quant_attention_config"] = vg["attention_config"]["quant_attention_config"]
         results["config"]["cudnn_ungate"] = "#19738 6cbec8f" if os.environ.get("H3_UNGATE_CUDNN") == "1" else None
     if args.sol:
-        parts = args.sol.split(",")
-        sparse = {"algorithm": "sol_attn", "tau": float(parts[0]), "thresh_type": parts[2] if len(parts) > 2 else "diag"}
-        if len(parts) > 1 and parts[1].lower() != "none":
-            sparse["disabled_until_timestep"] = float(parts[1])
-        vg.setdefault("attention_config", {})["sparse_attention_config"] = sparse
-        results["config"]["sparse_attention_config"] = sparse
-    results["config"]["study_overrides"] = {k: os.environ.get(k) for k in ("H3_UNGATE_CUDNN", "H3_UNGATE_TRTLLM", "H3_UNGATE_SAGE", "TLLM_FMHA_LIBS", "CUTE_DSL_ARCH", "H3_SOL_STATS")}
+        tau_s, cutoff_s = args.sol.split(",")
+        sol = {"algorithm": "sol_attn", "tau": float(tau_s), "thresh_type": args.sol_thresh}
+        if cutoff_s.strip().lower() != "none":
+            sol["disabled_until_timestep"] = float(cutoff_s)
+        if args.sol_dense_layers:
+            # Layer indices are shared by the 50 transformer blocks and the token refiner's
+            # blocks; a wide range covers both for the "every layer dense" control.
+            sol["dense_layers"] = list(range(256)) if args.sol_dense_layers == "all" else [int(x) for x in args.sol_dense_layers.split(",")]
+        vg.setdefault("attention_config", {})["sparse_attention_config"] = sol
+        results["config"]["sol"] = sol
+        results["config"]["sol_probe"] = args.sol_probe
+    if args.sol_probe and not args.sol:
+        raise SystemExit("--sol-probe needs --sol")
+    if args.sol_probe and args.compile == "on":
+        raise SystemExit("--sol-probe needs --compile off (the predictor wrapper would change the compiled graphs)")
     if args.quant_algo:
         vg["quant_config"] = {"quant_algo": args.quant_algo, "dynamic": True}
     if args.ulysses > 1:
@@ -371,14 +404,84 @@ def main():
         "transformer_forward": repr(transformer.forward),
         "num_blocks": len(transformer.transformer_blocks),
         "block_type": type(transformer.transformer_blocks[0]).__name__,
-        # Sol-Attn / SageAttention resolution (TRTLLM backend): the route class, its SolParams and the
-        # quant recipe the backend holds, plus the FMHA libraries the core registered.
-        "sol_params": repr(getattr(inner_backend, "sol_params", None)),
-        "timestep_cutoff": getattr(inner_backend, "timestep_cutoff", None),
-        "quant_attention_config": repr(getattr(inner_backend, "quant_attention_config", None)),
-        "fmha_libs": [type(f).__name__ for f in getattr(getattr(inner_backend, "_fmha_manager", None), "fmha_libs", [])],
+        # Lever 21 (Sol-Attn): the FMHA libraries the TRTLLM core enabled (TLLM_FMHA_LIBS), the lowered
+        # Sol parameters, the token refiner's attention class (same backend config, called without a
+        # timestep) and the study shim marker set by probe/sitecustomize.py (H3_UNGATE_TRTLLM=1).
+        "fmha_libs": [type(f).__name__ for f in getattr(getattr(attn_module.attn, "_fmha_manager", None), "fmha_libs", [])],
+        "sparse_params": repr(getattr(attn_module.attn, "sol_params", None) or getattr(attn_module.attn, "sparse_params", None)),
+        "refiner_attention_backend": type(next((m for m in transformer.token_refiner.modules() if type(m).__name__ == "MiniMaxH3Attention"), attn_module).attn).__name__
+        if getattr(transformer, "token_refiner", None) is not None
+        else None,
+        "h3_ungate_trtllm_shim": getattr(h3_pipeline, "H3_UNGATE_TRTLLM_SHIM", None),
+        # Lever 22 (Sol + Sage): the quant recipe the backend holds and the SM-107 recipe-table shim marker.
+        "quant_attention_config": repr(getattr(attn_module.attn, "quant_attention_config", None)),
+        "h3_ungate_sage": os.environ.get("H3_UNGATE_SAGE"),
+        "pipeline_file_sha256": hashlib.sha256(Path(h3_pipeline.__file__).read_bytes()).hexdigest()[:16],
     }
     write()
+
+    # Lever 21: the normalized timesteps the transformer sees (one per denoising step, descending noise)
+    # and, with a Sol cutoff, how many steps run dense. Read once from the first warm-up generation: the
+    # .item() syncs there only, the timed generations run the untouched wrapper.
+    ts_log = {"timesteps": [], "armed": True, "calls": 0}
+    original_forward = transformer.forward
+
+    def forward_with_timestep_log(*a, **k):
+        ts_log["calls"] += 1
+        if ts_log["armed"]:
+            t = k.get("timestep")
+            if t is not None:
+                ts_log["timesteps"].append(float(torch.as_tensor(t).detach().float().amax().item()))
+        return original_forward(*a, **k)
+
+    transformer.forward = forward_with_timestep_log
+
+    sol_probe = None
+    if args.sol_probe:
+        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import backend as sol_backend_mod
+        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import predictor as sol_predictor_mod
+
+        popcount = torch.tensor([bin(i).count("1") for i in range(256)], dtype=torch.int32, device="cuda")
+        sol_probe = {"route": None, "calls": []}
+        original_predict = sol_predictor_mod.predict
+
+        def _record(bits, q, route):
+            batch, seq, heads = q.shape[0], q.shape[1], q.shape[2]
+            n_blocks = -(-seq // sol_predictor_mod.BLOCK_SIZE)
+            kept = int(popcount[bits.contiguous().view(torch.uint8).long()].sum().item())
+            total = batch * heads * n_blocks * n_blocks
+            sol_probe["calls"].append(
+                {"transformer_call": ts_log["calls"], "seq": int(seq), "heads": int(heads), "kept_blocks": kept, "total_blocks": total, "kept_fraction": kept / total, "route": route}
+            )
+
+        def probed_predict(q, k, v, *, tau, sm_scale, thresh_type="diag"):
+            out = original_predict(q, k, v, tau=tau, sm_scale=sm_scale, thresh_type=thresh_type)
+            _record(out.exact_block_bits, q, "trtllm-predictor")
+            return out
+
+        sol_predictor_mod.predict = probed_predict
+        sol_probe["route"] = "trtllm-predictor"
+        if args.attention_backend == "CUTEDSL" and getattr(sol_backend_mod, "_sol_attn_run", None) is not None:
+            original_run = sol_backend_mod._sol_attn_run
+
+            def probed_run(q, k, v, *, tau, thresh_type, dense_fn, **kw):
+                # The fused kernel keeps its route internal; this is the predictor's route for the same
+                # q / k / v and tau, i.e. what the two-stage TRTLLM backend would execute.
+                try:
+                    out = original_predict(q.contiguous(), k.contiguous(), v.contiguous(), tau=tau, sm_scale=1.0 / math.sqrt(q.shape[-1]), thresh_type=thresh_type)
+                    _record(out.exact_block_bits, q, "predictor-implied-for-cutedsl")
+                except Exception as exc:  # noqa: BLE001 - probe only
+                    sol_probe["calls"].append({"transformer_call": ts_log["calls"], "error": repr(exc)})
+                return original_run(q, k, v, tau=tau, thresh_type=thresh_type, dense_fn=dense_fn, **kw)
+
+            sol_backend_mod._sol_attn_run = probed_run
+            sol_probe["route"] = "predictor-implied-for-cutedsl"
+    sol_stats_mod = None
+    if args.sol:
+        try:
+            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend as sol_stats_mod
+        except Exception:  # noqa: BLE001 - counters are optional
+            sol_stats_mod = None
 
     timer = EventTimer()
     timer.wrap(pipeline, "_encode_prompt", "text_encode", nvtx="h3/prompt_encode")
@@ -485,6 +588,23 @@ def main():
             }
             gens.append(gen)
             print(json.dumps({k: v for k, v in gen.items() if k not in ("nvml_samples", "step_ms")}), flush=True)
+            if ts_log["armed"]:
+                ts_log["armed"] = False
+                results["timesteps"] = ts_log["timesteps"]
+                sol_cfg = results["config"].get("sol")
+                if sol_cfg is not None:
+                    cutoff = sol_cfg.get("disabled_until_timestep")
+                    phases = None if cutoff is None else [0 if t >= cutoff else 1 for t in ts_log["timesteps"]]
+                    results["sol"] = {
+                        "cutoff": cutoff,
+                        "dense_steps": None if phases is None else phases.count(0),
+                        "sparse_steps": None if phases is None else phases.count(1),
+                        "phase_by_step": phases,
+                        "dense_layers_all": bool(sol_cfg.get("dense_layers")) and len(sol_cfg["dense_layers"]) >= 256,
+                    }
+                    print(json.dumps({"sol": results["sol"], "timesteps": [round(t, 5) for t in ts_log["timesteps"]]}), flush=True)
+                if sol_stats_mod is not None and hasattr(sol_stats_mod, "reset_sol_attn_stats"):
+                    sol_stats_mod.reset_sol_attn_stats()  # count the fused kernel's calls over the timed generations only
             if kind == "timed":
                 last_output = out
             else:
@@ -562,6 +682,29 @@ def main():
         video = torch.as_tensor(last_output.video).cpu()
         audio = None if getattr(last_output, "audio", None) is None else torch.as_tensor(last_output.audio).cpu()
         torch.save({"video": video, "audio": audio, "frame_rate": getattr(last_output, "frame_rate", None)}, args.output / "output.pt")
+    if sol_stats_mod is not None and hasattr(sol_stats_mod, "get_sol_attn_stats"):
+        results["sol_kernel_stats_timed"] = sol_stats_mod.get_sol_attn_stats()
+    if sol_probe is not None:
+        calls = [c for c in sol_probe["calls"] if "kept_fraction" in c]
+        # Calls before the first transformer step (transformer_call 0) are the token refiner's;
+        # steps are numbered from the first transformer call of the recorded generation.
+        by_step = {}
+        for c in calls:
+            by_step.setdefault(c["transformer_call"], []).append(c["kept_fraction"])
+        summary = {
+            str(step): {"layers": len(fr), "kept_fraction_mean": sum(fr) / len(fr), "kept_fraction_min": min(fr), "kept_fraction_max": max(fr)}
+            for step, fr in sorted(by_step.items())
+        }
+        timed_calls = [c for c in calls if c["transformer_call"] >= 1]
+        results["sol_probe"] = {
+            "route": sol_probe["route"],
+            "calls": len(sol_probe["calls"]),
+            "errors": [c for c in sol_probe["calls"] if "error" in c][:5],
+            "kept_fraction_mean_all_sparse_calls": (sum(c["kept_fraction"] for c in timed_calls) / len(timed_calls)) if timed_calls else None,
+            "by_transformer_call": summary,
+        }
+        (args.output / "sol_probe_calls.json").write_text(json.dumps(sol_probe["calls"]))
+        print(json.dumps({"sol_probe": {k: v for k, v in results["sol_probe"].items() if k != "by_transformer_call"}}), flush=True)
     results["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     write()
     print("H3_E2E_BENCH_DONE", flush=True)

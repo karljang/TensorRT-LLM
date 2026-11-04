@@ -4,11 +4,8 @@ Records provenance, the per-step scheduler inputs (model velocity, sample) throu
 probe/sitecustomize.py (H3_PROBE_DIR on PYTHONPATH), the final video as output.pt and the
 wall time. Compare runs with quality_compare.py.
 
-Variant spec: BACKEND[:q=<qk_dtype>:v=<v_dtype>[:vblk=N][:blk=Q,K,V]][:sol=TAU:dut=CUTOFF[:tt=diag|exact]][:2cta=1];
-'2cta=1' re-enables FA4's 2-CTA kernel by exporting FA_DISABLE_2CTA=0 before the backend module is
-imported; 'blk=1,16,1' sets the SageAttention block sizes (q, k, v) of the quant recipe; 'sol=TAU'
-selects Sol-Attn (sparse_attention_config algorithm sol_attn) with 'dut' = disabled_until_timestep
-(the dense prefix: steps whose normalized timestep is >= CUTOFF run dense) and 'tt' = thresh_type.
+Variant spec: BACKEND[:q=<qk_dtype>:v=<v_dtype>[:vblk=N]][:2cta=1]; '2cta=1' re-enables FA4's
+2-CTA kernel by exporting FA_DISABLE_2CTA=0 before the backend module is imported.
 """
 
 import argparse
@@ -27,21 +24,28 @@ import h3_ungate  # noqa: E402  study root, after the sys.path insert
 
 
 def parse_variant(spec):
-    """Return (backend, quant_attention_config, want_2cta, sparse_attention_config)."""
+    """BACKEND[:q=..:v=..[:vblk=N]][:2cta=1][:sol=TAU[:dut=CUTOFF][:thresh=diag|exact][:dense=all|i,j]].
+
+    `sol=` adds attention_config.sparse_attention_config = {algorithm: sol_attn, tau, disabled_until_timestep
+    (`dut`, 'none' or absent = no dense prefix), thresh_type, dense_layers}; TRTLLM serves it with the predictor
+    op + PrimsTS block-sparse FMHA, CUTEDSL with the fused kernel (lever 21, §657).
+    """
     backend, *opts = spec.split(":")
     options = dict(opt.split("=", 1) for opt in opts)
     quant = None
     if "q" in options or "v" in options:
         quant = {"qk_dtype": options.get("q", "bf16"), "v_dtype": options.get("v", "fp8"),
                  "v_block_size": int(options.get("vblk", "0"))}
-        if "blk" in options:  # SageAttention block sizes q,k,v (TRTLLM backend), e.g. blk=1,16,1
+        if "blk" in options:  # lever 22: SageAttention block sizes q,k,v (TRTLLM backend), e.g. blk=1,16,1
             qb, kb, vb = (int(x) for x in options["blk"].split(","))
             quant.update({"q_block_size": qb, "k_block_size": kb, "v_block_size": vb})
     sparse = None
     if "sol" in options:
-        sparse = {"algorithm": "sol_attn", "tau": float(options["sol"]), "thresh_type": options.get("tt", "diag")}
-        if "dut" in options:
+        sparse = {"algorithm": "sol_attn", "tau": float(options["sol"]), "thresh_type": options.get("thresh", "diag")}
+        if options.get("dut", "none").lower() != "none":
             sparse["disabled_until_timestep"] = float(options["dut"])
+        if "dense" in options:
+            sparse["dense_layers"] = list(range(256)) if options["dense"] == "all" else [int(x) for x in options["dense"].split(",")]
     return backend.upper(), quant, options.get("2cta") == "1", sparse
 
 
@@ -82,8 +86,8 @@ def main():
     provenance = {
         "variant": args.variant, "backend": backend, "quant_attention_config": quant, "sparse_attention_config": sparse,
         "fa_disable_2cta": os.environ.get("FA_DISABLE_2CTA"),
-        "cudnn_ungate": cudnn_ungate,
-        "study_overrides": {k: os.environ.get(k) for k in ("H3_UNGATE_CUDNN", "H3_UNGATE_TRTLLM", "H3_UNGATE_SAGE", "TLLM_FMHA_LIBS", "CUTE_DSL_ARCH", "H3_SOL_STATS")},
+        "cudnn_ungate": cudnn_ungate, "h3_ungate_trtllm": os.environ.get("H3_UNGATE_TRTLLM"), "h3_ungate_sage": os.environ.get("H3_UNGATE_SAGE"), "tllm_fmha_libs": os.environ.get("TLLM_FMHA_LIBS"),
+        "cute_dsl_arch": os.environ.get("CUTE_DSL_ARCH"),
         "seed": args.seed, "steps": args.steps, "compile": args.compile, "cuda_graph": args.cuda_graph, "pipeline_warmup": args.pipeline_warmup, "request": request,
         "torch": torch.__version__, "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(), "host": platform.node(),
         "arch": platform.machine(), "tensorrt_llm": tensorrt_llm.__version__, "tensorrt_llm_file": tensorrt_llm.__file__,
