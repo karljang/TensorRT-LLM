@@ -150,7 +150,7 @@ if dryrun_patches $H3_PIN_FIXES; then
   done
   grep -q "do_not_specialize" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py" || { echo "[pinfix] marker missing in sol/kernels.py"; exit 2; }
   grep -q "SUPPORTED_SMS = frozenset({100, 103, 107})" "$pkg/tensorrt_llm/_torch/attention/backends/fmha/prims_ts.py" || { echo "[pinfix] marker missing in fmha/prims_ts.py (SM 107)"; exit 2; }
-  grep -q "_l22_qk_norm_input" "$M/transformer_minimax_h3.py" || { echo "[pinfix] marker missing in transformer_minimax_h3.py (Fp4 input to the fused QK-norm check)"; exit 2; }
+  grep -q "_l22_qk_norm_input" "$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3/transformer_minimax_h3.py" || { echo "[pinfix] marker missing in transformer_minimax_h3.py (Fp4 input to the fused QK-norm check)"; exit 2; }
 else echo "[pinfix] rejected on the pin package: abort (the Sol arms need both: predictor kernel under compile, PrimTS registration on SM 107)"; exit 2; fi
 echo "overlay_mode=$mode model=$MODEL pin_fixes=$(for p in $H3_PIN_FIXES; do basename $p; done | tr "\n" " ")" | tee "$R/overlay-mode.txt"
 M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3
