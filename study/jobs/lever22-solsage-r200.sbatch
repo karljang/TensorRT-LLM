@@ -93,7 +93,8 @@ export PYTHONPATH=$WT/study/hecate/probe22:$WT/study/hecate/probe${PYTHONPATH:+:
 pkg=$(python -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])" | tail -n 1)
 echo "[job] $(hostname) sm=$(python -c "import torch; print(torch.cuda.get_device_capability())" | tail -n 1) tensorrt_llm $(python -c "import tensorrt_llm; print(tensorrt_llm.__version__)" 2>/dev/null | tail -n 1) site=$pkg"
 dsl=$(python -c "import importlib.metadata as m; print(m.version(\"nvidia-cutlass-dsl\"))" 2>/dev/null | tail -n 1)
-if python -c "import sys; from packaging.version import Version as V; sys.exit(0 if V(\"$dsl\") < V(\"4.8\") else 1)" 2>/dev/null; then export CUTE_DSL_ARCH=sm_100f; fi
+# 4.8.0.dev0 (the rc1 image) already targets SM 107 natively; forcing sm_100f makes the PrimsTS Sage kernel fail NVVM ("unsupported operation", job 975192), so compare the release tuple, not the dev-tagged version
+if python -c "import sys; from packaging.version import Version as V; sys.exit(0 if V(\"$dsl\").release[:2] < (4, 8) else 1)" 2>/dev/null; then export CUTE_DSL_ARCH=sm_100f; fi
 echo "[job] nvidia-cutlass-dsl $dsl CUTE_DSL_ARCH=${CUTE_DSL_ARCH:-unset}"
 dryrun_patches() {  # whole chain on a scratch copy of the pin package; 0 clean, 1 reject
   local scratch; scratch=$(mktemp -d); mkdir -p "$scratch/tensorrt_llm/_torch"; cp -r "$pkg/tensorrt_llm/_torch/visual_gen" "$pkg/tensorrt_llm/_torch/attention" "$scratch/tensorrt_llm/_torch/"
