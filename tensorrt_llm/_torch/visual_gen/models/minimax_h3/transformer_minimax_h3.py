@@ -25,6 +25,9 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1115,6 +1118,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 weights,
                 attention_dim=self.config.num_attention_heads * self.config.attention_head_dim,
                 ffn_dim=self.config.ffn_dim,
+                dequant_nvfp4=getattr(self.config, "comfy_dequant_nvfp4", None),
+                dequant_dtype=self.model_config.torch_dtype,
             )
         if self.adaln_t_table is not None:
             table = weights.get("adaln_t_table")
@@ -1189,6 +1194,27 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 f"MiniMax-H3 checkpoint is missing {len(missing)} required tensors: "
                 f"{preview}{suffix}"
             )
+        census_path = os.environ.get("H3_LINEAR_CENSUS")
+        if census_path:
+            self._write_linear_census(census_path)
+
+    def _write_linear_census(self, path: str) -> None:
+        """Record every Linear's resolved precision (study provenance, H3_LINEAR_CENSUS=<json>)."""
+        from collections import Counter
+
+        rows = []
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                weight = getattr(module, "weight", None)
+                rows.append({
+                    "module": name,
+                    "quant": bool(module.has_any_quant),
+                    "weight_dtype": None if weight is None else str(weight.dtype),
+                    "shape": None if weight is None else list(weight.shape),
+                })
+        summary = Counter(f"{'quant' if r['quant'] else 'plain'}:{r['weight_dtype']}" for r in rows)
+        with open(path, "w") as handle:
+            json.dump({"summary": dict(summary), "modules": rows}, handle, indent=1)
 
     def post_load_weights(self) -> None:
         for module in self.modules():

@@ -17,7 +17,11 @@ from .comfy_quant import ComfyQuantization, convert_comfy_nvfp4
 def comfy_h3_quantization_config(
     checkpoint: ComfyQuantization, *, attention_dim: int, ffn_dim: int
 ) -> dict:
-    """Derive the native H3 mixed-precision recipe using header shapes only."""
+    """Derive the native H3 mixed-precision recipe using header shapes only.
+
+    Lever 24: modules in ``checkpoint.dequantized_layers`` count as full precision
+    (they are dequantized at load), so they land in the ``ignore`` list.
+    """
     shapes = {
         key: torch.empty(
             shape,
@@ -25,6 +29,7 @@ def comfy_h3_quantization_config(
             dtype=(
                 torch.uint8
                 if key.removesuffix(".weight") in checkpoint.nvfp4_layers
+                and key.removesuffix(".weight") not in checkpoint.dequantized_layers
                 else torch.float16
             ),
         )
@@ -60,12 +65,21 @@ def comfy_h3_quantization_config(
 
 
 def convert_comfy_h3_weights(
-    weights: Mapping[str, torch.Tensor], *, attention_dim: int, ffn_dim: int
+    weights: Mapping[str, torch.Tensor],
+    *,
+    attention_dim: int,
+    ffn_dim: int,
+    dequant_nvfp4=None,
+    dequant_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor]:
     """Normalize quantization and map native H3 names to TRT-LLM projections.
 
     Native Comfy SwiGLU stores gate before up. Map those halves directly to
     the loader's gate/up entries, bypassing the Diffusers up/gate permutation.
+    Lever 24: NVFP4 modules matching ``dequant_nvfp4`` are dequantized to
+    ``dequant_dtype``; untagged float8 weights (the community "mixed" file keeps
+    ``adaln_proj`` as a scale-less E4M3 cast) are widened to ``dequant_dtype``,
+    which is what ComfyUI does with an untagged fp8 tensor.
     """
     source = {}
     for key, value in weights.items():
@@ -73,7 +87,12 @@ def convert_comfy_h3_weights(
         if key in source:
             raise ValueError(f"Duplicate H3 tensor after prefix removal: {key}")
         source[key] = value
-    source = convert_comfy_nvfp4(source)
+    source = convert_comfy_nvfp4(source, dequant_nvfp4=dequant_nvfp4, dequant_dtype=dequant_dtype)
+    for key, value in list(source.items()):
+        if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and key.endswith(".weight"):
+            if f"{key[: -len('.weight')]}.weight_scale" in source:
+                raise ValueError(f"{key}: scaled FP8 weights are not supported by the H3 import")
+            source[key] = value.to(dequant_dtype)
     direct = {
         "video_patch_proj": "proj_in",
         "audio_patch_proj": "audio_proj_in",

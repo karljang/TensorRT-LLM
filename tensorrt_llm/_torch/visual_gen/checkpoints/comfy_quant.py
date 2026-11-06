@@ -67,11 +67,54 @@ def comfy_metadata_from_header(metadata: dict[str, str] | None) -> dict[str, tor
 
 @dataclass(frozen=True)
 class ComfyQuantization:
-    """Quantized source modules and their logical, uncompressed matrix shapes."""
+    """Quantized source modules and their logical, uncompressed matrix shapes.
+
+    ``dequantized_layers`` (lever 24 study extension): NVFP4 modules selected by the
+    ``comfy_dequant_nvfp4`` glob patterns for load-time dequantization to the model dtype,
+    so they run as full-precision Linears (the exclusion list treats them as unquantized).
+    """
 
     nvfp4_layers: dict[str, tuple[int, int]]
     weight_shapes: dict[str, tuple[int, ...]]
     adaln_curve_shape: tuple[int, int] | None = None
+    dequantized_layers: frozenset[str] = frozenset()
+
+
+def select_dequantized(names, patterns) -> frozenset[str]:
+    """NVFP4 source modules (names without the ``model.diffusion_model.`` prefix) that match any glob."""
+    import fnmatch
+
+    if not patterns:
+        return frozenset()
+    if isinstance(patterns, str):
+        patterns = [p for p in patterns.split(",") if p]
+    out = set()
+    for name in names:
+        short = name.removeprefix("model.diffusion_model.")
+        if any(fnmatch.fnmatchcase(short, p) or fnmatch.fnmatchcase(name, p) for p in patterns):
+            out.add(name)
+    return frozenset(out)
+
+
+_E2M1_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+
+def _dequantize_nvfp4(weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
+                      rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
+    """Comfy-layout NVFP4 (even element in the high nibble) -> dense ``dtype`` matrix.
+
+    value = e2m1(code) * block_scale(E4M3) * global_scale, blocks of 16 along the input dim;
+    ``scales`` are the linear ``[rows, cols // 16]`` E4M3 block scales from ``_linear_block_scales``.
+    """
+    hi = (weight >> 4).to(torch.long)
+    lo = (weight & 0x0F).to(torch.long)
+    codes = torch.stack([hi, lo], dim=-1).reshape(rows, cols)
+    values = _E2M1_VALUES.to(weight.device)[codes]
+    block = scales.float().repeat_interleave(16, dim=1)[:, :cols]
+    return (values * block * global_scale.float().reshape(())).to(dtype)
 
 
 def _validate_metadata(metadata: torch.Tensor, name: str) -> dict:
@@ -108,12 +151,15 @@ def _matrix_shape(shape: tuple[int, ...], dtype: torch.dtype, name: str) -> tupl
     return rows, cols
 
 
-def inspect_comfy_quantization(paths: list[Path]) -> ComfyQuantization | None:
+def inspect_comfy_quantization(
+    paths: list[Path], dequant_nvfp4=None
+) -> ComfyQuantization | None:
     """Detect explicit Comfy metadata while reading only headers and small tensors.
 
     All shards of one component must be supplied. A directory of alternative
     model variants is not a sharded checkpoint; duplicate tensor names fail.
     This function does not infer quantization from a filename or uint8 dtype.
+    ``dequant_nvfp4`` (lever 24): glob patterns of NVFP4 modules to dequantize at load.
     """
     metadata: dict[str, torch.Tensor] = {}
     shapes: dict[str, tuple[int, ...]] = {}
@@ -183,6 +229,7 @@ def inspect_comfy_quantization(paths: list[Path]) -> ComfyQuantization | None:
         layers,
         {key: shape for key, shape in shapes.items() if key.endswith(".weight")},
         curve_shape,
+        select_dequantized(layers, dequant_nvfp4),
     )
 
 
@@ -205,14 +252,22 @@ def _linear_block_scales(scales: torch.Tensor, rows: int, cols: int, name: str) 
     return linear
 
 
-def convert_comfy_nvfp4(weights: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def convert_comfy_nvfp4(
+    weights: Mapping[str, torch.Tensor],
+    dequant_nvfp4=None,
+    dequant_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor]:
     """Normalize explicitly tagged NVFP4 layers; leave other tensors unchanged.
 
     Keys retain the source model's names. Model adapters own renaming and
     fused-projection changes. The input mapping and tensor storage are not
     modified. Metadata is consumed so the conversion is idempotent.
+    Layers matching ``dequant_nvfp4`` (lever 24) are dequantized to ``dequant_dtype``
+    instead, and their scale tensors are dropped.
     """
     converted = dict(weights)
+    tagged = [k.removesuffix(_METADATA_SUFFIX) for k in weights if k.endswith(_METADATA_SUFFIX)]
+    dequantize = select_dequantized(tagged, dequant_nvfp4)
     for key, metadata in weights.items():
         if not key.endswith(_METADATA_SUFFIX):
             continue
@@ -230,8 +285,17 @@ def convert_comfy_nvfp4(weights: Mapping[str, torch.Tensor]) -> dict[str, torch.
             raise ValueError(f"{name}: NVFP4 global scale must be a float32 scalar")
         if not torch.isfinite(global_scale).all() or (global_scale <= 0).any():
             raise ValueError(f"{name}: NVFP4 global scale must be finite and positive")
+        linear_scales = _linear_block_scales(weights[scale_key], rows, cols, name)
+        if name in dequantize:
+            converted[weight_key] = _dequantize_nvfp4(
+                weight, linear_scales, global_scale, rows, cols, dequant_dtype
+            )
+            del converted[scale_key], converted[global_key]
+            converted.pop(f"{name}.input_scale", None)
+            del converted[key]
+            continue
         converted[weight_key] = (weight << 4) | (weight >> 4)
-        converted[scale_key] = _linear_block_scales(weights[scale_key], rows, cols, name)
+        converted[scale_key] = linear_scales
         # Imported checkpoints use dynamic activation quantization. A source
         # calibration tensor must not be interpreted as a TRT-LLM input scale.
         converted.pop(f"{name}.input_scale", None)
