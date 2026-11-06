@@ -301,7 +301,7 @@ class MiniMaxH3Attention(Attention):
                 timestep=timestep,
                 fp8_descales=descales,
             )
-            return self.to_out[0](hidden_states)
+            return self._out_proj(hidden_states)
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
             # One launch normalizes and rotates Q and K from the packed projection
             # output; V stays a view of the same buffer.
