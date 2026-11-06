@@ -1,0 +1,9 @@
+# §657 lever 22, second measured job (lead ¶15817): the recipe overlays that apply cleanly to the pin c8ee74b9 package.
+# Dropped (reject on the pin, 2026-11-05 dry run): 2 #21275 (FA4 2-CTA default; flash_attn4.py moved), 3 lever 5 (cuDNN padding mask,
+# U1 no-op), 6 lever 8 (FP8 scale fusion: the cuDNN FP8 arm runs the unfused recipe, ~10 % handicap at 19k), 7 lever 13 (async
+# Ulysses, U1 no-op), 9 lever 17 (attention-out NVFP4 quantize, ~1.3 % at 19k), 10 lever 19 (prefix in place, U1 no-op).
+# Same line numbers and shas as final-overlays.txt; files under $S/study/patches/recipe/.
+1   ad401b217d595f13  lever1-21089-rc1.patch
+4   e4acd70846607577  lever9-rc1.patch
+5   ea43b29eb4e89545  lever10-on-lever9-rc1.patch
+8   34f3b1698b3cfdc5  lever14-rc1.patch

@@ -116,7 +116,7 @@ apply_patches() {
   local M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3 m missing=""
   for m in $H3_MARKERS; do grep -q "$m" "$M/transformer_minimax_h3.py" || missing="$missing $m"; done
   for m in $H3_L14_MARKERS; do grep -q "$m" "$M/pipeline_minimax_h3.py" || missing="$missing $m"; done
-  grep -q "H3_CUDNN_PREFIX_INPLACE" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/cudnn.py" || missing="$missing H3_CUDNN_PREFIX_INPLACE(cudnn.py)"
+  grep -q "lever19" "$H3_MANIFEST" && { grep -q "H3_CUDNN_PREFIX_INPLACE" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/cudnn.py" || missing="$missing H3_CUDNN_PREFIX_INPLACE(cudnn.py)"; }
   [[ -z "$missing" ]] && echo "[patch] markers present" || { echo "[patch] MARKERS MISSING:$missing"; exit 2; }
   python -c "import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]; print(\"[patch] composed modules parse\")" "$M/transformer_minimax_h3.py" "$M/pipeline_minimax_h3.py" || exit 2
   echo "[provenance] manifest $(sha256sum $H3_MANIFEST | cut -c1-16) $(basename $H3_MANIFEST)"
@@ -285,7 +285,7 @@ if has side; then
   cp "$H3_SHIP_PROMPTS" "$R/ship-u1/prompts.json"
   gate=($H3_GATE_ARMS); ship=($H3_SHIP_ARMS)
   # three lanes: every gate arm x seeds 42 / 7 / 123 spread by seed, the rerun of the gate arm, then the ship arms
-  ( setenv 1; for a in "${gate[@]}"; do side_gate "$a" 42; done; side_gate "$H3_GATE_RERUN_ARM" 42 -rerun ) & pids+=($!)
+  ( setenv 1; for a in "${gate[@]}"; do side_gate "$a" 42; done; side_gate "$H3_GATE_RERUN_ARM" 42 -rerun; [[ -n ${ship[2]:-} ]] && side_ship "${ship[2]}" ) & pids+=($!)
   ( setenv 2; for a in "${gate[@]}"; do side_gate "$a" 7; done; side_ship "${ship[0]}" ) & pids+=($!)
   ( setenv 3; for a in "${gate[@]}"; do side_gate "$a" 123; done; [[ -n ${ship[1]:-} ]] && side_ship "${ship[1]}" ) & pids+=($!)
 fi
