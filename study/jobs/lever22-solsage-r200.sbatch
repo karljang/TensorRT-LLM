@@ -26,9 +26,10 @@
 # H3_SHIP_ARMS), cmp (hashes, bitcmp p1 vs p2 per arm, gate seed 42 vs rerun).
 # Study overrides, all logged in results.json: H3_UNGATE_TRTLLM=1 (pipeline SM gate), H3_UNGATE_SAGE=1 (recipe table),
 # H3_UNGATE_CUDNN=1 (cuDNN FP8 arm), TLLM_FMHA_LIBS=+prims_ts, CUTE_DSL_ARCH=sm_100f when the pin's DSL < 4.8.
-# Pin fix applied in every overlay mode (the TRTLLM Sol arms need it under torch.compile, ¶15584 defect 1): H3_PIN_FIXES =
-# study/patches/lever22-sol-kernels-pin.patch (sparse/sol/kernels.py do_not_specialize num_blocks; lever 21's overlay 11, same
-# hunk, committed on this branch as 5b7125bc39b). The pin already carries #20224's @torch.compiler.disable (lever 21's overlay 12).
+# Pin fixes applied in every overlay mode (H3_PIN_FIXES): lever21-defect (a) study/patches/lever22-sol-kernels-pin.patch
+# (sparse/sol/kernels.py do_not_specialize num_blocks, needed under torch.compile, ¶15584; 5b7125bc39b) and defect (c)
+# study/patches/lever22-prims-ts-sm107-pin.patch (fmha/prims_ts.py SUPPORTED_SMS gains 107, else the manager never registers
+# PrimsTSBlockSparse on SM 107, ¶15776). The pin already carries #20224's @torch.compiler.disable (lever 21's defect (b)).
 set -uo pipefail
 export H=/lustre/fsw/coreai_comparch_trtllm/kanghwanj/h3
 export S=$H/sweep-nvfp4
@@ -66,7 +67,7 @@ if [[ -z "${H3_PATCHES:-}" && $H3_OVERLAY_MODE != off ]]; then
   done < <(grep -E "^[0-9]+[[:space:]]+[0-9a-f]{16}[[:space:]]" "$H3_MANIFEST" | sort -n)
   export H3_PATCHES; echo "manifest $(sha256sum "$H3_MANIFEST" | cut -c1-16) -> $(echo $H3_PATCHES | wc -w) overlays verified"
 fi
-export H3_PIN_FIXES=${H3_PIN_FIXES:-$WT/study/patches/lever22-sol-kernels-pin.patch}   # applied to the pin package in every overlay mode
+export H3_PIN_FIXES=${H3_PIN_FIXES:-"$WT/study/patches/lever22-sol-kernels-pin.patch $WT/study/patches/lever22-prims-ts-sm107-pin.patch"}   # applied to the pin package in every overlay mode
 for f in $H3_PIN_FIXES; do [[ -f $f ]] || { echo "PIN_FIXES: missing $f"; exit 2; }; done
 export H3_MARKERS=${H3_MARKERS:-"FUSED_QUANT H3_LEVER10_FOLD async_ulysses=use_async_ulysses _l8_norm_rope_tensor recv_view_dtype _l8_rank _use_fused_fp8_qk _out_proj fused_out_quant"}
 export H3_L14_MARKERS=${H3_L14_MARKERS:-"H3_L14_SCHED H3_L14_VAE_FP8 H3_L14_VAE_TILE"}
@@ -95,7 +96,7 @@ dsl=$(python -c "import importlib.metadata as m; print(m.version(\"nvidia-cutlas
 if python -c "import sys; from packaging.version import Version as V; sys.exit(0 if V(\"$dsl\") < V(\"4.8\") else 1)" 2>/dev/null; then export CUTE_DSL_ARCH=sm_100f; fi
 echo "[job] nvidia-cutlass-dsl $dsl CUTE_DSL_ARCH=${CUTE_DSL_ARCH:-unset}"
 dryrun_patches() {  # whole chain on a scratch copy of the pin package; 0 clean, 1 reject
-  local scratch; scratch=$(mktemp -d); mkdir -p "$scratch/tensorrt_llm/_torch"; cp -r "$pkg/tensorrt_llm/_torch/visual_gen" "$scratch/tensorrt_llm/_torch/"
+  local scratch; scratch=$(mktemp -d); mkdir -p "$scratch/tensorrt_llm/_torch"; cp -r "$pkg/tensorrt_llm/_torch/visual_gen" "$pkg/tensorrt_llm/_torch/attention" "$scratch/tensorrt_llm/_torch/"
   local rc=0 p
   for p in "$@"; do
     if ! patch -p1 -d "$scratch" --forward --batch < "$p" > "$R/patch-dryrun-$(basename "$p").log" 2>&1 || grep -qE "FAILED|rejects" "$R/patch-dryrun-$(basename "$p").log"; then
@@ -144,10 +145,11 @@ if dryrun_patches $H3_PIN_FIXES; then
     echo "[pinfix] $(basename "$p") applied"
   done
   grep -q "do_not_specialize" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py" || { echo "[pinfix] marker missing in sol/kernels.py"; exit 2; }
-else echo "[pinfix] rejected on the pin package: abort (the compiled Sol arms would die on the one-block refiner call)"; exit 2; fi
+  grep -q "SUPPORTED_SMS = frozenset({100, 103, 107})" "$pkg/tensorrt_llm/_torch/attention/backends/fmha/prims_ts.py" || { echo "[pinfix] marker missing in fmha/prims_ts.py (SM 107)"; exit 2; }
+else echo "[pinfix] rejected on the pin package: abort (the Sol arms need both: predictor kernel under compile, PrimTS registration on SM 107)"; exit 2; fi
 echo "overlay_mode=$mode model=$MODEL pin_fixes=$(for p in $H3_PIN_FIXES; do basename $p; done | tr "\n" " ")" | tee "$R/overlay-mode.txt"
 M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3
-sha256sum ${H3_PATCHES:-} $H3_PIN_FIXES "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $WT/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
+sha256sum ${H3_PATCHES:-} $H3_PIN_FIXES "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py "$M"/transformer_minimax_h3.py "$M"/pipeline_minimax_h3.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py "$pkg"/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/backend.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts_block_sparse.py "$pkg"/tensorrt_llm/_torch/attention/backends/fmha/prims_ts.py "$pkg"/tensorrt_llm/visual_gen/args.py $WT/study/hecate/probe22/sitecustomize.py $WT/study/hecate/probe/sitecustomize.py $WT/study/e2e-17216/h3_e2e_bench.py $WT/study/hecate/gen_quality.py 2>/dev/null | tee "$R/overlay-sha256.txt" | cut -c1-16,65-
 tag="$(basename "$SQSH") + overlays:$mode $( [[ $mode == on ]] && sha256sum $H3_MANIFEST | cut -c1-16 )"
 
 arm_backend() {  # arm -> harness attention flags
@@ -201,6 +203,8 @@ src = inspect.getsource(sol.SOLTrtllmAttention)
 print("SOLTrtllmAttention mentions quant_attention_config (a rejection in older trees):", "quant_attention_config" in src)
 from tensorrt_llm._torch.attention.backends.prims_ts import context
 print("prims_ts supported cc", context._SUPPORTED_COMPUTE_CAPABILITIES)
+from tensorrt_llm._torch.attention.backends.fmha import prims_ts as pts
+print("PrimsTSFmha.SUPPORTED_SMS", sorted(pts.PrimsTSFmha.SUPPORTED_SMS))
 EOF
   out=$R/probe/solsage-eager-s19k; mkdir -p "$out"
   echo "[probe] eager Sol + Sage (no dense prefix) with --sol-probe start $(date -Is)"
