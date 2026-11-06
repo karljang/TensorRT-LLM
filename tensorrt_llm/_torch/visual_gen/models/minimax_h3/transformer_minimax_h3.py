@@ -22,6 +22,7 @@ linear, attention, normalization, and dynamic-weight-loading modules
 """
 
 import os
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -45,6 +46,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -862,92 +864,90 @@ class MiniMaxH3TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
-        if self._fuse_nvfp4_quantize():
-            return self._forward_fused_adaln_nvfp4(
-                hidden_states, mod, adaln_indices, rotary_emb, key_padding_mask, timestep
+        fuse_qkv, fuse_gate_up, fuse_down = self._nvfp4_producers()
+        if fuse_qkv:
+            codes, scales = h3_norm_mod_fp4(
+                hidden_states,
+                self.norm1.weight,
+                mod,
+                adaln_indices,
+                self.attn.qkv_proj.input_scale,
+                self.norm1.variance_epsilon,
+                1,
+                0,
             )
-        norm_hidden_states = h3_norm_mod(
-            hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
-        )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
-        hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
-            hidden_states,
-            attn_output,
-            self.norm2.weight,
-            mod,
-            adaln_indices,
-            self.norm2.variance_epsilon,
-            2,
-            4,
-            3,
-        )
-        ff_output = self.ff(
-            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
-        ).reshape_as(norm_hidden_states)
+            attn_input = Fp4QuantizedTensor(codes, scales)
+        else:
+            attn_input = h3_norm_mod(
+                hidden_states,
+                self.norm1.weight,
+                mod,
+                adaln_indices,
+                self.norm1.variance_epsilon,
+                1,
+                0,
+            )
+        attn_output = self.attn(attn_input, rotary_emb, key_padding_mask, timestep)
+        if fuse_gate_up:
+            hidden_states, codes, scales = h3_gate_res_norm_mod_fp4(
+                hidden_states,
+                attn_output,
+                self.norm2.weight,
+                mod,
+                adaln_indices,
+                self.ff.gate_up_proj.input_scale,
+                self.norm2.variance_epsilon,
+                2,
+                4,
+                3,
+            )
+            ff_input = Fp4QuantizedTensor(codes.reshape(-1, codes.shape[-1]), scales)
+        else:
+            hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+                hidden_states,
+                attn_output,
+                self.norm2.weight,
+                mod,
+                adaln_indices,
+                self.norm2.variance_epsilon,
+                2,
+                4,
+                3,
+            )
+            ff_input = norm_hidden_states.reshape(-1, hidden_size)
+        if fuse_gate_up or fuse_down:
+            gate_up = self.ff.gate_up_proj(ff_input)
+            if fuse_down:
+                codes, scales = h3_swiglu_fp4(gate_up, self.ff.down_proj.input_scale)
+                activation = Fp4QuantizedTensor(codes, scales)
+            else:
+                # GatedMLP's own SwiGLU; emits FP8 when down_proj is a static-FP8 Linear.
+                activation = self.ff._apply_activation(gate_up)
+            ff_output = self.ff.down_proj(activation, layer_idx=self.ff.layer_idx)
+        else:
+            ff_output = self.ff(ff_input)
+        ff_output = ff_output.reshape_as(hidden_states)
         gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
         return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
-    def _fuse_nvfp4_quantize(self) -> bool:
-        """Whether the norm and SwiGLU producers quantize straight into their NVFP4 Linears.
+    def _nvfp4_producers(self) -> tuple[bool, bool, bool]:
+        """Which producers quantize straight into their consumer Linear: (norm1 -> qkv_proj,
+        gated residual + norm2 -> gate_up_proj, SwiGLU -> down_proj).
 
-        Needs the fused-QKV attention and the fused gate/up MLP over static-NVFP4 Linears
-        (``fused_quant.static_nvfp4_input``); ``H3_FUSED_QUANT=0`` keeps the unfused path.
+        Each is decided per Linear (``fused_quant.static_nvfp4_input``: the plain static-NVFP4
+        method with its calibrated input scale), so under a MIXED_PRECISION checkpoint an FP8
+        Linear gets the BF16 producer and quantizes its input itself while its NVFP4 neighbours
+        keep the fused producer. Needs the fused-QKV attention and the fused gate/up MLP;
+        ``H3_FUSED_QUANT=0`` keeps every producer unfused.
         """
         if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
-            return False
+            return False, False, False
         qkv_proj = getattr(self.attn, "qkv_proj", None)
         return (
-            qkv_proj is not None
-            and static_nvfp4_input(qkv_proj)
-            and static_nvfp4_input(self.ff.gate_up_proj)
-            and static_nvfp4_input(self.ff.down_proj)
+            qkv_proj is not None and static_nvfp4_input(qkv_proj),
+            static_nvfp4_input(self.ff.gate_up_proj),
+            static_nvfp4_input(self.ff.down_proj),
         )
-
-    def _forward_fused_adaln_nvfp4(
-        self,
-        hidden_states: torch.Tensor,
-        mod: torch.Tensor,
-        adaln_indices: torch.Tensor,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        key_padding_mask: Optional[torch.Tensor],
-        timestep: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """``_forward_fused_adaln`` with the producers emitting the Linears' NVFP4 inputs directly."""
-        hidden_size = hidden_states.shape[-1]
-        codes, scales = h3_norm_mod_fp4(
-            hidden_states,
-            self.norm1.weight,
-            mod,
-            adaln_indices,
-            self.attn.qkv_proj.input_scale,
-            self.norm1.variance_epsilon,
-            1,
-            0,
-        )
-        attn_output = self.attn(
-            Fp4QuantizedTensor(codes, scales), rotary_emb, key_padding_mask, timestep
-        )
-        hidden_states, codes, scales = h3_gate_res_norm_mod_fp4(
-            hidden_states,
-            attn_output,
-            self.norm2.weight,
-            mod,
-            adaln_indices,
-            self.ff.gate_up_proj.input_scale,
-            self.norm2.variance_epsilon,
-            2,
-            4,
-            3,
-        )
-        gate_up = self.ff.gate_up_proj(
-            Fp4QuantizedTensor(codes.reshape(-1, codes.shape[-1]), scales)
-        )
-        codes, scales = h3_swiglu_fp4(gate_up, self.ff.down_proj.input_scale)
-        ff_output = self.ff.down_proj(
-            Fp4QuantizedTensor(codes, scales), layer_idx=self.ff.layer_idx
-        ).reshape_as(hidden_states)
-        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
-        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -1141,38 +1141,122 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             hidden_size, audio_in_channels, bias=True, **fp32_linear_kwargs
         )
 
-        self.apply_quant_config_exclude_modules()
+        self.apply_layer_quant_configs()
 
-    def apply_quant_config_exclude_modules(self) -> None:
-        """Drop quantization from Linears the quant config excludes.
+    # TRT-LLM Linears that fuse several checkpoint Linears, and the checkpoint names the
+    # fused module stands for (relative to the parent module). ``load_weights`` reads the
+    # same tensors through ``params_map`` and ``_remap_feed_forward_weights``.
+    _FUSED_CHECKPOINT_LINEARS = {
+        "qkv_proj": ("to_q", "to_k", "to_v"),
+        "gate_up_proj": ("net.0.proj",),
+        "down_proj": ("net.2",),
+    }
 
-        Every Linear is constructed with the model-wide ``quant_config``, so
-        without this an excluded module still builds quantized buffers while
-        ``DynamicLinearWeightLoader`` hands it a high-precision weight -- an FP8
-        buffer left at its default scale of 1.0, or an NVFP4 shape mismatch.
+    @classmethod
+    def _checkpoint_linear_names(cls, name: str) -> tuple[str, ...]:
+        """Checkpoint module names behind TRT-LLM Linear ``name`` (one, or several when fused)."""
+        parent, _, leaf = name.rpartition(".")
+        members = cls._FUSED_CHECKPOINT_LINEARS.get(leaf)
+        if members is None:
+            return (name,)
+        return tuple(f"{parent}.{member}" if parent else member for member in members)
 
-        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights``
-        caches ``quant_method`` and allocates the quantized parameters, and it
-        early-returns once ``_weights_created`` is set. With the default
-        ``skip_create_weights_in_init=False`` that has already happened by the time
-        this runs, so an excluded module would keep its quantized buffers and
-        method. Rebuild those modules so the layout matches the no-quant config.
+    def _layer_quant_config(self, name: str) -> QuantConfig:
+        """The checkpoint's QuantConfig for Linear ``name`` under a MIXED_PRECISION export.
+
+        A fused Linear (QKV, gate/up) must find one precision behind all of its checkpoint
+        names: it holds one weight buffer and one set of scales. A Linear that no group
+        covers is an error, never a silent fallback to the global algorithm.
+        """
+        configs = {
+            ckpt: self.model_config.get_layer_quant_config(ckpt)
+            for ckpt in self._checkpoint_linear_names(name)
+        }
+        missing = [ckpt for ckpt, config in configs.items() if config is None]
+        if missing:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint assigns no precision to Linear '{name}' "
+                f"(checkpoint names {missing}) and does not list it under 'ignore'"
+            )
+        precisions = {(config.quant_algo, config.group_size) for config in configs.values()}
+        if len(precisions) != 1:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint gives the fused Linear '{name}' several precisions: "
+                + ", ".join(f"{ckpt}={config.quant_algo.name}" for ckpt, config in configs.items())
+            )
+        return next(iter(configs.values()))
+
+    def apply_layer_quant_configs(self) -> Counter:
+        """Give every Linear the quant config the checkpoint assigns it, before weights load.
+
+        Every Linear is constructed with the model-wide ``quant_config``. Two kinds of module
+        need another one: the modules ``exclude_modules`` lists keep high precision, and under
+        a MIXED_PRECISION export each quantized Linear takes its group's recipe (NVFP4 or
+        per-tensor FP8). Without this an excluded module would build quantized buffers while
+        ``DynamicLinearWeightLoader`` hands it a high-precision weight (an FP8 buffer left at its
+        default scale of 1.0, or an NVFP4 shape mismatch), and an FP8 Linear would receive an
+        NVFP4 layout.
+
+        ModelOpt writes both lists in the checkpoint's names (``attn.to_q``, ``ff.net.0.proj``),
+        so a fused TRT-LLM Linear is excluded when all of its checkpoint members are; a partial
+        exclusion of one fused Linear is an error.
+
+        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights`` caches
+        ``quant_method`` and allocates the quantized parameters, and it early-returns once
+        ``_weights_created`` is set. With the default ``skip_create_weights_in_init=False`` that
+        has already happened by the time this runs, so the module is rebuilt with the new config.
+
+        Returns the census of Linears per precision (``NVFP4`` / ``FP8`` / ``BF16``), logged once
+        for mixed-precision checkpoints.
         """
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.exclude_modules is None:
-            return
+        census: Counter = Counter()
+        layered = self.model_config.quant_config_dict is not None
+        if quant_config is None or (quant_config.exclude_modules is None and not layered):
+            return census
 
         no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                if quant_config.is_module_excluded_from_quantization(name):
-                    if getattr(module, "quant_config", None) is not None:
-                        module.quant_config = no_quant_config
-                        if getattr(module, "_weights_created", False):
-                            module._weights_created = False
-                            module._parameters.clear()
-                            module._buffers.clear()
-                            module.create_weights()
+            if not isinstance(module, Linear) or getattr(module, "quant_config", None) is None:
+                continue
+            members = self._checkpoint_linear_names(name)
+            excluded = [quant_config.is_module_excluded_from_quantization(m) for m in members]
+            if quant_config.is_module_excluded_from_quantization(name) or all(excluded):
+                target = no_quant_config
+            elif any(excluded):
+                raise ValueError(
+                    f"quant_config.exclude_modules covers only part of the fused Linear '{name}': "
+                    + ", ".join(
+                        f"{m} {'excluded' if e else 'quantized'}" for m, e in zip(members, excluded)
+                    )
+                )
+            elif layered:
+                target = self._layer_quant_config(name)
+                if target.quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.FP8):
+                    raise NotImplementedError(
+                        f"MiniMax-H3 MIXED_PRECISION supports NVFP4 and per-tensor FP8 Linears; "
+                        f"'{name}' asks for {target.quant_algo.name}"
+                    )
+            else:
+                census[quant_config.quant_algo.name if quant_config.quant_algo else "BF16"] += 1
+                continue
+            census[target.quant_algo.name if target.quant_algo else "BF16"] += 1
+            current = module.quant_config
+            if (current.quant_algo, current.group_size) == (target.quant_algo, target.group_size):
+                continue
+            module.quant_config = target
+            if getattr(module, "_weights_created", False):
+                module._weights_created = False
+                module._parameters.clear()
+                module._buffers.clear()
+                module.create_weights()
+        if layered:
+            logger.info(
+                "MiniMax-H3 MIXED_PRECISION checkpoint: "
+                + ", ".join(f"{count} {algo}" for algo, count in sorted(census.items()))
+                + f" Linears ({sum(census.values())} total)"
+            )
+        return census
 
     @property
     def device(self) -> torch.device:
