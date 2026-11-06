@@ -19,6 +19,7 @@
 #   p-tsage-16   TRTLLM dense + Sage fp8/fp8 (1,16,1) (Sage cost / gain on the dense path, 19k only)
 #   p-sol-t2-dB  Sol tau 2, dense prefix B (~10 of 27 steps), BF16 PrimsTS block-sparse (Sage off)
 #   p-solsage-16 the same Sol + Sage fp8/fp8 (1,16,1)   p-solsage-4: (1,4,1), 19k only
+#   p-sol-t2-dA / p-solsage-16-dA  the 4-dense-step cutoff A pair (second measured job, lead ¶15812)
 # Phases (H3_PARTS): probe (DSL version, ops, one eager Sol + Sage generation with lever 21's --sol-probe -> the 27 normalized
 # timesteps and the achieved sparsity; derives the cutoffs A (4 dense) / B (10 dense) unless H3_SOL_CUT_B is given), e2e (GPU 0: 19k
 # x 2 rotated passes, 104k x 1, 38k x 1 last), nsys (GPU 0, timed generation only, 19k + 104k, p-f8 / p-sol-t2-dB /
@@ -162,6 +163,7 @@ arm_backend() {  # arm -> harness attention flags
   p-sol-t2-dA)  echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_A";;
   p-sol-t2-dB)  echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_B";;
   p-solsage-16) echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_B --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,16,1";;
+  p-solsage-16-dA) echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_A --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,16,1";;
   p-solsage-4)  echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_B --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,4,1";;
   p-solsage-1)  echo "--attention-backend TRTLLM --sol $H3_SOL_TAU,$H3_SOL_CUT_B --qk-dtype fp8 --v-dtype fp8 --quant-blocks 1,1,1";;
   esac; }
@@ -174,6 +176,7 @@ arm_variant() {  # arm -> gen_quality variant string
   p-sol-t2-dA)  echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_A";;
   p-sol-t2-dB)  echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_B";;
   p-solsage-16) echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_B:q=fp8:v=fp8:blk=1,16,1";;
+  p-solsage-16-dA) echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_A:q=fp8:v=fp8:blk=1,16,1";;
   p-solsage-4)  echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_B:q=fp8:v=fp8:blk=1,4,1";;
   p-solsage-1)  echo "TRTLLM:sol=$H3_SOL_TAU:dut=$H3_SOL_CUT_B:q=fp8:v=fp8:blk=1,1,1";;
   esac; }
