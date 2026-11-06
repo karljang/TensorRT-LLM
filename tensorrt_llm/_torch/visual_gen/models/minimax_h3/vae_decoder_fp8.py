@@ -16,7 +16,7 @@
 """FP8 per-tensor GEMMs for the MiniMax-H3 VAE ViT decoder (opt-in, ``H3_L14_VAE_FP8=1``).
 
 The decoder's 36 transformer blocks run once per clip in fp16 autocast and are GEMM-bound
-(fp16 ``nvjet`` kernels are 57 % of the decode on R200). Every ``nn.Linear`` under the
+(fp16 ``nvjet`` GEMM kernels dominate the decode). Every ``nn.Linear`` under the
 decoder blocks is replaced by :class:`Fp8Linear`: the weight is quantized once to e4m3 with a
 static per-tensor scale, the activation is quantized per call with a dynamic per-tensor scale,
 and ``torch._scaled_mm`` produces the fp16 output with the original bias. This changes the
@@ -79,7 +79,5 @@ def convert_decoder_linears_fp8(decoder: nn.Module) -> int:
                 if isinstance(child, nn.Linear):
                     setattr(parent, name, Fp8Linear(child))
                     replaced += 1
-    logger.info(
-        f"MiniMax-H3 VAE decoder: {replaced} Linears converted to FP8 per-tensor"
-    )
+    logger.info(f"MiniMax-H3 VAE decoder: {replaced} Linears converted to FP8 per-tensor")
     return replaced
