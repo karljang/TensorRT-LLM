@@ -181,11 +181,16 @@ class MiniMaxH3Attention(Attention):
             if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
                 return False
         cos, sin = rotary_emb
+        # An NVFP4 producer fusion hands the projection input as an Fp4QuantizedTensor
+        # (codes + scales): device, rank and sequence length come from the codes; the
+        # projection output is BF16 either way (_l22_qk_norm_input).
+        codes = getattr(hidden_states, "fp4_tensor", None)
+        x = codes if codes is not None else hidden_states
         if (
-            not hidden_states.is_cuda
-            or hidden_states.dtype != torch.bfloat16
-            or hidden_states.ndim != 3
-            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
+            not x.is_cuda
+            or (codes is None and hidden_states.dtype != torch.bfloat16)
+            or x.ndim != 3
+            or cos.shape != (x.shape[1], cos.shape[-1])
             or sin.shape != cos.shape
             or cos.shape[-1] % 32
             or cos.shape[-1] > self.head_dim
@@ -193,7 +198,7 @@ class MiniMaxH3Attention(Attention):
             return False
         if torch.is_grad_enabled() and any(
             t.requires_grad
-            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
+            for t in (x, cos, sin, self.norm_q.weight, self.norm_k.weight)
         ):
             return False
         return True
