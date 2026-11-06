@@ -30,6 +30,8 @@
 # Pin fixes applied in every overlay mode (H3_PIN_FIXES): lever21-defect (a) study/patches/lever22-sol-kernels-pin.patch
 # (sparse/sol/kernels.py do_not_specialize num_blocks, needed under torch.compile, ¶15584; 5b7125bc39b) and defect (c)
 # study/patches/lever22-prims-ts-sm107-pin.patch (fmha/prims_ts.py SUPPORTED_SMS gains 107, else the manager never registers
+# and study/patches/lever22-qknorm-fp4-pin.patch (transformer_minimax_h3.py _use_fused_qk_norm_rope reads the Fp4QuantizedTensor codes that the
+# lever-9 producer fusion hands in; lever 8, which carries that hunk in rc1, rejects on the pin: job 976231 died on .is_cuda).
 # PrimsTSBlockSparse on SM 107, ¶15776). The pin already carries #20224's @torch.compiler.disable (lever 21's defect (b)).
 set -uo pipefail
 export H=/lustre/fsw/coreai_comparch_trtllm/kanghwanj/h3
@@ -68,7 +70,7 @@ if [[ -z "${H3_PATCHES:-}" && $H3_OVERLAY_MODE != off ]]; then
   done < <(grep -E "^[0-9]+[[:space:]]+[0-9a-f]{16}[[:space:]]" "$H3_MANIFEST" | sort -n)
   export H3_PATCHES; echo "manifest $(sha256sum "$H3_MANIFEST" | cut -c1-16) -> $(echo $H3_PATCHES | wc -w) overlays verified"
 fi
-export H3_PIN_FIXES=${H3_PIN_FIXES:-"$WT/study/patches/lever22-sol-kernels-pin.patch $WT/study/patches/lever22-prims-ts-sm107-pin.patch"}   # applied to the pin package in every overlay mode
+export H3_PIN_FIXES=${H3_PIN_FIXES:-"$WT/study/patches/lever22-sol-kernels-pin.patch $WT/study/patches/lever22-prims-ts-sm107-pin.patch $WT/study/patches/lever22-qknorm-fp4-pin.patch"}   # applied to the pin package in every overlay mode
 for f in $H3_PIN_FIXES; do [[ -f $f ]] || { echo "PIN_FIXES: missing $f"; exit 2; }; done
 export H3_MARKERS=${H3_MARKERS:-"FUSED_QUANT H3_LEVER10_FOLD async_ulysses=use_async_ulysses _l8_norm_rope_tensor recv_view_dtype _l8_rank _use_fused_fp8_qk _out_proj fused_out_quant"}
 export H3_L14_MARKERS=${H3_L14_MARKERS:-"H3_L14_SCHED H3_L14_VAE_FP8 H3_L14_VAE_TILE"}
@@ -148,6 +150,7 @@ if dryrun_patches $H3_PIN_FIXES; then
   done
   grep -q "do_not_specialize" "$pkg/tensorrt_llm/_torch/visual_gen/attention/backends/sparse/sol/kernels.py" || { echo "[pinfix] marker missing in sol/kernels.py"; exit 2; }
   grep -q "SUPPORTED_SMS = frozenset({100, 103, 107})" "$pkg/tensorrt_llm/_torch/attention/backends/fmha/prims_ts.py" || { echo "[pinfix] marker missing in fmha/prims_ts.py (SM 107)"; exit 2; }
+  grep -q "_l22_qk_norm_input" "$M/transformer_minimax_h3.py" || { echo "[pinfix] marker missing in transformer_minimax_h3.py (Fp4 input to the fused QK-norm check)"; exit 2; }
 else echo "[pinfix] rejected on the pin package: abort (the Sol arms need both: predictor kernel under compile, PrimTS registration on SM 107)"; exit 2; fi
 echo "overlay_mode=$mode model=$MODEL pin_fixes=$(for p in $H3_PIN_FIXES; do basename $p; done | tr "\n" " ")" | tee "$R/overlay-mode.txt"
 M=$pkg/tensorrt_llm/_torch/visual_gen/models/minimax_h3

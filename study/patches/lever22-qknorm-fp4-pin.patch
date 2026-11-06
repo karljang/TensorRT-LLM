@@ -1,0 +1,49 @@
+From 4bc66b9f3c0491c93e966891529bb9a59e560c29 Mon Sep 17 00:00:00 2001
+From: Kanghwan Jang <karljang@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 19:55:31 -0800
+Subject: [PATCH] [None][fix] H3 fused QK-norm/RoPE path check accepts an
+ Fp4QuantizedTensor input
+
+The NVFP4 producer fusion hands the attention module codes + scales; read device, rank
+and sequence length from the codes instead of the wrapper (which has no is_cuda).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Kanghwan Jang <karljang@users.noreply.github.com>
+---
+ .../models/minimax_h3/transformer_minimax_h3.py   | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/tensorrt_llm/_torch/visual_gen/models/minimax_h3/transformer_minimax_h3.py b/tensorrt_llm/_torch/visual_gen/models/minimax_h3/transformer_minimax_h3.py
+index e09d334f917..27ce3b5369e 100644
+--- a/tensorrt_llm/_torch/visual_gen/models/minimax_h3/transformer_minimax_h3.py
++++ b/tensorrt_llm/_torch/visual_gen/models/minimax_h3/transformer_minimax_h3.py
+@@ -181,11 +181,16 @@ class MiniMaxH3Attention(Attention):
+             if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
+                 return False
+         cos, sin = rotary_emb
++        # An NVFP4 producer fusion hands the projection input as an Fp4QuantizedTensor
++        # (codes + scales): device, rank and sequence length come from the codes; the
++        # projection output is BF16 either way (_l22_qk_norm_input).
++        codes = getattr(hidden_states, "fp4_tensor", None)
++        x = codes if codes is not None else hidden_states
+         if (
+-            not hidden_states.is_cuda
+-            or hidden_states.dtype != torch.bfloat16
+-            or hidden_states.ndim != 3
+-            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
++            not x.is_cuda
++            or (codes is None and hidden_states.dtype != torch.bfloat16)
++            or x.ndim != 3
++            or cos.shape != (x.shape[1], cos.shape[-1])
+             or sin.shape != cos.shape
+             or cos.shape[-1] % 32
+             or cos.shape[-1] > self.head_dim
+@@ -193,7 +198,7 @@ class MiniMaxH3Attention(Attention):
+             return False
+         if torch.is_grad_enabled() and any(
+             t.requires_grad
+-            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
++            for t in (x, cos, sin, self.norm_q.weight, self.norm_k.weight)
+         ):
+             return False
+         return True
