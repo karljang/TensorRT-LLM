@@ -170,6 +170,17 @@ def _qkv_amax_kernel(
 
 
 @triton.jit
+def _load_amax(amax_ptr, AMAX_N: tl.constexpr, AMAX_STRIDE: tl.constexpr):
+    """The per-tensor amax: one value, or the max over ``AMAX_N`` per-rank values ``AMAX_STRIDE``
+    apart (the gathered rows of ``H3_AMAX_ALLREDUCE=symm``). ``max`` is exact, so the result equals
+    an all-reduce MAX of the same values."""
+    a = tl.load(amax_ptr)
+    for j in tl.static_range(1, AMAX_N):
+        a = tl.maximum(a, tl.load(amax_ptr + j * AMAX_STRIDE))
+    return a
+
+
+@triton.jit
 def _scale_from_amax(amax):
     # cudaFp8Utils.cu: scale = (bf16) max(amax / FP8_E4M3_MAX, 1 / (FP8_E4M3_MAX * 512)); the
     # cast kernel multiplies by 1 / float(scale) and the backend dequantises with float(scale).
@@ -298,6 +309,65 @@ def _reduce_amax(amax: torch.Tensor) -> None:
         torch.distributed.all_reduce(amax, op=torch.distributed.ReduceOp.MAX, group=_REDUCE_GROUP)
 
 
+def _amax_allreduce_mode() -> str:
+    """``H3_AMAX_ALLREDUCE`` = ``nccl`` (default: ``all_reduce(MAX)`` on the Ulysses group) |
+    ``symm``: the split path gathers the per-rank amax rows through torch symmetric memory
+    (``one_shot_all_reduce`` of a zero-padded ``[U, 4]`` buffer: each rank fills only its own row,
+    so the sum is an exact gather) and the cast kernels take the max over the U rows. Bit-identical
+    to ``nccl``: every rank casts with the same max."""
+    mode = os.environ.get("H3_AMAX_ALLREDUCE", "nccl")
+    if mode not in ("nccl", "symm"):
+        raise ValueError(f"H3_AMAX_ALLREDUCE={mode!r}: expected nccl or symm")
+    return mode
+
+
+class _SymmAmax:
+    """Two alternating symmetric ``[U, 4]`` fp32 buffers on the Ulysses group (row ``rank`` holds
+    this rank's Q / K / V amax, column 3 is padding to 16 B). Alternating makes the zeroing for call
+    n + 2 safe against a peer still reading call n."""
+
+    def __init__(self, group, device: torch.device):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.group_name = group.group_name
+        self.rank = torch.distributed.get_rank(group=group)
+        self.world = torch.distributed.get_world_size(group=group)
+        enable = getattr(symm_mem, "enable_symm_mem_for_group", None)
+        if enable is not None:
+            enable(self.group_name)
+        self.bufs = []
+        for _ in range(2):
+            buf = symm_mem.empty((self.world, 4), dtype=torch.float32, device=device)
+            symm_mem.rendezvous(buf, self.group_name)
+            buf.zero_()
+            self.bufs.append(buf)
+        self.i = 0
+
+    def begin(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero the next buffer; returns (buffer, this rank's row) for the amax kernels."""
+        buf = self.bufs[self.i]
+        self.i ^= 1
+        buf.zero_()
+        return buf, buf[self.rank]
+
+    def gather(self, buf: torch.Tensor) -> torch.Tensor:
+        return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.group_name)
+
+
+_SYMM_AMAX: Dict[Tuple[int, int], _SymmAmax] = {}
+
+
+def _symm_amax_state(device: torch.device) -> Optional[_SymmAmax]:
+    if _REDUCE_GROUP is None or _amax_allreduce_mode() != "symm":
+        return None
+    key = (id(_REDUCE_GROUP), device.index if device.index is not None else 0)
+    st = _SYMM_AMAX.get(key)
+    if st is None:
+        st = _SymmAmax(_REDUCE_GROUP, device)
+        _SYMM_AMAX[key] = st
+    return st
+
+
 def _launch_config() -> Tuple[int, int]:
     return (
         int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "4")),
@@ -333,12 +403,17 @@ def _qk_norm_rope_fp8_split(
     width = h * d
     grid = (rows,)
     static = static_descale is not None
+    symm = None
     if static:
         # A custom op's output may not alias an input: copy the static table.
         descale = static_descale.to(torch.float32).contiguous().clone()
         amax = descale
     else:
-        amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
+        symm = _symm_amax_state(qkv.device)
+        if symm is not None:
+            symm_buf, amax = symm.begin()
+        else:
+            amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
         descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
     weights = (weight_q, weight_k, weight_q)
     rot = cos.shape[-1]
@@ -363,15 +438,20 @@ def _qk_norm_rope_fp8_split(
                 ROW_STRIDE=3 * width,
                 num_warps=num_warps,
             )
+    amax_n, amax_stride = 1, 1
     if not static:
-        _reduce_amax(amax)
+        if symm is not None:
+            amax = symm.gather(symm_buf)  # [U, 4]: row u = rank u's amax, exact
+            amax_n, amax_stride = symm.world, 4
+        else:
+            _reduce_amax(amax)
     for i in range(3):
         _tensor_cast_kernel[grid](
             qkv[..., i * width : (i + 1) * width],
             weights[i],
             cos,
             sin,
-            amax[i : i + 1],
+            amax.view(-1)[i:] if amax_n > 1 else amax[i : i + 1],
             descale[i : i + 1],
             outs[i],
             sat[i : i + 1] if sat is not None else descale,
@@ -389,6 +469,8 @@ def _qk_norm_rope_fp8_split(
             PACKED=packed_hl > 0,
             HL=max(packed_hl, 1),
             WHICH=i,
+            AMAX_N=amax_n,
+            AMAX_STRIDE=amax_stride,
             num_warps=num_warps,
         )
     return descale, static, sat
@@ -703,6 +785,8 @@ def _tensor_cast_kernel(
     PACKED: tl.constexpr,
     HL: tl.constexpr,
     WHICH: tl.constexpr,
+    AMAX_N: tl.constexpr = 1,
+    AMAX_STRIDE: tl.constexpr = 1,
 ):
     r = tl.program_id(0)
     t = r % S
@@ -719,7 +803,7 @@ def _tensor_cast_kernel(
         if STATIC:
             s = tl.load(descale_ptr)
         else:
-            s = _scale_from_amax(tl.load(amax_ptr))
+            s = _scale_from_amax(_load_amax(amax_ptr, AMAX_N, AMAX_STRIDE))
             if r == 0:
                 tl.store(descale_ptr, s)
         f = _div_rn(1.0, s)
