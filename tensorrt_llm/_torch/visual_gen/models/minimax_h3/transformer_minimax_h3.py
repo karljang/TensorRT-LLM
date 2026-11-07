@@ -21,7 +21,6 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
-import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -48,12 +47,12 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from . import fused_fp8_qk, fused_quant
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
-from .fused_fp8_qk import fusion_mode, set_reduce_group, static_descale
-from .fused_out_quant import OUT_QUANT_ENABLED, h3_out_quant_fp4
+from .fused_fp8_qk import set_reduce_group, static_descale
+from .fused_out_quant import h3_out_quant_fp4
 from .fused_out_quant import static_nvfp4_input as _l17_static_nvfp4_input
 from .fused_quant import (
-    FUSED_QUANT_ENABLED,
     h3_gate_res_norm_mod_fp4,
     h3_norm_mod_fp4,
     h3_swiglu_fp4,
@@ -63,12 +62,10 @@ from .fused_quant import (
 MINIMAX_H3_MODALITY_NUM = 3
 
 try:  # fused_fp8_qk.py: per-tensor norm + RoPE (+ FP8 cast) for the async Ulysses path
-    from .fused_fp8_qk import fusion_mode as _l8_fusion_mode
     from .fused_fp8_qk import norm_rope_tensor as _l8_norm_rope_tensor
     from .fused_fp8_qk import set_reduce_group as _l8_set_reduce_group
     from .fused_fp8_qk import static_descale as _l8_static_descale
 except ImportError:
-    _l8_fusion_mode = None
     _l8_norm_rope_tensor = None
     _l8_set_reduce_group = None
     _l8_static_descale = None
@@ -179,9 +176,13 @@ class MiniMaxH3Attention(Attention):
         # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
         # each one is pushed to the peers while the next is computed (forward_async).
         use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
+        h3 = model_config.minimax_h3
         backend_kwargs = None
-        if fa4_use_2cta is not None and model_config.attention.backend.upper() == "FA4":
+        backend_name = model_config.attention.backend.upper()
+        if fa4_use_2cta is not None and backend_name == "FA4":
             backend_kwargs = {"use_2cta": fa4_use_2cta}
+        elif backend_name == "CUDNN":
+            backend_kwargs = {"prefix_inplace": h3.cudnn_prefix_inplace}
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -204,6 +205,7 @@ class MiniMaxH3Attention(Attention):
             backend_kwargs=backend_kwargs,
         )
         self.use_async_ulysses = use_async_ulysses
+        self._h3 = h3
 
     def _use_fused_qk_norm_rope(
         self,
@@ -270,7 +272,7 @@ class MiniMaxH3Attention(Attention):
                 static_descale(
                     self.layer_idx, getattr(hidden_states, "fp4_tensor", hidden_states).device
                 )
-                if fusion_mode() == "static"
+                if self._h3.fp8_scale_fusion == "static"
                 else None
             )
             valid_len = None
@@ -345,10 +347,10 @@ class MiniMaxH3Attention(Attention):
     def _out_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``to_out`` on the attention output; with a static-NVFP4 ``to_out`` the BF16 output is quantized
         by ``fused_out_quant`` instead of the Linear's ``fp4_quantize`` and handed over as
-        ``Fp4QuantizedTensor``. ``H3_OUT_QUANT=0`` keeps the Linear's own quantize."""
+        ``Fp4QuantizedTensor``. ``out_quant: false`` keeps the Linear's own quantize."""
         out = self.to_out[0]
         if (
-            OUT_QUANT_ENABLED
+            self._h3.out_quant
             and torch.is_tensor(hidden_states)
             and hidden_states.dtype == torch.bfloat16
             and _l17_static_nvfp4_input(out)
@@ -376,9 +378,13 @@ class MiniMaxH3Attention(Attention):
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
-        """Select the fused QK-norm + RoPE + FP8 cast (H3_FP8_SCALE_FUSION) for the cuDNN
+        """Select the fused QK-norm + RoPE + FP8 cast (``fp8_scale_fusion``) for the cuDNN
         per-tensor FP8 recipe on a packed BF16 projection with equal Q / K head counts."""
-        if fusion_mode() == "off" or self.qkv_mode != QKVMode.FUSE_QKV or not self.qk_norm:
+        if (
+            self._h3.fp8_scale_fusion == "off"
+            or self.qkv_mode != QKVMode.FUSE_QKV
+            or not self.qk_norm
+        ):
             return False
         backend = getattr(self.attn, "inner_backend", self.attn)
         if getattr(backend, "quant_dtype", None) != "fp8":
@@ -431,21 +437,18 @@ class MiniMaxH3Attention(Attention):
         head_dim = self.head_dim
 
         # Pairing with the fused per-tensor norm + RoPE kernel when it is available:
-        # "bf16" fuses norm and RoPE per projection; "fp8" (H3_L13_PAIR=fp8, FP8 attention
-        # backend) also casts to e4m3 before the push, so the all-to-all carries 1-byte codes
-        # viewed as bf16 and the receiver views them back (recv_view_dtype).
+        # "bf16" fuses norm and RoPE per projection; "fp8" (``ulysses_fp8_payload`` with the
+        # FP8 attention backend) also casts to e4m3 before the push, so the all-to-all carries
+        # 1-byte codes viewed as bf16 and the receiver views them back (recv_view_dtype).
         pair = None
         if (
             _l8_norm_rope_tensor is not None
             and rotary_emb is not None
-            and _l8_fusion_mode() != "off"
+            and self._h3.fp8_scale_fusion != "off"
         ):
             backend = getattr(self.attn, "inner_backend", self.attn)
             pair = "bf16"
-            if (
-                os.environ.get("H3_L13_PAIR", "bf16") == "fp8"
-                and getattr(backend, "quant_dtype", None) == "fp8"
-            ):
+            if self._h3.ulysses_fp8_payload and getattr(backend, "quant_dtype", None) == "fp8":
                 pair = "fp8"
         cos, sin = rotary_emb if rotary_emb is not None else (None, None)
         eps = float(self.norm_q.variance_epsilon)
@@ -455,7 +458,7 @@ class MiniMaxH3Attention(Attention):
             if getattr(self.attn, "world_size", 1) > 1:
                 _l8_set_reduce_group(group)
             descales = torch.empty(3, dtype=torch.float32, device=hidden_states.device)
-            if _l8_fusion_mode() == "static":
+            if self._h3.fp8_scale_fusion == "static":
                 static_in = _l8_static_descale(self.layer_idx, hidden_states.device)
             if key_padding_mask is not None:
                 rank = torch.distributed.get_rank(group=group) if group is not None else 0
@@ -813,6 +816,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         )
         # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
         self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
+        self._h3 = model_config.minimax_h3
 
     def forward(
         self,
@@ -891,9 +895,9 @@ class MiniMaxH3TransformerBlock(nn.Module):
         """Whether the norm and SwiGLU producers quantize straight into their NVFP4 Linears.
 
         Needs the fused-QKV attention and the fused gate/up MLP over static-NVFP4 Linears
-        (``fused_quant.static_nvfp4_input``); ``H3_FUSED_QUANT=0`` keeps the unfused path.
+        (``fused_quant.static_nvfp4_input``); ``fused_quant: false`` keeps the unfused path.
         """
-        if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
+        if not self._h3.fused_quant or getattr(self.ff, "split_gate_up", False):
             return False
         qkv_proj = getattr(self.attn, "qkv_proj", None)
         return (
@@ -994,6 +998,20 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "static activation-scale path would read an uninitialized scale."
             )
         self._model_dtype = model_config.torch_dtype
+        # Kernel launch parameters and the FP8 scale mode of the fused kernels, read by their
+        # custom ops at call time; set before the forward is traced.
+        h3 = model_config.minimax_h3
+        fused_quant.configure(num_warps=h3.fused_quant_warps)
+        fused_fp8_qk.configure(
+            mode=h3.fp8_scale_fusion,
+            split=h3.fp8_fusion_split,
+            block_h=h3.fp8_fusion_block_h,
+            num_warps=h3.fp8_fusion_warps,
+            static_scales=h3.fp8_static_scales,
+            static_margin=h3.fp8_static_margin,
+            amax_log=h3.fp8_amax_log,
+            sat_log=h3.fp8_sat_log,
+        )
 
         # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
         # because the fused GEMM is slightly slower than cuBLAS at small M. H3's

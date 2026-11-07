@@ -851,6 +851,189 @@ class RuntimeLoRAConfig(StrictBaseModel):
         return self
 
 
+class MiniMaxH3Config(StrictBaseModel):
+    """MiniMax-H3 pipeline switches: the fused kernels and schedule of the low-precision recipe.
+
+    The fields are the MiniMax-H3 entries of ``VisualGenArgs.pipeline_config`` (the pipeline
+    registry carries this class's defaults as the legal key set, so an unknown key fails at
+    load time) and are validated here when the pipeline config is built. The defaults are the
+    recipe as shipped: a MiniMax-H3 checkpoint with static NVFP4 Linears and
+    ``attention_config.quant_attention_config`` set to FP8 runs every fusion with a bare YAML.
+    Every field is inert where its precondition is missing: the NVFP4 producer fusions apply
+    only to static-NVFP4 Linears, the FP8 scale fusion only to the cuDNN FP8 attention recipe,
+    the prefix write only under Ulysses with a padded sequence. A BF16 checkpoint with BF16
+    attention therefore ignores all but ``schedule``, ``vae_fp8`` and ``vae_tile``.
+    """
+
+    fused_quant: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Quantize the AdaLN-norm and SwiGLU producer outputs straight to NVFP4 for the "
+            "static-NVFP4 qkv_proj, gate_up_proj and down_proj Linears, and fold the MLP "
+            "residual into the next block's norm. Bit-identical to the Linears' own quantize."
+        ),
+    )
+    fused_quant_warps: int = Field(
+        4,
+        ge=1,
+        status="prototype",
+        description="Warps per program of the fused producer quantize kernels.",
+    )
+    out_quant: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Quantize the attention output to NVFP4 for a static-NVFP4 to_out Linear with a "
+            "tiled kernel instead of the Linear's own quantize. Bit-identical."
+        ),
+    )
+    fp8_scale_fusion: Literal["off", "dynamic", "static"] = Field(
+        "dynamic",
+        status="prototype",
+        description=(
+            "cuDNN FP8 attention inputs: fuse QK-norm, RoPE and the per-tensor FP8 cast of Q, K "
+            "and V into one amax pass and one cast pass. 'dynamic' measures the amax per call, "
+            "'static' takes the per-layer descales from fp8_static_scales and skips the amax "
+            "pass, 'off' runs the unfused norm, RoPE and quantize kernels."
+        ),
+    )
+    fp8_fusion_split: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Launch the fused FP8 cast once per tensor (three amax, three cast launches) "
+            "instead of once over the packed QKV row. Same arithmetic."
+        ),
+    )
+    fp8_static_scales: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "JSON file with the per-layer FP8 descales (q, k, v) for fp8_scale_fusion: static, "
+            "as written by fp8_amax_log."
+        ),
+    )
+    fp8_static_margin: float = Field(
+        1.0,
+        gt=0.0,
+        status="prototype",
+        description=(
+            "Multiplier on the static descales. Values above 1.0 widened the scale and striped "
+            "the output in the calibration study; keep 1.0."
+        ),
+    )
+    fp8_fusion_block_h: int = Field(
+        4,
+        ge=1,
+        status="prototype",
+        description="Heads per program of the fused FP8 cast. Tuned launch at every shape; do not change.",
+    )
+    fp8_fusion_warps: int = Field(
+        2,
+        ge=1,
+        status="prototype",
+        description="Warps per program of the fused FP8 cast. Tuned launch at every shape; do not change.",
+    )
+    fp8_amax_log: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Calibration only: write the running maximum FP8 descale per layer to this JSON "
+            "file at exit (the input of fp8_static_scales). Under Ulysses each rank appends "
+            ".rank<N>."
+        ),
+    )
+    fp8_sat_log: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Calibration only: count the elements saturated by the FP8 cast per layer and write "
+            "them to this JSON file at exit."
+        ),
+    )
+    ulysses_fp8_payload: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "With parallel_config.async_ulysses and the cuDNN FP8 attention recipe: cast Q, K "
+            "and V to FP8 before the all-to-all so the exchange carries one-byte codes."
+        ),
+    )
+    cudnn_prefix_inplace: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "cuDNN attention under Ulysses: write each item's valid-prefix output straight into "
+            "the padded output buffer instead of pad + concatenate per layer. Same cuDNN plan; "
+            "a no-op when the token count divides by the Ulysses size."
+        ),
+    )
+    schedule: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Request schedule around the steps: the per-step velocity check is reduced on the "
+            "device and read back once after the loop, the per-step row-timestep plan moves to "
+            "the device in one transfer, and the audio decode overlaps the video decode on a "
+            "side stream. Bit-identical."
+        ),
+    )
+    vae_fp8: bool = Field(
+        True,
+        status="prototype",
+        description=(
+            "Run the VAE ViT decoder's Linears as FP8 per-tensor GEMMs (static e4m3 weight, "
+            "dynamic activation scale). Changes the decoded pixels."
+        ),
+    )
+    vae_tile: Optional[str] = Field(
+        "288x272x32",
+        status="prototype",
+        description=(
+            "VAE decoder spatial tile as HxW or HxWxO pixels (tile height x width x minimum "
+            "overlap, default overlap 32). The decoder's RoPE is normalised per tile, so this "
+            "changes the decoded pixels. None keeps the decoder's own 256x256x64 tiling."
+        ),
+    )
+
+    @classmethod
+    def from_pipeline_config(cls, pipeline_config: Dict[str, Any]) -> "MiniMaxH3Config":
+        """Build the group from a resolved ``pipeline_config``.
+
+        The dict is the registry defaults merged with the user's keys; keys of other
+        pipelines are ignored, so every pipeline config yields one group, the defaults
+        for pipelines that do not read it.
+        """
+        return cls.model_validate(
+            {k: v for k, v in pipeline_config.items() if k in cls.model_fields}
+        )
+
+    @property
+    def vae_tile_geometry(self) -> Optional[Tuple[int, int, int]]:
+        """``(tile_height, tile_width, min_overlap)`` from ``vae_tile``, or ``None``."""
+        if not self.vae_tile:
+            return None
+        parts = [int(p) for p in self.vae_tile.lower().split("x")]
+        if len(parts) == 2:
+            parts.append(32)
+        return parts[0], parts[1], parts[2]
+
+    @model_validator(mode="after")
+    def _validate(self) -> "MiniMaxH3Config":
+        if self.fp8_scale_fusion == "static" and not self.fp8_static_scales:
+            raise ValueError(
+                "pipeline_config.fp8_scale_fusion: static needs pipeline_config.fp8_static_scales"
+            )
+        if self.vae_tile:
+            parts = self.vae_tile.lower().split("x")
+            if len(parts) not in (2, 3) or not all(p.isdigit() and int(p) > 0 for p in parts):
+                raise ValueError(
+                    f"pipeline_config.vae_tile must be HxW or HxWxO in pixels, got {self.vae_tile!r}"
+                )
+        return self
+
+
 # =============================================================================
 # VisualGenArgs - User-facing configuration (CLI / YAML)
 # =============================================================================

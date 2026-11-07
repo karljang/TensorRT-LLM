@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
+    MiniMaxH3Config,
     ParallelConfig,
     RuntimeLoRAConfig,
     TeaCacheConfig,
@@ -140,6 +141,8 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    # Model-specific switches; read by the MiniMax-H3 modules only.
+    minimax_h3: MiniMaxH3Config = PydanticField(default_factory=MiniMaxH3Config)
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -215,6 +218,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
     runtime_lora: Optional[RuntimeLoRAConfig] = None
+    # MiniMax-H3 switches from pipeline_config; read by the MiniMax-H3 pipeline and modules only.
+    minimax_h3: MiniMaxH3Config = PydanticField(default_factory=MiniMaxH3Config)
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -290,6 +295,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
             cache=_model_config_value(self.cache),
+            minimax_h3=_model_config_value(self.minimax_h3),
             enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
 
@@ -634,6 +640,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
         extra_attrs.update(resolved_pipeline_config)
+        # MiniMax-H3 recipe switches: the pipeline_config keys the H3 registry entry declares,
+        # validated here; the defaults for every other pipeline.
+        minimax_h3_cfg = MiniMaxH3Config.from_pipeline_config(resolved_pipeline_config)
 
         model_index_path = checkpoint_path / "model_index.json"
         if not model_index_path.exists():
@@ -841,6 +850,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             cache=cache_cfg,
             device=device,
             runtime_lora=runtime_lora_cfg,
+            minimax_h3=minimax_h3_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,

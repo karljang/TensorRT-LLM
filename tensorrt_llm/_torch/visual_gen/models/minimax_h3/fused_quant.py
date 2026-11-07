@@ -33,7 +33,6 @@ Access pattern: one row per program, 1024-column register chunks loaded contiguo
 odd split happens in registers), packed codes stored 8 per 32-bit word.
 """
 
-import os
 from typing import Optional
 
 import torch
@@ -43,9 +42,20 @@ import triton.language as tl
 # "trtllm" inside the package; the study tree imports this file as h3_fused_quant and registers
 # the same ops under "h3study" so both can coexist in one process.
 _NS = "h3study" if __name__.startswith("h3_") else "trtllm"
-_ENV = os.environ.get("H3_FUSED_QUANT", "1")
-FUSED_QUANT_ENABLED = _ENV not in ("0", "off", "false")
-NUM_WARPS = int(os.environ.get("H3_FUSED_QUANT_WARPS", "4"))
+
+# Launch width of the producer kernels, set from ``MiniMaxH3Config.fused_quant_warps`` by the
+# transformer at construction (``configure``); the custom ops read it at call time.
+DEFAULT_NUM_WARPS = 4
+_NUM_WARPS = DEFAULT_NUM_WARPS
+
+
+def configure(num_warps: int = DEFAULT_NUM_WARPS) -> None:
+    """Set the warps per program of the fused producer quantize kernels."""
+    global _NUM_WARPS
+    if num_warps < 1:
+        raise ValueError(f"fused_quant_warps must be >= 1, got {num_warps}")
+    _NUM_WARPS = int(num_warps)
+
 
 _CH = 1024
 CH = tl.constexpr(_CH)
@@ -401,7 +411,7 @@ def _launch_adaln(
         swizzled_sf_ktiles(D),
         HAS_RES=has_res,
         CH=_CH,
-        num_warps=num_warps or NUM_WARPS,
+        num_warps=num_warps or _NUM_WARPS,
     )
     return x1, xq, sf
 
@@ -428,7 +438,7 @@ def _launch_swiglu(h, gs, num_warps=None):
         swiglu_alpha=1.0,
         swiglu_beta=0.0,
         CH=_CH,
-        num_warps=num_warps or NUM_WARPS,
+        num_warps=num_warps or _NUM_WARPS,
     )
     return xq, sf
 

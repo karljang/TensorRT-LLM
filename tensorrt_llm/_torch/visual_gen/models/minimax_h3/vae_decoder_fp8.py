@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP8 per-tensor GEMMs for the MiniMax-H3 VAE ViT decoder (opt-in, ``H3_L14_VAE_FP8=1``).
+"""FP8 per-tensor GEMMs for the MiniMax-H3 VAE ViT decoder (``MiniMaxH3Config.vae_fp8``).
 
 The decoder's 36 transformer blocks run once per clip in fp16 autocast and are GEMM-bound
 (fp16 ``nvjet`` GEMM kernels dominate the decode). Every ``nn.Linear`` under the

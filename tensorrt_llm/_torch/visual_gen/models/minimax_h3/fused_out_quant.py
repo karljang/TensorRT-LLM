@@ -29,32 +29,18 @@ through PTX so the compiler cannot fold it; the output equals
 ``fp4_quantize(x, input_scale, 16, sf_use_ue8m0=False)`` byte for byte.
 """
 
-import os
-from typing import Tuple
-
 import torch
 import triton
 import triton.language as tl
 
 # "trtllm" inside the package; the study tree imports this file as h3_fused_out_quant.
 _NS = "h3study" if __name__.startswith("h3_") else "trtllm"
-_ENV = os.environ.get("H3_OUT_QUANT", "1")
-OUT_QUANT_ENABLED = _ENV not in ("0", "off", "false")
 
-
-def _launch_config() -> Tuple[int, int, int]:
-    """(rows per program, columns per program, warps) from the environment.
-
-    Defaults are the R200 sweep best: 16 rows x 512 columns per program, 4 warps.
-    """
-    rb = int(os.environ.get("H3_OUT_QUANT_RB", "16"))
-    ch = int(os.environ.get("H3_OUT_QUANT_CH", "512"))
-    warps = int(os.environ.get("H3_OUT_QUANT_WARPS", "4"))
-    if rb & (rb - 1) or ch & (ch - 1) or ch % 16 or rb < 1 or ch < 16:
-        raise ValueError(
-            f"H3_OUT_QUANT_RB / _CH must be powers of two, CH a multiple of 16: {rb}, {ch}"
-        )
-    return rb, ch, warps
+# Tile per program (rows x columns) and warps: the tuned launch; ``_launch`` takes overrides
+# for sweeps.
+ROWS_PER_PROGRAM = 16
+COLS_PER_PROGRAM = 512
+NUM_WARPS = 4
 
 
 def swizzled_sf_rows(m: int) -> int:
@@ -207,10 +193,13 @@ def _launch(x: torch.Tensor, gs: torch.Tensor, rb=None, ch=None, num_warps=None)
         x2 = x2.contiguous()
     rows = x2.shape[0]
     rows_sf = swizzled_sf_rows(rows)
-    cfg = _launch_config()
-    rb = rb or cfg[0]
-    ch = ch or cfg[1]
-    num_warps = num_warps or cfg[2]
+    rb = rb or ROWS_PER_PROGRAM
+    ch = ch or COLS_PER_PROGRAM
+    num_warps = num_warps or NUM_WARPS
+    if rb & (rb - 1) or ch & (ch - 1) or ch % 16 or rb < 1 or ch < 16:
+        raise ValueError(
+            f"rows / columns per program must be powers of two, columns a multiple of 16: {rb}, {ch}"
+        )
     xq = torch.empty((rows, K // 2), dtype=torch.uint8, device=x.device)
     sf = torch.empty((sf_numel(rows, K),), dtype=torch.uint8, device=x.device)
     grid = (triton.cdiv(rows_sf, rb), triton.cdiv(K, ch))

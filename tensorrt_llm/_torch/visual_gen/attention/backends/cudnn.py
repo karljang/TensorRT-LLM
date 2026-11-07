@@ -38,7 +38,6 @@ that they never read those rows.
 """
 
 import math
-import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
@@ -52,9 +51,6 @@ from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 from ....attention.backends.interface import PredefinedAttentionMask
 from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
-
-# Opt-in: write the padded-prefix attention output in place instead of pad + cat.
-_PREFIX_INPLACE = os.environ.get("H3_CUDNN_PREFIX_INPLACE", "0") == "1"
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -266,6 +262,7 @@ class CuDNNAttention(AttentionBackend):
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
+        prefix_inplace: bool = False,
         **kwargs,
     ):
         self.layer_idx = layer_idx
@@ -273,6 +270,9 @@ class CuDNNAttention(AttentionBackend):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype or torch.bfloat16
+        # Padding mask: write each item's valid-prefix output straight into the padded output
+        # buffer instead of pad + cat per layer (``MiniMaxH3Config.cudnn_prefix_inplace``).
+        self.prefix_inplace = bool(prefix_inplace)
         self.quant_attention_config = quant_attention_config
         self.quant_dtype = self.check_quant_dtype(quant_attention_config)
         self.check_library_feature(self.quant_dtype)
@@ -989,7 +989,7 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError("cuDNN padding mask must be boolean with shape [batch, sequence].")
         lengths = self._padding_prefix_lengths(key_padding_mask)
         seq_len = q.shape[1]
-        if _PREFIX_INPLACE:
+        if self.prefix_inplace:
             # In-place prefix write: one padded output buffer; cuDNN writes each item's valid
             # prefix straight into it and only the padding rows are zero-filled, instead of a
             # full-size zero-fill (F.pad) plus a full copy (torch.cat) per layer. Same cuDNN

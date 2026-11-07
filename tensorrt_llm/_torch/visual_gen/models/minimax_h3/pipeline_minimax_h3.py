@@ -17,7 +17,6 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
-import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -46,6 +45,7 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
+from tensorrt_llm.visual_gen.args import MiniMaxH3Config
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -80,31 +80,6 @@ from .vae_decoder_fp8 import convert_decoder_linears_fp8
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
-
-# Opt-in switches for the work outside the transformer steps.
-#   H3_L14_SCHED=1    schedule only, bit-identical: the per-step velocity check is reduced on
-#                     device and read back once after the loop, the per-step row-timestep plan
-#                     moves to the device in one transfer, and the audio decode runs on a side
-#                     stream overlapped with the video decode.
-#   H3_L14_VAE_FP8=1  the VAE ViT decoder's Linears run as FP8 per-tensor GEMMs
-#                     (vae_decoder_fp8.py); changes the decoded pixels.
-#   H3_L14_VAE_TILE=HxW[xO]  VAE decoder spatial tile geometry in pixels (tile height x width x
-#                     minimum overlap, default overlap 32; the default geometry is 256x256x64).
-#                     The decoder's RoPE is normalised per tile, so this changes the decoded pixels.
-_L14_SCHED = os.environ.get("H3_L14_SCHED") == "1"
-_L14_VAE_FP8 = os.environ.get("H3_L14_VAE_FP8") == "1"
-_L14_VAE_TILE = os.environ.get("H3_L14_VAE_TILE", "")
-
-
-def _l14_tile_geometry() -> tuple[int, int, int] | None:
-    if not _L14_VAE_TILE:
-        return None
-    parts = [int(p) for p in _L14_VAE_TILE.lower().split("x")]
-    if len(parts) == 2:
-        parts.append(32)
-    if len(parts) != 3:
-        raise ValueError(f"H3_L14_VAE_TILE must be HxW or HxWxO, got {_L14_VAE_TILE!r}")
-    return parts[0], parts[1], parts[2]
 
 
 def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
@@ -210,7 +185,8 @@ def _raise_deferred_denoise_checks(pending: list[tuple[str, int, torch.Tensor]])
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
-    defaults={"workflow": "fl2va"},
+    # workflow plus the recipe switches of MiniMaxH3Config (its defaults are the recipe).
+    defaults={"workflow": "fl2va", **MiniMaxH3Config().model_dump()},
     download_patterns=[
         "modular_model_index.json",
         "LICENSE",
@@ -248,6 +224,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
+        # Recipe switches outside the transformer steps (schedule, VAE decoder); the
+        # transformer reads its own from the same group through its model config.
+        self._h3 = pipeline_config.minimax_h3
         self.text_encoder_tp_size = int(
             getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
         )
@@ -617,7 +596,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
         if self.vae is not None and self.device.type == "cuda":
-            tile = _l14_tile_geometry()
+            tile = self._h3.vae_tile_geometry
             if tile is not None:
                 # Before the decoder calibration, which measures one tile of this geometry.
                 self.vae.enable_tiling(
@@ -630,7 +609,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                     f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]}"
                 )
             _prepare_vae_decoder(self.vae)
-            if _L14_VAE_FP8:
+            if self._h3.vae_fp8:
                 convert_decoder_linears_fp8(self.vae.decoder)
 
     def torch_compile(self) -> None:
@@ -1317,7 +1296,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"{len(self.scheduler.timesteps)} vs "
                 f"{len(self.audio_scheduler.timesteps)} steps."
             )
-        if _L14_SCHED:
+        if self._h3.schedule:
             # Two read-backs for the whole schedule instead of one float() sync per step and stream.
             timestep_pairs = zip(
                 self.scheduler.timesteps.tolist(), self.audio_scheduler.timesteps.tolist()
@@ -1334,7 +1313,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             )
             for video_timestep, audio_timestep in timestep_pairs
         ]
-        if _L14_SCHED:
+        if self._h3.schedule:
             # One transfer per tensor kind instead of two per step (bit-identical values).
             unique_sizes = [int(plan[0].numel()) for plan in host_plan]
             unique_all = torch.cat([plan[0] for plan in host_plan]).to(self.device)
@@ -1399,7 +1378,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             # loudly at the step that produced it instead of shipping the
             # corruption downstream.
             audio_velocity = audio_velocity[:, audio_condition_rows:]
-            if _L14_SCHED:
+            if self._h3.schedule:
                 # Reduce on device now, read every step's flags back once after the loop:
                 # the result is still refused, without a host sync per step.
                 pending_checks.append(
@@ -1435,7 +1414,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             latent_width,
         )
         decode_audio = lambda rows: self._decode_audio(rows, num_audio_latents)  # noqa: E731
-        if _L14_SCHED:
+        if self._h3.schedule:
             video, audio = self._decode_latents_overlapped(
                 latents, decode_video, audio_latents, decode_audio
             )

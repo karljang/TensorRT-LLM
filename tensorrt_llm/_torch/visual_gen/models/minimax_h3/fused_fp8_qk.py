@@ -10,8 +10,8 @@ launches over the packed buffer:
   pass 1  per-tensor amax of the normalised, rotated Q and K and of V      (dynamic scales)
   pass 2  recompute, scale, cast to FP8; program 0 writes the three descales
 
-With static scales (``H3_FP8_SCALE_FUSION=static``, scales from ``H3_FP8_STATIC_SCALES``)
-pass 1 is skipped.
+With static scales (``fp8_scale_fusion: static``, scales from ``fp8_static_scales``) pass 1
+is skipped.
 
 The scale arithmetic reproduces TensorRT-LLM's per-tensor quantizer
 (``cpp/tensorrt_llm/common/cudaFp8Utils.cu``): ``scale = bf16(max(amax / 448, 1 / (448 * 512)))``,
@@ -20,16 +20,15 @@ RoPE arithmetic follows the compiled eager path: fp32 math, one rounding to BF16
 ``x * rsqrt(mean(x^2) + eps)``, the weight multiply and the rotation in fp32 with the BF16-rounded
 ``cos`` / ``sin``, one rounding to BF16 before the cast.
 
-Control: ``H3_FP8_SCALE_FUSION`` = ``0`` (off, default) | ``dynamic`` | ``static``.
-Calibration: ``H3_FP8_AMAX_LOG=<json>`` records the running maximum descale per layer and
-writes it at interpreter exit (input for the static mode).
+Control: the ``fp8_*`` fields of ``MiniMaxH3Config`` (``VisualGenArgs.minimax_h3``), applied
+by the transformer at construction through ``configure``. ``fp8_amax_log`` records the running
+maximum descale per layer and writes it at interpreter exit (input for the static mode).
 """
 
 from __future__ import annotations
 
 import atexit
 import json
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -267,17 +266,15 @@ def _reduce_amax(amax: torch.Tensor) -> None:
 
 
 def _launch_config() -> Tuple[int, int]:
-    return (
-        int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "4")),
-        int(os.environ.get("H3_FP8_FUSION_WARPS", "2")),
-    )
+    """(heads per program, warps) of the fused cast, from ``configure``."""
+    return _BLOCK_H, _NUM_WARPS
 
 
 def _split_launch() -> bool:
-    """``H3_FP8_FUSION_SPLIT=1``: one launch per tensor (three amax, three cast) through the
+    """``fp8_fusion_split``: one launch per tensor (three amax, three cast) through the
     per-tensor kernels with the packed row stride, instead of one launch over the packed row:
     the same arithmetic, three times the programs with a third of the work each."""
-    return os.environ.get("H3_FP8_FUSION_SPLIT", "0") == "1"
+    return _SPLIT
 
 
 def _qk_norm_rope_fp8_split(
@@ -731,24 +728,48 @@ def norm_rope_tensor(
 # ----------------------------------------------------------------------------------------------
 
 
-def _read_fusion_mode() -> str:
-    mode = os.environ.get("H3_FP8_SCALE_FUSION", "0").strip().lower()
-    if mode in ("", "0", "off", "false", "no"):
-        return "off"
-    if mode in ("1", "dynamic", "dyn", "on"):
-        return "dynamic"
-    if mode == "static":
-        return "static"
-    raise ValueError(f"H3_FP8_SCALE_FUSION={mode!r}: expected 0, dynamic or static")
+_MODE = "off"
+_SPLIT = False
+_BLOCK_H = 4
+_NUM_WARPS = 2
+_STATIC_PATH: Optional[str] = None
+_STATIC_MARGIN = 1.0
+_AMAX_LOG: Optional[str] = None
+_SAT_LOG: Optional[str] = None
 
 
-# Read once at import so the compiled transformer sees a constant (no environment access in
-# the traced forward).
-_MODE = _read_fusion_mode()
+def configure(
+    mode: str = "off",
+    split: bool = False,
+    block_h: int = 4,
+    num_warps: int = 2,
+    static_scales: Optional[str] = None,
+    static_margin: float = 1.0,
+    amax_log: Optional[str] = None,
+    sat_log: Optional[str] = None,
+) -> None:
+    """Apply the ``fp8_*`` fields of ``MiniMaxH3Config``. Called by the transformer at
+    construction, before the forward is traced, so the compiled graph sees constants."""
+    global _MODE, _SPLIT, _BLOCK_H, _NUM_WARPS, _STATIC_PATH, _STATIC_MARGIN, _AMAX_LOG, _SAT_LOG
+    global _STATIC_TABLE
+    if mode not in ("off", "dynamic", "static"):
+        raise ValueError(f"fp8_scale_fusion={mode!r}: expected off, dynamic or static")
+    if mode == "static" and not static_scales:
+        raise ValueError("fp8_scale_fusion: static needs fp8_static_scales")
+    _MODE = mode
+    _SPLIT = bool(split)
+    _BLOCK_H = int(block_h)
+    _NUM_WARPS = int(num_warps)
+    _STATIC_PATH = static_scales
+    _STATIC_MARGIN = float(static_margin)
+    _AMAX_LOG = amax_log or None
+    _SAT_LOG = sat_log or None
+    _STATIC_TABLE = None
+    _STATIC_CACHE.clear()
 
 
 def fusion_mode() -> str:
-    """``off`` | ``dynamic`` | ``static`` from ``H3_FP8_SCALE_FUSION`` (read at import)."""
+    """``off`` | ``dynamic`` | ``static`` as set by ``configure``."""
     return _MODE
 
 
@@ -758,11 +779,11 @@ _STATIC_CACHE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
 
 @torch.compiler.disable
 def static_descale(layer_idx: int, device: torch.device) -> torch.Tensor:
-    """Per-layer ``[3]`` fp32 descale (q, k, v) from the JSON named by ``H3_FP8_STATIC_SCALES``.
+    """Per-layer ``[3]`` fp32 descale (q, k, v) from the JSON named by ``fp8_static_scales``.
 
     The file maps ``str(layer_idx)`` to ``[descale_q, descale_k, descale_v]`` (the running maxima
-    written by the calibration log, optionally scaled by ``H3_FP8_STATIC_MARGIN``, default 1.0).
-    Each value is rounded to BF16 like the dynamic quantizer's scale.
+    written by the calibration log, scaled by ``fp8_static_margin``). Each value is rounded to
+    BF16 like the dynamic quantizer's scale.
     """
     global _STATIC_TABLE
     key = (layer_idx, device)
@@ -770,30 +791,26 @@ def static_descale(layer_idx: int, device: torch.device) -> torch.Tensor:
     if cached is not None:
         return cached
     if _STATIC_TABLE is None:
-        path = os.environ.get("H3_FP8_STATIC_SCALES")
-        if not path:
-            raise RuntimeError("H3_FP8_SCALE_FUSION=static needs H3_FP8_STATIC_SCALES=<json>")
-        with open(path) as f:
+        if not _STATIC_PATH:
+            raise RuntimeError("fp8_scale_fusion: static needs fp8_static_scales")
+        with open(_STATIC_PATH) as f:
             table = json.load(f)
         # Either a bare {layer: [dq, dk, dv]} map or the calibration log's {"descale_max": {...}}.
         _STATIC_TABLE = table.get("descale_max", table)
-    margin = float(os.environ.get("H3_FP8_STATIC_MARGIN", "1.0"))
     values = _STATIC_TABLE[str(layer_idx)]
-    t = torch.tensor([float(v) * margin for v in values], dtype=torch.float32)
+    t = torch.tensor([float(v) * _STATIC_MARGIN for v in values], dtype=torch.float32)
     t = t.clamp_min(MIN_SCALING_FACTOR).to(torch.bfloat16).to(torch.float32).to(device)
     _STATIC_CACHE[key] = t
     return t
 
 
-_AMAX_LOG = os.environ.get("H3_FP8_AMAX_LOG") or None
-_SAT_LOG = os.environ.get("H3_FP8_SAT_LOG") or None
 _RUNNING: Dict[int, torch.Tensor] = {}
 _SAT: Dict[int, torch.Tensor] = {}
 _SAT_CALLS: Dict[int, int] = {}
 
 
 def _sat_buffer(device: torch.device, n: int) -> Optional[torch.Tensor]:
-    """Per-call saturation counters (elements clipped at +-448), only with ``H3_FP8_SAT_LOG``."""
+    """Per-call saturation counters (elements clipped at +-448), only with ``fp8_sat_log``."""
     if _SAT_LOG is None:
         return None
     return torch.zeros(n, dtype=torch.int32, device=device)
@@ -829,11 +846,16 @@ def _dump_amax_log() -> None:
         "calls": {str(k): v for k, v in sorted(_CALLS.items())},
         "note": "descale = max(amax / 448, 1 / (448 * 512)) rounded to bf16; q, k, v per layer",
     }
-    path = (
-        f"{_AMAX_LOG}.pid{os.getpid()}" if os.environ.get("H3_FP8_AMAX_LOG_PER_PID") else _AMAX_LOG
-    )
-    with open(path, "w") as f:
+    with open(_AMAX_LOG + _rank_suffix(), "w") as f:
         json.dump(payload, f, indent=1)
+
+
+def _rank_suffix() -> str:
+    """``.rank<N>`` when several ranks share one log name (Ulysses), else empty."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_world_size() > 1:
+            return f".rank{torch.distributed.get_rank()}"
+    return ""
 
 
 def _dump_sat_log() -> None:
@@ -845,7 +867,7 @@ def _dump_sat_log() -> None:
         "calls": {str(k): v for k, v in sorted(_SAT_CALLS.items())},
         "note": "elements with |x / scale| > 448 before the saturating FP8 cast, run total; q, k, v per layer",
     }
-    with open(_SAT_LOG, "w") as f:
+    with open(_SAT_LOG + _rank_suffix(), "w") as f:
         json.dump(payload, f, indent=1)
 
 
