@@ -890,6 +890,59 @@ class UlyssesAttention(AttentionBackend):
         )
         return output
 
+    @torch.compiler.disable
+    def forward_packed_fp8(
+        self,
+        send: torch.Tensor,
+        *,
+        fp8_descales: torch.Tensor,
+        return_pre_a2a: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Ulysses forward over a pre-packed FP8 send buffer (one sequence, ``B = 1``).
+
+        ``send`` is ``[U, S_local, 3, H / U, D]`` float8_e4m3fn, written by the producer directly
+        in exchange order (chunk ``u`` = this shard's tokens for the heads rank ``u`` owns). One
+        ``all_to_all_single`` moves it; the receive buffer, indexed by source rank, is the full
+        sequence in token order, ``[S, 3, H / U, D]``, so Q, K and V are strided views of it and
+        the inner backend (cuDNN, explicit strides) reads them without a permute copy.
+
+        Returns ``[1, S_local, H, D]`` after the output all-to-all, or with ``return_pre_a2a`` the
+        attention output ``[1, S, H / U, D]`` before it, for a caller that exchanges the output in
+        another format.
+        """
+        if send.dim() != 5 or send.shape[0] != self.world_size:
+            raise ValueError(
+                f"packed send buffer must be [U={self.world_size}, S_local, 3, H/U, D]; "
+                f"got {tuple(send.shape)}"
+            )
+        _, s_local, three, h_local, d = send.shape
+        if three != 3 or h_local != self.sharded_num_heads or d != self.head_dim:
+            raise ValueError(
+                f"packed send buffer shape {tuple(send.shape)} does not match the backend"
+            )
+        recv = torch.empty_like(send)
+        # NCCL moves bytes: view the FP8 codes as uint8 for the collective.
+        torch.distributed.all_to_all_single(
+            recv.view(torch.uint8).view(-1),
+            send.view(torch.uint8).view(-1),
+            group=self.process_group,
+        )
+        seq_len_full = self.world_size * s_local
+        qkv = recv.view(seq_len_full, 3, h_local, d)
+        q = qkv[:, 0].unsqueeze(0)
+        k = qkv[:, 1].unsqueeze(0)
+        v = qkv[:, 2].unsqueeze(0)
+        kwargs.pop("batch_size", None)
+        kwargs["seq_len"] = seq_len_full
+        kwargs["seq_len_kv"] = seq_len_full
+        output = self.inner_backend.forward(
+            q=q, k=k, v=v, batch_size=1, fp8_descales=fp8_descales, **kwargs
+        )
+        if return_pre_a2a:
+            return output
+        return self._output_a2a(output, 1, seq_len_full)
+
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
         """Preferred tensor layout: [B, S, H, D]"""

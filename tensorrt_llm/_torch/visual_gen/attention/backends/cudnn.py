@@ -845,7 +845,9 @@ class CuDNNAttention(AttentionBackend):
             )
         elif self.quant_dtype == "fp8":
             if pre_quantized:
-                q_q, k_q, v_q = q.contiguous(), k.contiguous(), v.contiguous()
+                # Strided NHD views are fine (the strides are part of the graph key below);
+                # only a non-unit head-dim stride forces a copy.
+                q_q, k_q, v_q = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
                 descales = fp8_descales.to(torch.float32)
                 descale_q = descales[0:1].reshape(1, 1, 1, 1)
                 descale_k = descales[1:2].reshape(1, 1, 1, 1)

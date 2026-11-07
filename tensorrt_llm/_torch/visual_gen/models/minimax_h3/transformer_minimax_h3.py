@@ -50,6 +50,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 from .fused_fp8_qk import fusion_mode, set_reduce_group, static_descale
+from .fused_out_a2a import OUT_A2A_FP4_ENABLED, h3_out_a2a_fp4
 from .fused_out_quant import OUT_QUANT_ENABLED, h3_out_quant_fp4
 from .fused_out_quant import static_nvfp4_input as _l17_static_nvfp4_input
 from .fused_quant import (
@@ -61,6 +62,10 @@ from .fused_quant import (
 )
 
 MINIMAX_H3_MODALITY_NUM = 3
+
+# Ulysses exchange of the fused FP8 Q / K / V as one packed all-to-all (fused_fp8_qk.py,
+# UlyssesAttention.forward_packed_fp8); B = 1, no padding mask.
+PACKED_A2A_ENABLED = os.environ.get("H3_PACKED_A2A", "0") not in ("0", "off", "false")
 
 try:  # fused_fp8_qk.py: per-tensor norm + RoPE (+ FP8 cast) for the async Ulysses path
     from .fused_fp8_qk import fusion_mode as _l8_fusion_mode
@@ -279,6 +284,42 @@ class MiniMaxH3Attention(Attention):
                 # [rank * S_local, (rank + 1) * S_local). Padded rows must not set the scale.
                 lengths = key_padding_mask.sum(dim=1) - self._l8_rank * sequence_length
                 valid_len = lengths.clamp(0, sequence_length).to(torch.int32).contiguous()
+            if self._use_packed_a2a(batch_size, key_padding_mask):
+                # The cast writes the Ulysses send buffer directly; one all-to-all, no permutes.
+                ulysses = int(self.attn.world_size)
+                send, descales = torch.ops.h3_lever8.qk_norm_rope_fp8_packed(
+                    qkv,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    cos,
+                    sin,
+                    descale_in,
+                    float(self.norm_q.variance_epsilon),
+                    self.local_num_attention_heads,
+                    self.head_dim,
+                    int(self.layer_idx),
+                    valid_len,
+                    ulysses,
+                )
+                out_linear = self.to_out[0]
+                fp4_exchange = (
+                    OUT_A2A_FP4_ENABLED
+                    and OUT_QUANT_ENABLED
+                    and _l17_static_nvfp4_input(out_linear)
+                )
+                attn_out = self.attn.forward_packed_fp8(
+                    send,
+                    fp8_descales=descales,
+                    return_pre_a2a=fp4_exchange,
+                    discard_padded_queries=True,
+                    timestep=timestep,
+                )
+                if fp4_exchange:
+                    codes, scales = h3_out_a2a_fp4(
+                        attn_out, out_linear.input_scale, self.attn.process_group
+                    )
+                    return out_linear(Fp4QuantizedTensor(codes, scales))
+                return self._out_proj(attn_out.flatten(2))
             query, key, value, descales = torch.ops.h3_lever8.qk_norm_rope_fp8(
                 qkv,
                 self.norm_q.weight,
@@ -370,6 +411,18 @@ class MiniMaxH3Attention(Attention):
             )
             self.__dict__["_l8_rank_cache"] = rank
         return rank
+
+    def _use_packed_a2a(self, batch_size: int, key_padding_mask: Optional[torch.Tensor]) -> bool:
+        """Packed FP8 Ulysses exchange (``H3_PACKED_A2A=1``): one sequence, no padding (the
+        padded path keeps the per-tensor exchange and the cuDNN prefix plan), a Ulysses wrapper
+        with ``forward_packed_fp8`` and an inner backend that takes explicit strides (cuDNN)."""
+        if not PACKED_A2A_ENABLED or batch_size != 1 or key_padding_mask is not None:
+            return False
+        attn = self.attn
+        if getattr(attn, "world_size", 1) <= 1 or not hasattr(attn, "forward_packed_fp8"):
+            return False
+        inner = getattr(attn, "inner_backend", None)
+        return inner is not None and getattr(inner, "quant_dtype", None) == "fp8"
 
     def _use_fused_fp8_qk(
         self,

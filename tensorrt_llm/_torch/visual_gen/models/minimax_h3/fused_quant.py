@@ -34,7 +34,7 @@ odd split happens in registers), packed codes stored 8 per 32-bit word.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -339,6 +339,69 @@ def _minimax_h3_swiglu_fp4_kernel(
         )
 
 
+# -------------------------------------------------------------------------- box 4: tiled SwiGLU
+
+
+@triton.jit
+def _minimax_h3_swiglu_fp4_tiled_kernel(
+    h_ptr,
+    xq_ptr,
+    sf_ptr,
+    gs_ptr,
+    rows,
+    rows_sf,
+    inter,
+    h_stride,
+    xq_stride,
+    SF_KTILES,
+    RB: tl.constexpr,
+    TCH: tl.constexpr,
+):
+    """_minimax_h3_swiglu_fp4_kernel over a [RB, TCH] tile: the same values and rounding points, with
+    RB rows per program so each thread keeps several loads in flight (§689 box 4)."""
+    TKB: tl.constexpr = TCH // 16
+    row0 = tl.program_id(0) * RB
+    col0 = tl.program_id(1) * TCH
+    r = row0 + tl.arange(0, RB)
+    r64 = r.to(tl.int64)
+    valid = r < rows
+    c = col0 + tl.arange(0, TCH)
+    m = valid[:, None] & (c < inter)[None, :]
+    hr = h_ptr + r64[:, None] * h_stride + c[None, :]
+    a = tl.load(hr, mask=m, other=0.0).to(tl.float32)
+    b = tl.load(hr + inter, mask=m, other=0.0).to(tl.float32)
+    result = a * tl.sigmoid(1.0 * a) * (b + 0.0)
+    t = tl.reshape(_round_bf16(result), [RB, TKB, 16])
+    amax = tl.max(tl.abs(t), axis=2)
+    gs = tl.load(gs_ptr).to(tl.float32)
+    rcp_gs = _rcp_approx(gs)
+    rcp6 = _rcp_approx(gs * 0.0 + 6.0)
+    sfv = gs * (amax * rcp6)
+    sf_b = _e4m3_encode(sfv)
+    sf_f = sf_b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    oscale = tl.where(amax != 0.0, _rcp_approx(sf_f * rcp_gs), 0.0)
+    scaled = t * oscale[:, :, None]
+    lo, hi = tl.split(tl.reshape(scaled, [RB, TKB, 8, 2]))
+    packed = _e2m1_pack(lo, hi)
+    kk = tl.arange(0, TKB)
+    kidx = col0 // 16 + kk
+    kmask = kidx < inter // 16
+    qoff = r64[:, None, None] * xq_stride + col0 // 2 + kk[None, :, None] * 8 + tl.arange(0, 8)[None, None, :]
+    tl.store(xq_ptr + qoff, packed.to(tl.uint8, bitcast=True), mask=valid[:, None, None] & kmask[None, :, None])
+    soff = _sf_row_base(r64, SF_KTILES)[:, None] + (kidx // 4).to(tl.int64)[None, :] * 512 + (kidx % 4)[None, :]
+    sf_out = tl.where(valid[:, None], sf_b, tl.zeros_like(sf_b))
+    tl.store(sf_ptr + soff, sf_out.to(tl.uint8, bitcast=True), mask=(r < rows_sf)[:, None] & kmask[None, :])
+
+
+def _swiglu_tile() -> Optional[Tuple[int, int, int]]:
+    """H3_SWIGLU_TILE=RB,CH,WARPS selects the tiled SwiGLU kernel (box 4); unset = the row kernel."""
+    v = os.environ.get("H3_SWIGLU_TILE", "")
+    if not v:
+        return None
+    rb, ch, warps = (int(s) for s in v.split(","))
+    return rb, ch, warps
+
+
 # -------------------------------------------------------------------------- launchers
 
 
@@ -415,6 +478,26 @@ def _launch_swiglu(h, gs, num_warps=None):
         h2 = h2.contiguous()
     rows = h2.shape[0]
     xq, sf = _alloc(rows, inter, h.device)
+    tile = _swiglu_tile()
+    if tile is not None:
+        rb, tch, warps = tile
+        rows_sf = swizzled_sf_rows(rows)
+        _minimax_h3_swiglu_fp4_tiled_kernel[(triton.cdiv(rows_sf, rb), triton.cdiv(inter, tch))](
+            h2,
+            xq,
+            sf,
+            gs,
+            rows,
+            rows_sf,
+            inter,
+            h2.stride(0),
+            xq.stride(0),
+            swizzled_sf_ktiles(inter),
+            RB=rb,
+            TCH=tch,
+            num_warps=warps,
+        )
+        return xq, sf
     _minimax_h3_swiglu_fp4_kernel[(swizzled_sf_rows(rows), triton.cdiv(inter, _CH))](
         h2,
         xq,

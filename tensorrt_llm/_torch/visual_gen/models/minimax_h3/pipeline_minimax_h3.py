@@ -60,6 +60,7 @@ from .packing import (
     MINIMAX_H3_TEXT_ENCODER_LAYER,
     MINIMAX_H3_TEXT_TAG,
     MINIMAX_H3_VIDEO_TAG,
+    RowTimestepPlanner,
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
@@ -91,9 +92,14 @@ if TYPE_CHECKING:
 #   H3_L14_VAE_TILE=HxW[xO]  VAE decoder spatial tile geometry in pixels (tile height x width x
 #                     minimum overlap, default overlap 32; the default geometry is 256x256x64).
 #                     The decoder's RoPE is normalised per tile, so this changes the decoded pixels.
+#   H3_PRELOOP_FAST=1 schedule only, bit-identical (§689 box 7 rider): the per-step row-timestep
+#                     plan comes from RowTimestepPlanner (four class values sorted per step and a
+#                     gather) instead of a torch.unique over every row per step; removes the
+#                     pre-loop host gap before the plan transfer.
 _L14_SCHED = os.environ.get("H3_L14_SCHED") == "1"
 _L14_VAE_FP8 = os.environ.get("H3_L14_VAE_FP8") == "1"
 _L14_VAE_TILE = os.environ.get("H3_L14_VAE_TILE", "")
+_PRELOOP_FAST = os.environ.get("H3_PRELOOP_FAST") == "1"
 
 
 def _l14_tile_geometry() -> tuple[int, int, int] | None:
@@ -1330,9 +1336,17 @@ class MiniMaxH3Pipeline(BasePipeline):
             )
         else:
             timestep_pairs = zip(self.scheduler.timesteps, self.audio_scheduler.timesteps)
+        # H3_PRELOOP_FAST: one class map per layout, four values sorted per step (bit-identical to
+        # build_row_timesteps, see RowTimestepPlanner).
+        if _PRELOOP_FAST:
+            plan_fn = RowTimestepPlanner(layout)
+        else:
+
+            def plan_fn(*times: float) -> tuple[torch.Tensor, torch.Tensor]:
+                return build_row_timesteps(layout, *times)
+
         host_plan = [
-            build_row_timesteps(
-                layout,
+            plan_fn(
                 float(video_timestep),
                 float(audio_timestep),
                 max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),

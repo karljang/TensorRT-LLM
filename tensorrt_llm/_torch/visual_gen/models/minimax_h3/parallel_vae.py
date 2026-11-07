@@ -19,11 +19,18 @@ Temporal chunking, spatial overlap geometry, and blending remain owned by
 Diffusers. Only independent spatial decoder calls are batched or distributed.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3
 
 from tensorrt_llm.logger import logger
+
+# H3_VAE_GRAPH=1: replay the decoder call per chunk shape from a CUDA graph (schedule only, bit-identical;
+# §689 box 7 rider). Unset = the eager call.
+_VAE_GRAPH = os.environ.get("H3_VAE_GRAPH") == "1"
+_VAE_GRAPH_MAX_SHAPES = int(os.environ.get("H3_VAE_GRAPH_MAX_SHAPES", "2"))
 
 # Share of the memory available at decode time that the tiles of one decoder call may occupy.
 TILE_DECODE_MEMORY_FRACTION = 0.75
@@ -168,6 +175,55 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         rows = [decoded[i : i + columns] for i in range(0, len(tiles), columns)]
         return self._stitch_tiles(rows, y_overlaps, x_overlaps)
 
+    def _run_decoder(self, latents: torch.Tensor) -> torch.Tensor:
+        """``post_quant_conv`` + ``decoder`` on one chunk of tiles.
+
+        Under ``H3_VAE_GRAPH=1`` (§689 box 7 rider, schedule only) the call is replayed from a CUDA
+        graph per chunk shape: the first call of a shape runs eagerly (compile, autotune), the
+        second captures the graph, the rest replay it. The kernels and their inputs are the same,
+        so the pixels are bit-identical to the eager path. Autocast runs with its weight cache off
+        inside the captured region (the cache would hold casts made outside the graph).
+        """
+        if not _VAE_GRAPH or latents.device.type != "cuda":
+            return self.decoder(self.post_quant_conv(latents))
+        autocast = torch.autocast(
+            device_type="cuda",
+            dtype=torch.get_autocast_dtype("cuda"),
+            enabled=torch.is_autocast_enabled("cuda"),
+            cache_enabled=False,
+        )
+        # Contiguous input: the non-uniform-tile fallback hands strided views, and the captured call
+        # must see the same layout the eager warm call saw.
+        latents = latents.contiguous()
+        key = (tuple(latents.shape), latents.dtype, torch.is_autocast_enabled("cuda"))
+        graphs = self.__dict__.setdefault("_vae_graphs", {})
+        entry = graphs.get(key)
+        if entry is None:
+            # At most _VAE_GRAPH_MAX_SHAPES graphs: each holds a private memory pool that
+            # `_tiles_per_decoder_call` would otherwise count out of the next chunk's budget, shrinking
+            # the chunk and creating yet another shape (ratchet).
+            if len(graphs) >= _VAE_GRAPH_MAX_SHAPES:
+                with autocast:
+                    return self.decoder(self.post_quant_conv(latents))
+            graphs[key] = "warm"
+            with autocast:
+                return self.decoder(self.post_quant_conv(latents))
+        if entry == "warm":
+            static_in = latents.clone()
+            graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize(latents.device)
+            with autocast, torch.cuda.graph(graph):
+                static_out = self.decoder(self.post_quant_conv(static_in))
+            entry = graphs[key] = (graph, static_in, static_out)
+            logger.info(
+                f"MiniMax-H3 VAE decode: CUDA graph captured for a {tuple(latents.shape)} chunk "
+                f"({len([v for v in graphs.values() if v != 'warm'])} shapes)"
+            )
+        graph, static_in, static_out = entry
+        static_in.copy_(latents)
+        graph.replay()
+        return static_out.clone()
+
     def _decode_tiles_batched(
         self, z: torch.Tensor, tiles: list[tuple[int, int, int, int]]
     ) -> list[torch.Tensor]:
@@ -177,14 +233,14 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         """
         latents = [z[..., y : y + h, x : x + w] for y, h, x, w in tiles]
         if len({tuple(t.shape) for t in latents}) != 1:
-            return [self.decoder(self.post_quant_conv(t)) for t in latents]
+            return [self._run_decoder(t) for t in latents]
         batch = z.shape[0]
         decoded: list[torch.Tensor] = []
         start = 0
         while start < len(latents):
             count = self._tiles_per_decoder_call(latents[0], len(latents) - start)
             chunk = torch.cat(latents[start : start + count], dim=0)
-            decoded.extend(self.decoder(self.post_quant_conv(chunk)).split(batch, dim=0))
+            decoded.extend(self._run_decoder(chunk).split(batch, dim=0))
             start += count
         return decoded
 
@@ -213,7 +269,7 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         for start in range(0, waves, count):
             chunk = own[start : start + count]
             if chunk:
-                local = self.decoder(self.post_quant_conv(torch.cat(chunk, dim=0))).contiguous()
+                local = self._run_decoder(torch.cat(chunk, dim=0)).contiguous()
             else:
                 # Every rank owns at least waves - 1 tiles, so only a last batch can be empty
                 # and the previous batch has set local's tile geometry.

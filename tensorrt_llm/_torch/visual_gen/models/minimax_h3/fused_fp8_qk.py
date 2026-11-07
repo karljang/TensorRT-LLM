@@ -178,6 +178,18 @@ def _scale_from_amax(amax):
 
 
 @triton.jit
+def _packed_out_offs(h, d, t, S, WHICH: tl.constexpr, HL: tl.constexpr, D: tl.constexpr):
+    """Element offsets of head tile ``h`` x ``d`` of token ``t`` inside the packed Ulysses send
+    buffer ``[U, S, 3, HL, D]``: head ``h`` of the local shard goes to rank ``h // HL`` as its
+    local head ``h % HL``; ``WHICH`` selects the Q / K / V plane. Rank ``u``'s chunk is contiguous,
+    so one ``all_to_all_single`` on the flat buffer is the whole exchange."""
+    dst = h // HL
+    hl = h - dst * HL
+    base = ((dst.to(tl.int64) * S + t) * 3 + WHICH) * (HL * D) + hl.to(tl.int64) * D
+    return base[:, None] + d[None, :]
+
+
+@triton.jit
 def _qkv_cast_kernel(
     qkv_ptr,
     wq_ptr,
@@ -196,6 +208,8 @@ def _qkv_cast_kernel(
     D: tl.constexpr,
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    PACKED: tl.constexpr,
+    HL: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r % S
@@ -232,7 +246,6 @@ def _qkv_cast_kernel(
         yq = _norm_rope_tile(
             row + offs, row + offs_p, mask, wq_d, wq_p, cos_v, sin_v, sign, inv_d, eps
         )
-        tl.store(q_out_ptr + out_row + offs, (yq * f_q).to(tl.float8e4nv), mask=mask)
         yk = _norm_rope_tile(
             row + H * D + offs,
             row + H * D + offs_p,
@@ -245,9 +258,28 @@ def _qkv_cast_kernel(
             inv_d,
             eps,
         )
-        tl.store(k_out_ptr + out_row + offs, (yk * f_k).to(tl.float8e4nv), mask=mask)
         v = tl.load(row + 2 * H * D + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(v_out_ptr + out_row + offs, (v * f_v).to(tl.float8e4nv), mask=mask)
+        if PACKED:
+            # q_out_ptr is the one packed send buffer; k_out_ptr / v_out_ptr are unused.
+            tl.store(
+                q_out_ptr + _packed_out_offs(h, d, t, S, 0, HL, D),
+                (yq * f_q).to(tl.float8e4nv),
+                mask=mask,
+            )
+            tl.store(
+                q_out_ptr + _packed_out_offs(h, d, t, S, 1, HL, D),
+                (yk * f_k).to(tl.float8e4nv),
+                mask=mask,
+            )
+            tl.store(
+                q_out_ptr + _packed_out_offs(h, d, t, S, 2, HL, D),
+                (v * f_v).to(tl.float8e4nv),
+                mask=mask,
+            )
+        else:
+            tl.store(q_out_ptr + out_row + offs, (yq * f_q).to(tl.float8e4nv), mask=mask)
+            tl.store(k_out_ptr + out_row + offs, (yk * f_k).to(tl.float8e4nv), mask=mask)
+            tl.store(v_out_ptr + out_row + offs, (v * f_v).to(tl.float8e4nv), mask=mask)
 
 
 _REDUCE_GROUP = None
@@ -296,6 +328,7 @@ def _qk_norm_rope_fp8_split(
     block_h,
     num_warps,
     valid_len=None,
+    packed_hl=0,
 ):
     width = h * d
     grid = (rows,)
@@ -353,13 +386,15 @@ def _qk_norm_rope_fp8_split(
             ROT=rot,
             BLOCK_H=block_h,
             ROW_STRIDE=3 * width,
+            PACKED=packed_hl > 0,
+            HL=max(packed_hl, 1),
+            WHICH=i,
             num_warps=num_warps,
         )
     return descale, static, sat
 
 
-@torch.library.custom_op("h3_lever8::qk_norm_rope_fp8", mutates_args=())
-def qk_norm_rope_fp8(
+def _qk_norm_rope_fp8_impl(
     qkv: torch.Tensor,
     weight_q: torch.Tensor,
     weight_k: torch.Tensor,
@@ -371,12 +406,10 @@ def qk_norm_rope_fp8(
     head_dim: int,
     layer_idx: int,
     valid_len: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return FP8 ``q``, ``k``, ``v`` of shape ``[B, S, H * D]`` and ``descale`` ``[3]`` fp32.
-
-    ``qkv`` is the packed projection output ``[B, S, 3 * H * D]`` (BF16, contiguous);
-    ``cos`` / ``sin`` are ``[S, ROT]``; ``static_descale`` ``[3]`` fp32 skips the amax pass.
-    """
+    ulysses: int,
+) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+    """Shared body of the two ops. ``ulysses == 0``: three ``[B, S, H * D]`` FP8 outputs.
+    ``ulysses = U > 1``: one packed Ulysses send buffer ``[U, S, 3, H / U, D]`` (B must be 1)."""
     b, s, width = qkv.shape
     h, d = num_heads, head_dim
     if width != 3 * h * d:
@@ -386,9 +419,18 @@ def qk_norm_rope_fp8(
     cos = cos.contiguous()
     sin = sin.contiguous()
     rows = b * s
-    q8 = torch.empty((b, s, h * d), dtype=torch.float8_e4m3fn, device=qkv.device)
-    k8 = torch.empty_like(q8)
-    v8 = torch.empty_like(q8)
+    if ulysses > 1:
+        if b != 1 or h % ulysses:
+            raise ValueError(
+                f"packed exchange needs B == 1 and H % U == 0 (B={b}, H={h}, U={ulysses})"
+            )
+        hl = h // ulysses
+        send = torch.empty((ulysses, s, 3, hl, d), dtype=torch.float8_e4m3fn, device=qkv.device)
+        outs = (send, send, send)
+    else:
+        hl = 0
+        q8 = torch.empty((b, s, h * d), dtype=torch.float8_e4m3fn, device=qkv.device)
+        outs = (q8, torch.empty_like(q8), torch.empty_like(q8))
     block_h, num_warps = _launch_config()
     grid = (rows,)
     if _split_launch():
@@ -404,16 +446,17 @@ def qk_norm_rope_fp8(
             d,
             s,
             rows,
-            (q8, k8, v8),
+            outs,
             block_h,
             num_warps,
             valid_len,
+            packed_hl=hl,
         )
         if _AMAX_LOG is not None and not static:
             _record_descale(layer_idx, descale)
         if sat is not None:
             _record_sat(layer_idx, sat)
-        return q8, k8, v8, descale
+        return outs, descale
     if static_descale is None:
         amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
         descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
@@ -448,9 +491,9 @@ def qk_norm_rope_fp8(
         sin,
         amax,
         descale,
-        q8,
-        k8,
-        v8,
+        outs[0],
+        outs[1],
+        outs[2],
         s,
         eps,
         STATIC=static,
@@ -458,11 +501,108 @@ def qk_norm_rope_fp8(
         D=d,
         ROT=rot,
         BLOCK_H=block_h,
+        PACKED=hl > 0,
+        HL=max(hl, 1),
         num_warps=num_warps,
     )
     if _AMAX_LOG is not None and not static:
         _record_descale(layer_idx, descale)
-    return q8, k8, v8, descale
+    return outs, descale
+
+
+@torch.library.custom_op("h3_lever8::qk_norm_rope_fp8_packed", mutates_args=())
+def qk_norm_rope_fp8_packed(
+    qkv: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    static_descale: Optional[torch.Tensor],
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+    layer_idx: int,
+    valid_len: Optional[torch.Tensor],
+    ulysses: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The fused cast writing straight into the Ulysses send buffer ``[U, S, 3, H / U, D]`` (FP8),
+    plus ``descale`` ``[3]``. ``qkv`` is ``[1, S, 3 * H * D]`` (one sequence shard); chunk ``u`` of
+    the buffer holds this shard's tokens for the heads rank ``u`` owns, so a single
+    ``all_to_all_single`` over the flat buffer replaces the three per-tensor exchanges and their
+    permute copies. Same codes and scales as :func:`qk_norm_rope_fp8`."""
+    outs, descale = _qk_norm_rope_fp8_impl(
+        qkv,
+        weight_q,
+        weight_k,
+        cos,
+        sin,
+        static_descale,
+        eps,
+        num_heads,
+        head_dim,
+        layer_idx,
+        valid_len,
+        ulysses,
+    )
+    return outs[0], descale
+
+
+@qk_norm_rope_fp8_packed.register_fake
+def _qk_norm_rope_fp8_packed_fake(
+    qkv,
+    weight_q,
+    weight_k,
+    cos,
+    sin,
+    static_descale,
+    eps,
+    num_heads,
+    head_dim,
+    layer_idx,
+    valid_len,
+    ulysses,
+):
+    _, s, _ = qkv.shape
+    return (
+        qkv.new_empty((ulysses, s, 3, num_heads // ulysses, head_dim), dtype=torch.float8_e4m3fn),
+        qkv.new_empty((3,), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("h3_lever8::qk_norm_rope_fp8", mutates_args=())
+def qk_norm_rope_fp8(
+    qkv: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    static_descale: Optional[torch.Tensor],
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+    layer_idx: int,
+    valid_len: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return FP8 ``q``, ``k``, ``v`` of shape ``[B, S, H * D]`` and ``descale`` ``[3]`` fp32.
+
+    ``qkv`` is the packed projection output ``[B, S, 3 * H * D]`` (BF16, contiguous);
+    ``cos`` / ``sin`` are ``[S, ROT]``; ``static_descale`` ``[3]`` fp32 skips the amax pass.
+    """
+    outs, descale = _qk_norm_rope_fp8_impl(
+        qkv,
+        weight_q,
+        weight_k,
+        cos,
+        sin,
+        static_descale,
+        eps,
+        num_heads,
+        head_dim,
+        layer_idx,
+        valid_len,
+        0,
+    )
+    return outs[0], outs[1], outs[2], descale
 
 
 @qk_norm_rope_fp8.register_fake
@@ -560,6 +700,9 @@ def _tensor_cast_kernel(
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
+    PACKED: tl.constexpr,
+    HL: tl.constexpr,
+    WHICH: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r % S
@@ -586,6 +729,11 @@ def _tensor_cast_kernel(
         h = h0 + hh
         mask = (h < H)[:, None] & (d < D)[None, :]
         offs = h[:, None] * D + d[None, :]
+        if PACKED:
+            out_offs = _packed_out_offs(h, d, t, S, WHICH, HL, D)
+            out_tile = out_ptr + out_offs
+        else:
+            out_tile = out_row + offs
         if NORM_ROPE:
             offs_p = h[:, None] * D + partner[None, :]
             y = _norm_rope_tile(
@@ -598,9 +746,9 @@ def _tensor_cast_kernel(
             if SAT_COUNT:
                 # Elements beyond the E4M3 range are clamped by the saturating cast.
                 nsat += (tl.abs(scaled) > 448.0).to(tl.int32)
-            tl.store(out_row + offs, scaled.to(tl.float8e4nv), mask=mask)
+            tl.store(out_tile, scaled.to(tl.float8e4nv), mask=mask)
         else:
-            tl.store(out_row + offs, y.to(tl.bfloat16), mask=mask)
+            tl.store(out_tile, y.to(tl.bfloat16), mask=mask)
     if SAT_COUNT:
         tl.atomic_add(sat_ptr, tl.sum(tl.sum(nsat, axis=1), axis=0))
 
@@ -690,6 +838,9 @@ def norm_rope_fp8_tensor(
         ROT=rot,
         BLOCK_H=block_h,
         ROW_STRIDE=h * d,
+        PACKED=False,
+        HL=1,
+        WHICH=0,
         num_warps=num_warps,
     )
     return out, descale
