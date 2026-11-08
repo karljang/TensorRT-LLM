@@ -49,6 +49,7 @@
 // Switch to streaming-style TLLM_LOG_* macros for trtllm-gen export headers,
 // which use streaming syntax (e.g., TLLM_LOG_INFO("val=", x)) instead of
 // TRT-LLM's printf-style (e.g., TLLM_LOG_INFO("val=%d", x)).
+#include "kernelParamsPre20054.h"
 #include "trtllmGen_fmha_export/FmhaAutoTuner.h"
 #include "trtllmGen_fmha_export/FmhaInterface.h"
 #include "trtllmGen_fmha_export/FmhaOptions.h"
@@ -1499,6 +1500,24 @@ private:
         sstream << "}\n";
     }
 
+    static bool usesPre20054KernelParams(char const* funcName)
+    {
+        static char const* const kNames[] = {
+            "fmhaSm107aKernel_QkvE4m3OBfloat16H128SeparateQkvDenseVarSeqFp16SoftmaxQ256Kv128PersistentContext",
+            "fmhaSm107aKernel_QkvE4m3OBfloat16H128SeparateQkvDenseVarSeqFp16SoftmaxQ256Kv128StaticContext",
+            "fmhaSm107aKernel_QkvE4m3OE4m3H128SeparateQkvDenseVarSeqFp16SoftmaxQ256Kv128PersistentContext",
+            "fmhaSm107aKernel_QkvE4m3OE4m3H128SeparateQkvDenseVarSeqFp16SoftmaxQ256Kv128StaticContext",
+        };
+        for (char const* name : kNames)
+        {
+            if (std::strcmp(funcName, name) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void launchFmhaKernel(KernelParams const& kernelParams, KernelMeta const& kernelMeta, CUfunction const& func,
         tg::CudaRunner::Grid const& grid, FmhaOptions const& options, CUstream stream) const
     {
@@ -1508,8 +1527,16 @@ private:
             launchedClusterDimX *= options.mMaxNumCtasKv;
         }
 
-        // Prepare kernel parameters list for cuLaunchKernelEx.
-        void* kernelParamsList[] = {const_cast<void*>(static_cast<void const*>(&kernelParams))};
+        // Prepare kernel parameters list for cuLaunchKernelEx. The unit-softmax-scale SM107a FP16-softmax
+        // cubins (#20622) were generated against the pre-#20054 export and take its KernelParams layout.
+        fmha_pre20054::KernelParams kernelParamsPre20054;
+        void const* kernelParamsPtr = &kernelParams;
+        if (usesPre20054KernelParams(kernelMeta.mFuncName))
+        {
+            kernelParamsPre20054 = fmha_pre20054::fromCurrent(kernelParams);
+            kernelParamsPtr = &kernelParamsPre20054;
+        }
+        void* kernelParamsList[] = {const_cast<void*>(kernelParamsPtr)};
         CUlaunchConfig launch_config;
         launch_config.blockDimX = kernelMeta.mThreadsPerCTA;
         launch_config.blockDimY = 1;

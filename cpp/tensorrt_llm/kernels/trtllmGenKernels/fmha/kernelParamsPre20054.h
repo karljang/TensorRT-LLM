@@ -1,0 +1,258 @@
+/*
+ * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cuda.h>
+#include <trtllm/dev/FastMath.h>
+#include <vector_types.h>
+
+// NOTE: Keep this code dependency free. It has to be included by the device code and has to be
+// compilable with NVRTC.
+
+// The KernelParams layout before TensorRT-LLM #20054 (the trtllm-gen FMHA export of #19591, f08592ada02):
+// one int32 mAttentionWindowSize where #20054 has mLeftSlidingWindow, mRightSlidingWindow and the two
+// VariableWindow pointers, so every field from mBatchSize on sits 16-20 bytes earlier. Cubins generated
+// against that export (the unit-softmax-scale FP16-softmax SM107a cubins of #20622) read their parameters
+// at the old offsets; the runner hands them a struct in this layout (board 692 spot A.4).
+
+#include "trtllmGen_fmha_export/KernelParamsDecl.h"
+
+#include <climits>
+#include <cstddef>
+#include <cstring>
+
+namespace fmha_pre20054
+{
+struct KernelParams
+{
+#ifdef TLLM_ENABLE_CUDA
+    // TMA descriptor for Q.
+    CUtensorMap tmaQ_;
+    // TMA descriptor for K.
+    CUtensorMap tmaK_;
+    // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+    CUtensorMap tmaKSlidingWindowKvPool_;
+    // TMA descriptor for V.
+    CUtensorMap tmaV_;
+    // The descriptor for O.
+    CUtensorMap tmaO_;
+
+    // For FP4 KV cache, additional scaling factors are needed.
+
+    // TMA descriptor for K scaling factor.
+    CUtensorMap tmaKSf_;
+    // TMA descriptor for V scaling factor.
+    CUtensorMap tmaVSf_;
+#endif
+
+    // grid dimensions, these might differ from actual grid the kernel is launched with
+    // for persistent kernels on Hopper GPUs.
+    int32_t logicalGridDimX, logicalGridDimY, logicalGridDimZ;
+
+    // The output pointer (used by STG for last tile).
+    void* ptrO;
+    // The output SF pointer (used for block-scaled output).
+    void* ptrSfO;
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* ptrAttentionSinks;
+    // The cumulative sequence lengths for Q.
+    int32_t const* ptrCumSeqLensQ;
+    // The cumulative sequence lengths for K/V.
+    int32_t const* ptrCumSeqLensKv;
+    // The packed custom mask.
+    uint32_t const* ptrCustomMask;
+    // The packed custom mask's offsets of each sequence.
+    int64_t const* ptrCustomMaskOffsets;
+    // The debug output matrix O
+    float* ptrDebugO;
+    // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue fusion
+    float const* ptrDsv4InvRopeCosSinCache;
+    // DSv4 output scale buffer: FP32 values or packed UE8M0 words, only for epilogue fusion.
+    float* ptrDsv4OScale;
+    // The first sparseMask offsets in the Kv sequence dimension.
+    int32_t const* ptrFirstSparseMaskOffsetsKv;
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    // The output pointer for invalidation used only to test the FineGrained producer feature. This has
+    // the same data type and shape as ptrO and will be filled with the invalid sentinel value.
+    void* ptrInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+    // The counter for the multiCtasKv mode.
+    int32_t* ptrMultiCtasKvCounter;
+    // The device output scale for FP8 quantization. Only needed by trt-llm fp8 kernels as the sca-
+    // les have to be on the device currently.
+    float const* ptrOutputScale;
+    // The page indexes of the paged-kv buffer with shape of [batchSize, 2, maxNumPagesPerSeq].
+    int32_t const* ptrPageIdxKv;
+    // The partial matrix O for each CtaKv when the multiCtasKv mode is enabled.
+    void* ptrPartialO;
+    // The partial softmax stats (max/sum)for each CtaKv when the multiCtasKv mode is enabled.
+    float2* ptrPartialStats;
+    // The scaling factors for K.
+    float const* ptrSageAttnSfsK;
+    // The scaling factors for P.
+    float const* ptrSageAttnSfsP;
+    // The scaling factors for Q.
+    float const* ptrSageAttnSfsQ;
+    // The scaling factors for V.
+    float const* ptrSageAttnSfsV;
+    // The device scaling factor for softmax (multiplied by log2 to use faster exp2). Only needed by
+    // trt-llm fp8 kernels as the scales have to be on the device currently.
+    float const* ptrScaleSoftmaxLog2;
+    // The SF scale for Kv on device. Only needed by trt-llm kernels as the scales have to be on the
+    // device currently.
+    float const* ptrScaleSfKv;
+    // The scalar scale for block-scaled output O on device.
+    float const* ptrScaleSfO;
+    // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
+    // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
+    int32_t const* ptrSeqLensKv;
+    // When collecting skip softmax stats, store them here
+    // Note that softmax and BMM2 are skipped at different granularity (warp vs tile)
+    // [0] -> skipped softmax warp blocks; [1] -> total softmax warp blocks.
+    // [2] -> skipped BMM2s; [3] -> total BMM2s.
+    int32_t* ptrSkipSoftmaxStats;
+    // The softmax stats buffer.
+    float2* ptrSoftmaxStats;
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* ptrSparseMlaTopKLens;
+
+    // The attention window size for sliding window attention.
+    int32_t mAttentionWindowSize;
+    // The batch size
+    int32_t mBatchSize;
+    // The chunked attention size in log2.
+    int32_t mChunkedAttentionSizeLog2;
+    // Padded token dimension for the DSv4 fused FP32 or packed UE8M0 scale layout.
+    int64_t mDsv4ScaleBufM;
+    // The factor to add to the maximum value to increase the probability
+    //   of skip correction during next iterations.
+    float mInflateMax;
+    // The log of the Sage Attention block size for K.
+    int32_t mLogNumEltsPerSageAttnBlkK;
+    // The log of the Sage Attention block size for P.
+    int32_t mLogNumEltsPerSageAttnBlkP;
+    // The log of the Sage Attention block size for Q.
+    int32_t mLogNumEltsPerSageAttnBlkQ;
+    // The log of the Sage Attention block size for V.
+    int32_t mLogNumEltsPerSageAttnBlkV;
+    // The sequence lengths for Q and K/V.
+    int32_t mMaxSeqLenQ, mMaxSeqLenKv;
+    // The maximum number of CTAs for Q.
+    int32_t mMaxNumCtasQ;
+    // The maximum number of CTAs for K/V.
+    int32_t mMaxNumCtasKv;
+    // The maximum number of pages per sequence for paged-kv buffer.
+    int32_t mMaxNumPagesPerSeqKv;
+    // The number of heads for K/V.
+    int32_t mNumHeadsKv;
+    // The number of heads for Q.
+    int32_t mNumHeadsQ;
+    // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
+    int32_t mNumHeadsQPerKv;
+    // The number of headsQ per K/V head as a fast_mod_div divisor.
+    trtllm::dev::fast_mod_div mNumHeadsQPerKvDivisor{1};
+    // The hidden size of O.
+    int64_t mNumHiddenEltsO;
+    // The total number of pages in the paged-kv memory pool.
+    int32_t mNumPagesInMemPool;
+    // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
+    int32_t mNumTokensPerCtaQ;
+    // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+    int32_t mNumTokensPerPageLog2;
+    // The runtime K/V TMA box reshape factor selected by host descriptor setup.
+    int32_t mReshapeFactorKv;
+    // The output scale for FP8 quantization.
+    float mOutputScale;
+    // The scaling factor for softmax (multiplied by log2 to use faster exp2).
+    float mScaleSoftmaxLog2;
+    // The SF scale for Kv.
+    float mScaleSfKv;
+    // The scalar SF scale for output O.
+    float mScaleSfO;
+    // Threshold to decide whether warp skips softmax ops
+    float mSkipSoftmaxThresholdScaleFactor;
+    // The sparse attention topK value.
+    int32_t mSparseAttnTopK;
+    // The start token index in the output SF tensor. Used for block-scaled output SF offset
+    // calculation in generation phase kernels when inflight batching is enabled in TRT-LLM.
+    int32_t mStartTokenIdxSfO;
+    // The sum of sequence lengths for Q and K/V.
+    int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+    // The flag to use block sparse attention.
+    bool mUseBlockSparseAttention;
+    // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
+    bool mUsesSharedPagedKvIdx{false};
+
+    // Skip correction for row-max increases up to this base-2 threshold. 0 disables; use 8 for E4M3.
+    // Keep runtime parameters at the end to preserve the existing cubin ABI prefix.
+    float mSkipCorrThreshold;
+
+    // Note: No implementation functions here as they use STL which is not available in NVRTC
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline KernelParams fromCurrent(fmha::KernelParams const& n)
+{
+    static_assert(sizeof(KernelParams) == sizeof(fmha::KernelParams), "pre-#20054 KernelParams size");
+    static_assert(offsetof(KernelParams, mAttentionWindowSize) == offsetof(fmha::KernelParams, mLeftSlidingWindow),
+        "the two layouts agree up to the sliding-window field");
+    KernelParams o{};
+    std::memcpy(reinterpret_cast<char*>(&o), reinterpret_cast<char const*>(&n),
+        offsetof(fmha::KernelParams, mLeftSlidingWindow));
+    o.mAttentionWindowSize = n.mLeftSlidingWindow < 0 ? INT_MAX : n.mLeftSlidingWindow + 1;
+    o.mBatchSize = n.mBatchSize;
+    o.mChunkedAttentionSizeLog2 = n.mChunkedAttentionSizeLog2;
+    o.mDsv4ScaleBufM = n.mDsv4ScaleBufM;
+    o.mInflateMax = n.mInflateMax;
+    o.mLogNumEltsPerSageAttnBlkK = n.mLogNumEltsPerSageAttnBlkK;
+    o.mLogNumEltsPerSageAttnBlkP = n.mLogNumEltsPerSageAttnBlkP;
+    o.mLogNumEltsPerSageAttnBlkQ = n.mLogNumEltsPerSageAttnBlkQ;
+    o.mLogNumEltsPerSageAttnBlkV = n.mLogNumEltsPerSageAttnBlkV;
+    o.mMaxSeqLenQ = n.mMaxSeqLenQ;
+    o.mMaxSeqLenKv = n.mMaxSeqLenKv;
+    o.mMaxNumCtasQ = n.mMaxNumCtasQ;
+    o.mMaxNumCtasKv = n.mMaxNumCtasKv;
+    o.mMaxNumPagesPerSeqKv = n.mMaxNumPagesPerSeqKv;
+    o.mNumHeadsKv = n.mNumHeadsKv;
+    o.mNumHeadsQ = n.mNumHeadsQ;
+    o.mNumHeadsQPerKv = n.mNumHeadsQPerKv;
+    o.mNumHeadsQPerKvDivisor = n.mNumHeadsQPerKvDivisor;
+    o.mNumHiddenEltsO = n.mNumHiddenEltsO;
+    o.mNumPagesInMemPool = n.mNumPagesInMemPool;
+    o.mNumTokensPerCtaQ = n.mNumTokensPerCtaQ;
+    o.mNumTokensPerPageLog2 = n.mNumTokensPerPageLog2;
+    o.mReshapeFactorKv = n.mReshapeFactorKv;
+    o.mOutputScale = n.mOutputScale;
+    o.mScaleSoftmaxLog2 = n.mScaleSoftmaxLog2;
+    o.mScaleSfKv = n.mScaleSfKv;
+    o.mScaleSfO = n.mScaleSfO;
+    o.mSkipSoftmaxThresholdScaleFactor = n.mSkipSoftmaxThresholdScaleFactor;
+    o.mSparseAttnTopK = n.mSparseAttnTopK;
+    o.mStartTokenIdxSfO = n.mStartTokenIdxSfO;
+    o.mSumOfSeqLensQ = n.mSumOfSeqLensQ;
+    o.mSumOfSeqLensKv = n.mSumOfSeqLensKv;
+    o.mUseBlockSparseAttention = n.mUseBlockSparseAttention;
+    o.mUsesSharedPagedKvIdx = n.mUsesSharedPagedKvIdx;
+    o.mSkipCorrThreshold = n.mSkipCorrThreshold;
+    return o;
+}
+
+} // namespace fmha_pre20054
