@@ -111,6 +111,7 @@ llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
 nvidia-cudnn-frontend>=1.31.0,<1.32
+nvidia-cudnn-cu13>=9.28.1.4 # MiniMax-H3 FP8 attention on SM 107: the cuDNN FP8 SDPA engines (board 692 A.2 / A.3)
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
 grpcio>=1.73.1,<2
