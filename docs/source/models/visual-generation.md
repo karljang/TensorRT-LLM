@@ -198,6 +198,9 @@ are not supported. See the
   list are taken from the checkpoint's `quantization_config` when `quant_config`
   is not set. Passing `quant_config: {quant_algo: NVFP4}` instead keeps the packed
   weights but quantizes activations dynamically and ignores the exclusion list.
+- The optional SM107 NVFP4 scenario uses per-tensor FP8 attention with Ulysses 1 or 4.
+  See its [setup and settings guide](../../../examples/visual_gen/minimax_h3_r200_stack.md);
+  selection is explicit and defaults to `off`.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

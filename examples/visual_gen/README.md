@@ -9,6 +9,7 @@ for feature details.
 |---|---|
 | [`quickstart_example.py`](quickstart_example.py) | Minimal VisualGen API example |
 | [`models/`](models/) | Per-model example scripts |
+| [`minimax_h3_r200_stack.md`](minimax_h3_r200_stack.md) | MiniMax-H3 NVFP4 scenario on SM107: environment, selection and settings |
 | [`configs/`](configs/) | Shared `VisualGenArgs` YAMLs (used by `--visual_gen_args` and `trtllm-serve`) |
 | [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and clients |
 
