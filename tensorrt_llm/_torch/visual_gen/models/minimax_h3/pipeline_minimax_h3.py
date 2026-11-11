@@ -195,7 +195,9 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
         "MiniMaxAI/MiniMax-H3",
         "FastVideo/FastVideo-FastH3-8-Step-V2",
     ],
-    defaults={"workflow": "fl2va"},
+    # pipeline_config keys: the workflow, and the scenario selection read by scenarios.resolve_scenario
+    # (visual_gen_scenario = off | auto | require; minimax_h3_scenario = a mapping of overrides).
+    defaults={"workflow": "fl2va", "visual_gen_scenario": "off", "minimax_h3_scenario": None},
     download_patterns=[
         "modular_model_index.json",
         "fastvideo_inference.json",
@@ -229,6 +231,13 @@ class MiniMaxH3Pipeline(BasePipeline):
     VIDEO_SCHEDULER_SHIFT = 12.0
     AUDIO_SCHEDULER_SHIFT = 3.0
     derive_output_size_from_reference = True
+
+    @classmethod
+    def resolve_variant(cls, config: DiffusionPipelineConfig) -> type[BasePipeline]:
+        """A scenario pipeline (``models/minimax_h3/<scenario>/``) when one matches *config*."""
+        from .scenarios import resolve_scenario
+
+        return resolve_scenario(cls, config)
 
     @staticmethod
     def _request_generator(seed: int) -> torch.Generator:

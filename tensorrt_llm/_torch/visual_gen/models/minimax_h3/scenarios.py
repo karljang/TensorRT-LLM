@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MiniMax-H3 scenarios: one optimized pipeline per deployment, in its own folder.
+
+A scenario folder ``models/minimax_h3/<checkpoint>__<sm>__<parallel>/`` holds a complete variant of the
+H3 transformer and pipeline with its own kernels, after Modeling V2's shape (one target per
+configuration, model-specific kernels in the model directory, the shared code untouched). This module
+is the family's routing: :func:`resolve_scenario` picks the scenario whose requirements the pipeline
+config meets, or keeps the family pipeline.
+
+``pipeline_config.extra_attrs["visual_gen_scenario"]`` selects the mode, as ``modeling_v2`` does for LLMs:
+
+| mode | behaviour |
+|---|---|
+| ``"off"`` (default) | the family pipeline; no scenario code is imported |
+| ``"auto"`` | a scenario when one matches, else the family pipeline |
+| ``"require"`` | a scenario, or an error naming the requirement that failed |
+
+``extra_attrs["minimax_h3_scenario"]`` (a mapping) overrides a scenario's settings for an A/B; see the
+scenario's ``config.py``.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable, Optional, Type
+
+import torch
+
+from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+if TYPE_CHECKING:
+    from ...config import DiffusionPipelineConfig
+    from ...pipeline import BasePipeline
+
+_MODES = ("off", "auto", "require")
+
+
+class NoScenario(Exception):
+    """A scenario declines the configuration; the message names the requirement that failed."""
+
+
+def _device_capability() -> Optional[tuple[int, int]]:
+    if not torch.cuda.is_available():
+        return None
+    return tuple(torch.cuda.get_device_capability())
+
+
+def _transformer_quant_algo(config: "DiffusionPipelineConfig") -> Optional[QuantAlgo]:
+    model_config = config.model_configs.get("transformer")
+    quant_config = getattr(model_config, "quant_config", None) if model_config is not None else None
+    if quant_config is None:
+        quant_config = config.quant_config
+    return getattr(quant_config, "quant_algo", None)
+
+
+def _ulysses_size(config: "DiffusionPipelineConfig") -> int:
+    vgm = config.visual_gen_mapping
+    return int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1
+
+
+def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
+    """``minimax_h3_nvfp4__sm_107__u1_u4``: a pre-quantized NVFP4 checkpoint, SM 107, Ulysses 1 or 4,
+    the cuDNN attention backend with the per-tensor FP8 recipe, no tensor parallelism."""
+    capability = _device_capability()
+    if capability != (10, 7):
+        raise NoScenario(f"needs an SM 107 device, found {capability}")
+    quant_algo = _transformer_quant_algo(config)
+    if quant_algo != QuantAlgo.NVFP4 or config.dynamic_weight_quant:
+        raise NoScenario(
+            f"needs a pre-quantized NVFP4 transformer checkpoint (dynamic_weight_quant=False); "
+            f"found quant_algo={quant_algo}, dynamic_weight_quant={config.dynamic_weight_quant}"
+        )
+    backend = str(getattr(config.attention, "backend", "")).upper()
+    if backend != "CUDNN":
+        raise NoScenario(f"needs attention.backend=CUDNN, found {backend!r}")
+    qac = getattr(config.attention, "quant_attention_config", None)
+    if (
+        qac is None
+        or getattr(qac, "qk_dtype", None) != "fp8"
+        or getattr(qac, "v_dtype", None) != "fp8"
+    ):
+        raise NoScenario("needs the per-tensor FP8 attention recipe (qk_dtype=v_dtype='fp8')")
+    ulysses = _ulysses_size(config)
+    if ulysses not in (1, 4):
+        raise NoScenario(f"serves Ulysses 1 or 4, found {ulysses}")
+    if config.mapping.tp_size > 1:
+        raise NoScenario("serves tp_size=1")
+    if getattr(config.parallel, "async_ulysses", False):
+        raise NoScenario("serves the packed FP8 Ulysses exchange, not async_ulysses")
+
+    from . import minimax_h3_nvfp4__sm_107__u1_u4 as pkg  # the config is applied before this import
+
+    pkg.config.apply(config.extra_attrs.get("minimax_h3_scenario"))
+    from .minimax_h3_nvfp4__sm_107__u1_u4.pipeline import MiniMaxH3Nvfp4Sm107U1U4Pipeline
+
+    return MiniMaxH3Nvfp4Sm107U1U4Pipeline
+
+
+# Scenario routes in the order they are tried; the first that does not raise wins.
+ROUTES: tuple[Callable[["DiffusionPipelineConfig"], Type["BasePipeline"]], ...] = (
+    route_nvfp4_sm_107_u1_u4,
+)
+
+
+def resolve_scenario(
+    family_cls: Type["BasePipeline"], config: "DiffusionPipelineConfig"
+) -> Type["BasePipeline"]:
+    """The pipeline class for *config*: a scenario in ``auto`` / ``require`` mode, else *family_cls*."""
+    mode = str(config.extra_attrs.get("visual_gen_scenario", "off")).lower()
+    if mode not in _MODES:
+        raise ValueError(f"visual_gen_scenario={mode!r}: expected one of {_MODES}")
+    if mode == "off":
+        return family_cls
+    reasons: list[str] = []
+    for route in ROUTES:
+        try:
+            cls = route(config)
+        except NoScenario as e:
+            reasons.append(f"{route.__name__}: {e}")
+            continue
+        logger.info(f"MiniMax-H3 scenario {cls.__name__} selected ({route.__name__})")
+        return cls
+    if mode == "require":
+        raise RuntimeError(
+            "visual_gen_scenario=require, but no MiniMax-H3 scenario matches this configuration: "
+            + "; ".join(reasons)
+        )
+    logger.info(
+        "MiniMax-H3: no scenario matches, using the family pipeline (" + "; ".join(reasons) + ")"
+    )
+    return family_cls

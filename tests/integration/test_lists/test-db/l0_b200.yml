@@ -329,6 +329,7 @@ l0_b200:
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/kernels
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"

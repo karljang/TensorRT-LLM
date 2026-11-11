@@ -74,7 +74,7 @@ tk::TllmGenFmhaRunner& runnerFor(tk::Data_type dtypeOut, int device)
 
 // Shape-only parameters; callers fill the pointers and the stream before running.
 // Q / K / V may be strided views [T, H, D] with unit element and head strides (e.g. the planes of a
-// [T, 3, H, D] Ulysses receive buffer, board 692 U.3): the token stride goes to the runner, which
+// [T, 3, H, D] Ulysses receive buffer): the token stride goes to the runner, which
 // builds the TMA descriptors from it. A packed tensor keeps the stride 0 (today's path).
 int64_t tokenStrideBytes(torch::Tensor const& t, char const* name)
 {
@@ -125,9 +125,9 @@ tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t
 // scale_out: fp32 [1] on device, v_descale for BF16 output or v_descale / out_scale for FP8 output.
 // With fp16_softmax the softmax scale must be folded into the Q/K quantization scales; the op runs
 // the kernels with a unit scaleSoftmaxLog2 of its own.
-// skip_corr_threshold: deferred output rescale (board 692 A.5): the kernel skips the O rescale while
+// skip_corr_threshold: deferred output rescale: the kernel skips the O rescale while
 //   the running row max has grown by at most 2^t (E4M3 BMM2 then uses a P scale of 1.75 instead of
-//   448); 0 = rescale every step (the pre-round behaviour), at most 8 for E4M3 BMM2.
+//   448); 0 = rescale every step (unconditional rescale), at most 8 for E4M3 BMM2.
 torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, torch::Tensor const& v,
     torch::Tensor const& cu_seqlens, int64_t max_seqlen, c10::optional<torch::Tensor> const& scale_bmm1,
     torch::Tensor const& scale_out, bool fp16_softmax, c10::ScalarType out_dtype, double skip_corr_threshold)
