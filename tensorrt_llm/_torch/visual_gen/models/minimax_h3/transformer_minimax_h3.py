@@ -164,15 +164,16 @@ class MiniMaxH3Attention(Attention):
         layer_idx: int,
         module_name: str,
         fa4_use_2cta: Optional[bool] = None,
+        backend_kwargs: Optional[dict] = None,
     ) -> None:
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
         # each one is pushed to the peers while the next is computed (forward_async).
         use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
-        backend_kwargs = None
+        backend_kwargs = dict(backend_kwargs or {})
         if fa4_use_2cta is not None and model_config.attention.backend.upper() == "FA4":
-            backend_kwargs = {"use_2cta": fa4_use_2cta}
+            backend_kwargs["use_2cta"] = fa4_use_2cta
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -192,7 +193,7 @@ class MiniMaxH3Attention(Attention):
             module_name=module_name,
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
-            backend_kwargs=backend_kwargs,
+            backend_kwargs=backend_kwargs or None,
         )
         self.use_async_ulysses = use_async_ulysses
         sparse = model_config.attention.sparse_attention_config
@@ -563,6 +564,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
             "FA4",
             "TRTLLM",
             "FLASHINFER",
+            "CUDNN",
         )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -599,7 +601,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded token-refiner sequences require key_padding_mask support; "
-                    "use VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "use VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
                 )
             if self._attn_backend != "TRTLLM":
                 # Attention caches use the mask version to detect changes.
@@ -632,6 +634,9 @@ def _pad_rotary_emb(
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
+    # The attention module class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
+    attention_cls = MiniMaxH3Attention
+
     def __init__(
         self,
         *,
@@ -646,12 +651,13 @@ class MiniMaxH3TransformerBlock(nn.Module):
         layer_idx: int,
         fuse_bf16_gate_up_swiglu: bool = False,
         fa4_use_2cta: Optional[bool] = None,
+        backend_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
         )
-        self.attn = MiniMaxH3Attention(
+        self.attn = self.attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
@@ -660,6 +666,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
             fa4_use_2cta=fa4_use_2cta,
+            backend_kwargs=backend_kwargs,
         )
         self.norm2 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
@@ -771,6 +778,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             architecture, dtype, distributed mapping, and loading settings.
     """
 
+    # The transformer-block class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
+    block_cls = MiniMaxH3TransformerBlock
+
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
@@ -780,10 +790,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "FA4",
             "TRTLLM",
             "FLASHINFER",
+            "CUDNN",
         )
-        # The transformer blocks run at the packed clip length; the token refiner
-        # keeps the process default for FA4.
-        self.fa4_use_2cta = fa4_use_2cta_default(self._attn_backend)
         quant_algo = model_config.quant_config.quant_algo
         dynamic_weights = model_config.dynamic_weight_quant
         # Supported recipes: load-time (dynamic) FP8 / FP8_BLOCK_SCALES / NVFP4
@@ -812,6 +820,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "static activation-scale path would read an uninitialized scale."
             )
         self._model_dtype = model_config.torch_dtype
+        # The transformer blocks' attention runs at the packed clip length; the token refiner
+        # keeps FA4's process default.
+        self.fa4_use_2cta = fa4_use_2cta_default(self._attn_backend)
 
         # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
         # because the fused GEMM is slightly slower than cuBLAS at small M. H3's
@@ -930,9 +941,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             model_config=model_config,
             fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
+        backend_kwargs = self._attention_backend_kwargs()
         self.transformer_blocks = nn.ModuleList(
             [
-                MiniMaxH3TransformerBlock(
+                self.block_cls(
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -944,6 +956,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     layer_idx=layer_idx,
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                     fa4_use_2cta=self.fa4_use_2cta,
+                    backend_kwargs=backend_kwargs,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -960,6 +973,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         )
 
         self.apply_quant_config_exclude_modules()
+
+    def _attention_backend_kwargs(self) -> Optional[dict]:
+        """Extra constructor arguments for the transformer blocks' attention backend.
+
+        None here; a scenario returns the options its attention recipe needs (for example the
+        cuDNN backend's ``fp8_dense_fmha``).
+        """
+        return None
 
     def apply_quant_config_exclude_modules(self) -> None:
         """Drop quantization from Linears the quant config excludes.
@@ -1125,11 +1146,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
                 )
-            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
-            # Ulysses appends padding in this layout.
-            if self._attn_backend in ("FA4", "TRTLLM") and bool(
+            # FA4 seqused_k, TRTLLM prefix trimming and the cuDNN prefix run require trailing
+            # padding. Ulysses appends padding in this layout.
+            if self._attn_backend in ("FA4", "TRTLLM", "CUDNN") and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(

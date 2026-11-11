@@ -1000,7 +1000,14 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
+    [
+        ("VANILLA", True),
+        ("FA4", True),
+        ("TRTLLM", True),
+        ("FLASHINFER", True),
+        ("CUDNN", True),
+        ("CUTEDSL", False),
+    ],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
