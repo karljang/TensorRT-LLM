@@ -249,8 +249,17 @@ def _folded_inputs(batch, seq_len, num_heads, seed):
 
 
 def test_opcheck_with_explicit_threshold():
-    """The schema's tenth argument reaches the fake: opcheck with skip_corr_threshold passed explicitly."""
+    """The schema's tenth argument reaches the fake: opcheck with skip_corr_threshold passed explicitly.
+
+    Only the fake-tensor check of opcheck runs: its schema check (``SchemaCheckMode``) compares the
+    inputs with ``torch.allclose`` to detect mutation, and FP8 tensors have no multiply kernel. The
+    schema's arity and the no-mutation / no-aliasing contract are checked directly instead.
+    """
     _require(10, torch.bfloat16, fp16_softmax=True)
+    schema = torch.ops.trtllm.fmha_dense_fp8.default._schema
+    assert [a.name for a in schema.arguments][-1] == "skip_corr_threshold"
+    assert len(schema.arguments) == 10
+    assert all(a.alias_info is None for a in schema.arguments + schema.returns)
     batch, seq_len = 1, 1560
     q8, k8, v8, vs, _ = _folded_inputs(batch, seq_len, 10, seed=9)
     args = (
@@ -265,9 +274,17 @@ def test_opcheck_with_explicit_threshold():
         torch.bfloat16,
         0.5,
     )
-    torch.library.opcheck(
-        torch.ops.trtllm.fmha_dense_fp8, args, test_utils=("test_schema", "test_faketensor")
-    )  # fmt: skip
+    torch.library.opcheck(torch.ops.trtllm.fmha_dense_fp8, args, test_utils=("test_faketensor",))
+    inputs = [a for a in args if isinstance(a, torch.Tensor)]
+    before = [t.view(torch.uint8).clone() for t in inputs]
+    out = torch.ops.trtllm.fmha_dense_fp8(*args)
+    torch.cuda.synchronize()
+    for t, b in zip(inputs, before):
+        assert torch.equal(t.view(torch.uint8), b), "input mutated"
+    out_storage = out.untyped_storage().data_ptr()
+    assert all(out_storage != t.untyped_storage().data_ptr() for t in inputs), (
+        "output aliases an input"
+    )
 
 
 @pytest.mark.parametrize("fp16_softmax", [False, True])

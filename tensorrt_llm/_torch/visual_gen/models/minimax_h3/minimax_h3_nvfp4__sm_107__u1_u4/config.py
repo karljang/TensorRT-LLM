@@ -64,7 +64,7 @@ class ScenarioConfig:
 
     # --- the NVFP4 producers (norm + modulation, SwiGLU, attention output) -----------------------
     fused_quant: bool = True  # the norm / SwiGLU producers write the Linears' NVFP4 inputs directly
-    fused_quant_warps: int = 4
+    fused_quant_warps: int = 4  # Byte identity with the family AdaLN path holds only at 4 warps.
     swiglu_tile: Optional[Tile3] = (8, 512, 4)
     out_quant: bool = True  # the attention output quantized by the tiled kernel
     out_quant_tile: Tile3 = (16, 512, 4)

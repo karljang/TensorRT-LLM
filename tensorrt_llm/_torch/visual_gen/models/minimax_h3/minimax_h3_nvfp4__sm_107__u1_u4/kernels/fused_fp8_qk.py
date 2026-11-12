@@ -18,9 +18,10 @@ pass 1 is skipped.
 The scale arithmetic reproduces TensorRT-LLM's per-tensor quantizer
 (``cpp/tensorrt_llm/common/cudaFp8Utils.cu``): ``scale = bf16(max(amax / 448, 1 / (448 * 512)))``,
 ``fp8 = cvt.rn.satfinite.e4m3(x * (1 / float(scale)))``, ``descale = float(scale)``. The norm and
-RoPE arithmetic follows the compiled eager path: fp32 math, one rounding to BF16 after
-``x * rsqrt(mean(x^2) + eps)``, the weight multiply and the rotation in fp32 with the BF16-rounded
-``cos`` / ``sin``, one rounding to BF16 before the cast.
+RoPE arithmetic: fp32 math, one rounding to BF16 after ``x * rsqrt(mean(x^2) + eps)``, the weight
+multiply and the rotation in fp32 with the BF16-rounded ``cos`` / ``sin``, one rounding to BF16
+before the cast. This is not bit-identical to ``torch.compile`` of the eager norm + RoPE, which
+rounds to BF16 before the rotation.
 
 ``fp8_scale_fusion`` selects ``qkstatic`` (default), ``dynamic`` or ``static``.
 The private calibration and saturation logs are disabled in this scenario.

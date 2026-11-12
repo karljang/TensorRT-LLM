@@ -6,6 +6,7 @@ Reference for each producer: the family's unfused kernel (``fused_adaln.py`` or
 ``trtllm::silu_and_mul``) writing BF16, then ``trtllm::fp4_quantize(x, input_scale, 16, False)``,
 which is what the block runs without the fusion. Codes and swizzled block scales are compared byte
 for byte, and the gated residual the second producer also returns is compared bit for bit.
+AdaLN byte identity uses the family kernel's four-warp reduction split.
 """
 
 import pytest
@@ -14,6 +15,9 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm  # noqa: F401  -- loads libth_common.so (registers the trtllm ops)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import fused_adaln
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_nvfp4__sm_107__u1_u4.config import (
+    ScenarioConfig,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_nvfp4__sm_107__u1_u4.kernels import (
     fused_quant,
 )
@@ -58,37 +62,36 @@ def _adaln_inputs(rows: int, seed: int):
     return x.to(bf16), a.to(bf16), w.to(bf16), mod.to(bf16), idx
 
 
-@pytest.mark.parametrize("num_warps", (4, 8))
 @pytest.mark.parametrize("rows", ROWS)
-def test_norm_mod_fp4_equals_family_norm_then_fp4_quantize(rows, num_warps):
+def test_norm_mod_fp4_equals_family_norm_then_fp4_quantize(rows):
     x, _, w, mod, idx = _adaln_inputs(rows, seed=rows)
     ref = fused_adaln.h3_norm_mod(x, w, mod, idx, EPS, 1, 0).reshape(rows, HIDDEN)
     gs = _global_scale(ref)
     ref_codes, ref_scales = torch.ops.trtllm.fp4_quantize(ref, gs, 16, False)
-    _, codes, scales = fused_quant._launch_adaln(
-        x, None, w, mod, idx, gs, EPS, 0, 1, 0, num_warps=num_warps
-    )
+    _, codes, scales = fused_quant._launch_adaln(x, None, w, mod, idx, gs, EPS, 0, 1, 0)
     _assert_same_bytes(codes, ref_codes, "packed e2m1 codes")
     _assert_same_bytes(scales, ref_scales, "swizzled e4m3 block scales")
 
 
-@pytest.mark.parametrize("num_warps", (4, 8))
 @pytest.mark.parametrize("rows", ROWS)
-def test_gate_res_norm_mod_fp4_equals_family_then_fp4_quantize(rows, num_warps):
+def test_gate_res_norm_mod_fp4_equals_family_then_fp4_quantize(rows):
     x, a, w, mod, idx = _adaln_inputs(rows, seed=rows + 1)
     ref_x1, ref = fused_adaln.h3_gate_res_norm_mod(x, a, w, mod, idx, EPS, 2, 4, 3)
     ref = ref.reshape(rows, HIDDEN)
     gs = _global_scale(ref)
     ref_codes, ref_scales = torch.ops.trtllm.fp4_quantize(ref, gs, 16, False)
-    x1, codes, scales = fused_quant._launch_adaln(
-        x, a, w, mod, idx, gs, EPS, 2, 4, 3, num_warps=num_warps
-    )
+    x1, codes, scales = fused_quant._launch_adaln(x, a, w, mod, idx, gs, EPS, 2, 4, 3)
     assert x1.dtype == torch.bfloat16
     assert torch.equal(x1.reshape(-1).view(torch.int16), ref_x1.reshape(-1).view(torch.int16)), (
         "gated residual (BF16 bits)"
     )
     _assert_same_bytes(codes, ref_codes, "packed e2m1 codes")
     _assert_same_bytes(scales, ref_scales, "swizzled e4m3 block scales")
+
+
+def test_adaln_fp4_warps_match_family_kernel():
+    # Byte identity with the family AdaLN kernel needs the same reduction split.
+    assert ScenarioConfig().fused_quant_warps == 4
 
 
 # The tiled SwiGLU kernel at the scenario's default tile, and the per-row kernel (no tile).
