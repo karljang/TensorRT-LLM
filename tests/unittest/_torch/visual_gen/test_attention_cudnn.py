@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._torch.visual_gen.attention.backends import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends import cudnn as cudnn_backend
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import (
     CuDNNAttention,
     _quantize_mxfp8_qk,
@@ -330,6 +332,52 @@ def test_cudnn_padded_self_attention_matches_masked_sdpa(quant_dtype, num_kv_hea
 
     # The unpadded item equals the plain forward on that item.
     full = attention.forward(q[1:], k[1:], v[1:])
+    torch.testing.assert_close(actual[1:], full, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("prefix_inplace", [False, True], ids=["fallback", "inplace"])
+@pytest.mark.parametrize("fp8_dense_fmha", ["cudnn", "trtllm-gen-fp16sm"])
+def test_cudnn_padded_prequantized_fp8(prefix_inplace, fp8_dense_fmha, monkeypatch):
+    """Padded pre-quantized inputs retain their descales in both prefix implementations."""
+    _require_cudnn("fp8")
+    if fp8_dense_fmha != "cudnn" and torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The shipped FP16-softmax cubins target SM107.")
+    monkeypatch.setattr(cudnn_backend, "_PREFIX_INPLACE", prefix_inplace)
+    device = torch.device("cuda")
+    batch, num_heads, seq_len, head_dim = 2, 4, 300, 128
+    tensors = _make_qkv(batch, num_heads, num_heads, seq_len, seq_len, head_dim, device)
+    descales = torch.stack([x.float().abs().amax() / 448.0 for x in tensors])
+    if fp8_dense_fmha == "trtllm-gen-fp16sm":
+        # The FP16-softmax kernel uses a unit base-2 softmax scale.
+        descales[:2] = (head_dim**-0.5 * math.log2(math.e)) ** -0.5
+    codes = [
+        (x.float() / d).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        for x, d in zip(tensors, descales)
+    ]
+    dequantized = [x.float() * d for x, d in zip(codes, descales)]
+    lengths = torch.tensor([257, 300], device=device)
+    mask = torch.arange(seq_len, device=device)[None] < lengths[:, None]
+    attention = CuDNNAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_heads,
+        dtype=torch.bfloat16,
+        quant_attention_config=QUANT_CONFIGS["fp8"],
+        fp8_dense_fmha=fp8_dense_fmha,
+        fp8_skip_corr_threshold=1.0 if fp8_dense_fmha == "trtllm-gen-fp16sm" else 0.0,
+    )
+    actual = attention.forward(
+        *codes, key_padding_mask=mask, discard_padded_queries=True, fp8_descales=descales
+    )
+    assert actual.shape == (batch, seq_len, num_heads, head_dim)
+    assert actual.dtype == torch.bfloat16
+    assert torch.count_nonzero(actual[~mask]) == 0
+    expected = _masked_sdpa_reference(*dequantized, mask)
+    cosine = F.cosine_similarity(
+        actual[mask].float().flatten(), expected[mask].flatten(), dim=0
+    ).item()
+    assert cosine > MIN_COSINE["fp8"], f"cosine {cosine} below {MIN_COSINE['fp8']}"
+    full = attention.forward(*(x[1:] for x in codes), fp8_descales=descales)
     torch.testing.assert_close(actual[1:], full, atol=0.0, rtol=0.0)
 
 

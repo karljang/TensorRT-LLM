@@ -1209,6 +1209,7 @@ class CuDNNAttention(AttentionBackend):
                         v[item, :length],
                         is_causal=False,
                         with_lse=False,
+                        fp8_descales=fp8_descales,
                         out=output[item, :length],
                     )
             return output
