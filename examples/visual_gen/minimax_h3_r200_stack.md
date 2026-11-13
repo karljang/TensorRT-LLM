@@ -6,7 +6,7 @@
 Select the optimized MiniMax-H3 pipeline explicitly with `visual_gen_scenario: require`.
 
 - Use a pre-quantized NVFP4 checkpoint, SM107, per-tensor FP8 attention and one or four GPUs.
-- Set the 31 recipe fields through `minimax_h3_scenario`; the process keeps one frozen configuration.
+- Set the 32 recipe fields through `minimax_h3_scenario`; the process keeps one frozen configuration.
 - Build with the shipped FMHA cubins and install the recipe's cuDNN environment before launching.
 
 ## Contents
@@ -92,7 +92,7 @@ Unknown settings and combinations checked by `ScenarioConfig.validate()` raise b
 Static scale mode additionally needs `fp8_static_scales`; the kernel checks that path when it consumes the table.
 
 <details>
-<summary>All 31 settings and their source defaults</summary>
+<summary>All 32 settings and their source defaults</summary>
 
 **One source.** This table is generated from [`ScenarioConfig`](../../tensorrt_llm/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/config.py).
 
@@ -117,6 +117,7 @@ Static scale mode additionally needs `fp8_static_scales`; the kernel checks that
 | `swiglu_tile` | `(8, 512, 4)` |
 | `out_quant` | `True` |
 | `out_quant_tile` | `(16, 512, 4)` |
+| `nvfp4_gemm_backends` | `('cublaslt',)` |
 | `vae_fp8` | `True` |
 | `vae_fp8_tiled` | `True` |
 | `vae_fused_norm` | `True` |
@@ -133,6 +134,7 @@ Static scale mode additionally needs `fp8_static_scales`; the kernel checks that
 - **Attention.** `trtllm-gen-fp16sm` requires `fp8_scale_fusion="qkstatic"`; the default threshold is 1.0.
 - **Scale exchange.** `amax_allreduce="symm"` uses symmetric memory on the Ulysses group; `nccl` selects the ordinary max reduction.
 - **Decoder tiles.** `vae_fp8_qtile=None` resolves to `(32, 8, 8)` at U1 and `(64, 4, 8)` at U4.
+- **NVFP4 GEMMs.** `nvfp4_gemm_backends=('cublaslt',)` gives the transformer's NVFP4 Linears one backend, so each GEMM shape has one output; the AutoTuner keys its entries on the tuple. The family's tuple `[cutlass, cublaslt, cutedsl, cuda_core]` is the comparison arm.
 - **Validation.** `vae_fused_norm=True` requires `vae_fp8_tiled=True`; `skip_corr_threshold` must lie in `[0, 8]`.
 
 </details>

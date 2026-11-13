@@ -24,7 +24,8 @@ leaving the family's construction, weight loading and everything else untouched:
 * :class:`ScenarioBlock`: the AdaLN norm + modulation and the SwiGLU producers write the Linears'
   NVFP4 inputs directly.
 * :class:`ScenarioTransformer`: the family transformer built from the two classes above, with the
-  cuDNN backend options of the scenario.
+  cuDNN backend options of the scenario and its Linears' NVFP4 GEMMs restricted to the scenario's
+  backend tuple.
 
 Every switch comes from :mod:`.config`; the family's environment-free defaults are what an unmatched
 configuration runs.
@@ -36,6 +37,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -393,9 +395,11 @@ class ScenarioTransformer(MiniMaxH3Transformer3DModel):
                 "the minimax_h3_nvfp4__sm_107__u1_u4 scenario runs the CUDNN attention backend, "
                 f"got {self._attn_backend}"
             )
+        self._restrict_nvfp4_backends()
         logger.info(
             "MiniMax-H3 scenario transformer: fp8_dense_fmha=%s skip_corr_threshold=%s strided_receive=%s "
-            "fp8_scale_fusion=%s grouped_cast=%s vamax_fold=%s amax_allreduce=%s fused_quant=%s out_quant=%s",
+            "fp8_scale_fusion=%s grouped_cast=%s vamax_fold=%s amax_allreduce=%s fused_quant=%s out_quant=%s "
+            "nvfp4_gemm_backends=%s",
             SCENARIO.attention_fmha,
             SCENARIO.skip_corr_threshold,
             SCENARIO.strided_receive,
@@ -405,7 +409,17 @@ class ScenarioTransformer(MiniMaxH3Transformer3DModel):
             SCENARIO.amax_allreduce,
             SCENARIO.fused_quant,
             SCENARIO.out_quant,
+            SCENARIO.nvfp4_gemm_backends,
         )
+
+    def _restrict_nvfp4_backends(self) -> None:
+        """Hand the scenario's backend tuple to every Linear of the transformer. The unified NVFP4 GEMM
+        reads ``nvfp4_allowed_backends`` at each call and keys its AutoTuner entries on the tuple, so a
+        single backend gives one output per shape; the family's construction stays untouched."""
+        backends = list(SCENARIO.nvfp4_gemm_backends)
+        for module in self.modules():
+            if isinstance(module, Linear):
+                module.nvfp4_allowed_backends = list(backends)
 
     def _attention_backend_kwargs(self) -> Optional[dict]:
         if self._attn_backend.upper() != "CUDNN":

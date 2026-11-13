@@ -29,6 +29,8 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Mapping, Optional
 
 Tile3 = tuple[int, int, int]
+# The backends of the unified NVFP4 GEMM op (``torch.ops.trtllm.nvfp4_gemm``) this scenario may name.
+NVFP4_GEMM_BACKENDS = frozenset({"cutlass", "cublaslt", "cutedsl", "cuda_core"})
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,12 @@ class ScenarioConfig:
     swiglu_tile: Optional[Tile3] = (8, 512, 4)
     out_quant: bool = True  # the attention output quantized by the tiled kernel
     out_quant_tile: Tile3 = (16, 512, 4)
+
+    # --- the NVFP4 GEMMs -------------------------------------------------------------------------
+    # Backends the AutoTuner may choose from for the transformer's NVFP4 Linears, in the order the
+    # unified GEMM op lists them; the tuple is part of every tuner cache key. One backend gives one
+    # output per shape. The family's tuple is ("cutlass", "cublaslt", "cutedsl", "cuda_core").
+    nvfp4_gemm_backends: tuple[str, ...] = ("cublaslt",)
 
     # --- outside the denoise loop ----------------------------------------------------------------
     vae_fp8: bool = True  # the VAE ViT decoder's Linears as FP8 per-tensor GEMMs
@@ -111,6 +119,16 @@ class ScenarioConfig:
             raise ValueError(f"amax_allreduce={self.amax_allreduce!r}")
         if self.vae_fused_norm and not self.vae_fp8_tiled:
             raise ValueError("vae_fused_norm needs vae_fp8_tiled")
+        backends = self.nvfp4_gemm_backends
+        if (
+            not backends
+            or len(set(backends)) != len(backends)
+            or not set(backends) <= NVFP4_GEMM_BACKENDS
+        ):
+            raise ValueError(
+                f"nvfp4_gemm_backends={backends!r}: a non-empty tuple of distinct names from "
+                f"{sorted(NVFP4_GEMM_BACKENDS)}"
+            )
 
 
 SCENARIO = ScenarioConfig()
