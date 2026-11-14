@@ -41,6 +41,8 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .attention_precision import resolve_attention_precision
+
 if TYPE_CHECKING:
     from ...config import DiffusionPipelineConfig
     from ...pipeline import BasePipeline
@@ -130,6 +132,12 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
         raise NoScenario(f"serves Ulysses 1 or 4, found {ulysses}")
     if mixed and ulysses != 1:
         raise NoScenario(f"serves a MIXED_PRECISION checkpoint at Ulysses 1 only, found {ulysses}")
+    model_config = config.model_configs.get("transformer")
+    attention_precision = resolve_attention_precision(
+        getattr(model_config, "pretrained_config", None), config.extra_attrs
+    )
+    if attention_precision and ulysses != 1:
+        raise NoScenario(f"serves attention_precision at Ulysses 1 only, found {ulysses}")
     if config.mapping.tp_size > 1:
         raise NoScenario("serves tp_size=1")
     if getattr(config.parallel, "async_ulysses", False):

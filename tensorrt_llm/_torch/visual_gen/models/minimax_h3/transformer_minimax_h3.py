@@ -48,6 +48,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .attention_precision import (
+    attention_module_names,
+    resolve_attention_precision,
+    validate_attention_precision,
+)
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
@@ -110,6 +115,17 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     dense_config.attention = model_config.attention.model_copy(deep=True)
     dense_config.attention.sparse_attention_config = None
     return dense_config
+
+
+def _unquantized_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
+    """Return a shallow config copy whose attention runs on unquantized operands: no
+    ``quant_attention_config`` and no sparse attention; the backend stays the pipeline's."""
+
+    unquantized = model_config.model_copy(deep=False)
+    unquantized.attention = model_config.attention.model_copy(
+        update={"quant_attention_config": None, "sparse_attention_config": None}
+    )
+    return unquantized
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -497,6 +513,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         fuse_bf16_gate_up_swiglu: bool = False,
+        unquantized_attention: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -507,7 +524,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=_dense_attention_model_config(model_config),
+            model_config=(
+                _unquantized_attention_model_config(model_config)
+                if unquantized_attention
+                else _dense_attention_model_config(model_config)
+            ),
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
@@ -558,6 +579,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         final_norm_eps: float,
         model_config: DiffusionModelConfig,
         fuse_bf16_gate_up_swiglu: bool = False,
+        unquantized_attention: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
@@ -584,6 +606,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     model_config=model_config,
                     layer_idx=layer_idx,
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+                    unquantized_attention=(
+                        f"token_refiner.refiner_blocks.{layer_idx}.attn" in unquantized_attention
+                    ),
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -654,6 +679,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         fuse_bf16_gate_up_swiglu: bool = False,
         fa4_use_2cta: Optional[bool] = None,
         backend_kwargs: Optional[dict] = None,
+        unquantized_attention: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -664,7 +690,11 @@ class MiniMaxH3TransformerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=model_config,
+            model_config=(
+                _unquantized_attention_model_config(model_config)
+                if unquantized_attention
+                else model_config
+            ),
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
             fa4_use_2cta=fa4_use_2cta,
@@ -931,6 +961,29 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         )
         self.rope = MiniMaxH3RotaryPosEmbed(rope_freq_dim, rope_theta)
 
+        # Attention modules the checkpoint (or the run-time option) keeps on BF16 operands.
+        self.attention_precision = resolve_attention_precision(cfg, model_config.extra_attrs) or {}
+        vgm = model_config.visual_gen_mapping
+        validate_attention_precision(
+            self.attention_precision,
+            num_layers=num_layers,
+            num_refiner_layers=num_refiner_layers,
+            model_dtype=model_config.torch_dtype,
+            ulysses_size=int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1,
+        )
+        unquantized_attention = frozenset(self.attention_precision)
+        if unquantized_attention:
+            logger.info(
+                "MiniMax-H3 attention_precision: BF16 operands in "
+                f"{len(unquantized_attention)} of {num_layers + num_refiner_layers} attention "
+                "modules: "
+                + ", ".join(
+                    name
+                    for name in attention_module_names(num_layers, num_refiner_layers)
+                    if name in unquantized_attention
+                )
+            )
+
         self.token_refiner = MiniMaxH3TokenRefiner(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -942,6 +995,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             final_norm_eps=final_norm_eps,
             model_config=model_config,
             fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+            unquantized_attention=unquantized_attention,
         )
         backend_kwargs = self._attention_backend_kwargs()
         self.transformer_blocks = nn.ModuleList(
@@ -959,6 +1013,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                     fa4_use_2cta=self.fa4_use_2cta,
                     backend_kwargs=backend_kwargs,
+                    unquantized_attention=(
+                        f"transformer_blocks.{layer_idx}.attn" in unquantized_attention
+                    ),
                 )
                 for layer_idx in range(num_layers)
             ]

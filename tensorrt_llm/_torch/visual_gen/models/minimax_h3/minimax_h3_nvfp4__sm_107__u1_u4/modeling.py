@@ -64,7 +64,25 @@ from .kernels.fused_quant import (
 
 
 class ScenarioAttention(MiniMaxH3Attention):
-    """Full non-causal attention on pre-quantized FP8 Q / K / V, NVFP4 out."""
+    """Full non-causal attention on pre-quantized FP8 Q / K / V, NVFP4 out.
+
+    An attention whose configuration carries no ``quant_attention_config`` (a module the checkpoint
+    keeps on BF16 operands) is built without the FP8 backend options and runs the family path."""
+
+    def __init__(
+        self, *, model_config: DiffusionModelConfig, backend_kwargs=None, **kwargs
+    ) -> None:
+        if model_config.attention.quant_attention_config is None and backend_kwargs:
+            backend_kwargs = {
+                key: value for key, value in backend_kwargs.items() if not key.startswith("fp8_")
+            }
+        super().__init__(model_config=model_config, backend_kwargs=backend_kwargs or None, **kwargs)
+
+    def on_fp8_path(self) -> bool:
+        """Whether the backend takes pre-quantized FP8 Q / K / V, the only path that accepts the
+        fused NVFP4 producer's codes."""
+        backend = getattr(self.attn, "inner_backend", self.attn)
+        return getattr(backend, "quant_dtype", None) == "fp8"
 
     def _use_fused_qk_norm_rope(
         self,
@@ -387,14 +405,16 @@ class ScenarioBlock(MiniMaxH3TransformerBlock):
         Each is decided per Linear (``fused_quant.static_nvfp4_input``: the plain static-NVFP4
         method with its calibrated input scale), so under a MIXED_PRECISION checkpoint an FP8
         Linear gets the BF16 producer and quantizes its input itself while its NVFP4 neighbours
-        keep the fused producer. Needs the fused-QKV attention and the fused gate / up MLP; the
-        scenario's ``fused_quant`` switch off keeps every producer unfused.
+        keep the fused producer. The norm1 producer also needs the attention on the FP8 path: an
+        attention on BF16 operands takes the BF16 norm output and its ``qkv_proj`` quantizes it.
+        Needs the fused-QKV attention and the fused gate / up MLP; the scenario's ``fused_quant``
+        switch off keeps every producer unfused.
         """
         if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
             return False, False, False
         qkv_proj = getattr(self.attn, "qkv_proj", None)
         return (
-            qkv_proj is not None and static_nvfp4_input(qkv_proj),
+            qkv_proj is not None and static_nvfp4_input(qkv_proj) and self.attn.on_fp8_path(),
             static_nvfp4_input(self.ff.gate_up_proj),
             static_nvfp4_input(self.ff.down_proj),
         )

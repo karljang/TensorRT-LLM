@@ -319,10 +319,16 @@ class TestMixedPrecisionModel:
 
         model = _build(_mixed_precision_export(_FP8_LAYERS))
         block0, block1 = model.transformer_blocks
+        # The family attention built here stands in for a scenario attention on the FP8 path.
+        for block in (block0, block1):
+            block.attn.on_fp8_path = lambda: True
         # block 0: NVFP4 qkv and gate/up keep their producers, the FP8 down projection does not.
         assert ScenarioBlock._nvfp4_producers(block0) == (True, True, False)
         # block 1: FP8 QKV gets the BF16 norm output, the NVFP4 MLP keeps both producers.
         assert ScenarioBlock._nvfp4_producers(block1) == (False, True, True)
+        # An attention on BF16 operands takes the BF16 norm output even over an NVFP4 QKV.
+        block0.attn.on_fp8_path = lambda: False
+        assert ScenarioBlock._nvfp4_producers(block0) == (False, True, False)
         # The attention-output quantize reads the to_out Linear itself.
 
         assert static_nvfp4_input(block0.attn.to_out[0])

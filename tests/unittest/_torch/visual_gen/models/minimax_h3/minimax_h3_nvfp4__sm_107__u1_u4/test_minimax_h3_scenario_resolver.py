@@ -48,15 +48,24 @@ def _config(
     mode="auto",
     overrides=None,
     layer_quant=None,
+    attention_precision=None,
+    runtime_attention_precision=None,
 ):
     qac = SimpleNamespace(qk_dtype="fp8", v_dtype="fp8") if fp8 else None
     extra = {"visual_gen_scenario": mode}
     if overrides is not None:
         extra["minimax_h3_scenario"] = overrides
+    if runtime_attention_precision is not None:
+        extra["minimax_h3_attention_precision"] = runtime_attention_precision
+    quantization_config = {"quant_algo": "NVFP4"}
+    if attention_precision is not None:
+        quantization_config["attention_precision"] = attention_precision
     return SimpleNamespace(
         model_configs={
             "transformer": SimpleNamespace(
-                quant_config=SimpleNamespace(quant_algo=quant_algo), quant_config_dict=layer_quant
+                quant_config=SimpleNamespace(quant_algo=quant_algo),
+                quant_config_dict=layer_quant,
+                pretrained_config=SimpleNamespace(quantization_config=quantization_config),
             )
         },
         quant_config=SimpleNamespace(quant_algo=quant_algo),
@@ -167,6 +176,37 @@ def test_declined_mixed_checkpoint_falls_to_the_family_or_raises(monkeypatch, mo
     else:
         with pytest.raises(RuntimeError, match="Ulysses 1 only"):
             scenarios.resolve_scenario(_Family, config)
+
+
+_ATTENTION_PRECISION = {"schema_version": 1, "layers": {"transformer_blocks.45.attn": "bf16"}}
+
+
+@pytest.mark.parametrize("source", ["attention_precision", "runtime_attention_precision"])
+def test_route_admits_attention_precision_at_ulysses_1(monkeypatch, source):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    cls = _stub_scenario_package(monkeypatch)
+    assert scenarios.route_nvfp4_sm_107_u1_u4(_config(**{source: _ATTENTION_PRECISION})) is cls
+
+
+@pytest.mark.parametrize("source", ["attention_precision", "runtime_attention_precision"])
+def test_route_declines_attention_precision_above_ulysses_1(monkeypatch, source):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    with pytest.raises(scenarios.NoScenario, match="attention_precision at Ulysses 1 only"):
+        scenarios.route_nvfp4_sm_107_u1_u4(_config(ulysses=4, **{source: _ATTENTION_PRECISION}))
+
+
+def test_route_keeps_ulysses_4_for_an_empty_attention_precision(monkeypatch):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    cls = _stub_scenario_package(monkeypatch)
+    empty = {"schema_version": 1, "layers": {}}
+    assert scenarios.route_nvfp4_sm_107_u1_u4(_config(ulysses=4, attention_precision=empty)) is cls
+
+
+def test_route_refuses_a_malformed_attention_precision(monkeypatch):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    bad = {"schema_version": 1, "layers": {"transformer_blocks.45.attn": "fp8"}}
+    with pytest.raises(ValueError, match="only 'bf16'"):
+        scenarios.route_nvfp4_sm_107_u1_u4(_config(attention_precision=bad))
 
 
 def test_bad_mode_raises():
