@@ -21,6 +21,7 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -972,7 +974,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             hidden_size, audio_in_channels, bias=True, **fp32_linear_kwargs
         )
 
-        self.apply_quant_config_exclude_modules()
+        self.apply_layer_quant_configs()
 
     def _attention_backend_kwargs(self) -> Optional[dict]:
         """Extra constructor arguments for the transformer blocks' attention backend.
@@ -982,36 +984,120 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         """
         return None
 
-    def apply_quant_config_exclude_modules(self) -> None:
-        """Drop quantization from Linears the quant config excludes.
+    # TRT-LLM Linears that fuse several checkpoint Linears, and the checkpoint names the
+    # fused module stands for (relative to the parent module). ``load_weights`` reads the
+    # same tensors through ``params_map`` and ``_remap_feed_forward_weights``.
+    _FUSED_CHECKPOINT_LINEARS = {
+        "qkv_proj": ("to_q", "to_k", "to_v"),
+        "gate_up_proj": ("net.0.proj",),
+        "down_proj": ("net.2",),
+    }
 
-        Every Linear is constructed with the model-wide ``quant_config``, so
-        without this an excluded module still builds quantized buffers while
-        ``DynamicLinearWeightLoader`` hands it a high-precision weight -- an FP8
-        buffer left at its default scale of 1.0, or an NVFP4 shape mismatch.
+    @classmethod
+    def _checkpoint_linear_names(cls, name: str) -> tuple[str, ...]:
+        """Checkpoint module names behind TRT-LLM Linear ``name`` (one, or several when fused)."""
+        parent, _, leaf = name.rpartition(".")
+        members = cls._FUSED_CHECKPOINT_LINEARS.get(leaf)
+        if members is None:
+            return (name,)
+        return tuple(f"{parent}.{member}" if parent else member for member in members)
 
-        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights``
-        caches ``quant_method`` and allocates the quantized parameters, and it
-        early-returns once ``_weights_created`` is set. With the default
-        ``skip_create_weights_in_init=False`` that has already happened by the time
-        this runs, so an excluded module would keep its quantized buffers and
-        method. Rebuild those modules so the layout matches the no-quant config.
+    def _layer_quant_config(self, name: str) -> QuantConfig:
+        """The checkpoint's QuantConfig for Linear ``name`` under a MIXED_PRECISION export.
+
+        A fused Linear (QKV, gate/up) must find one precision behind all of its checkpoint
+        names: it holds one weight buffer and one set of scales. A Linear that no group
+        covers is an error, never a silent fallback to the global algorithm.
+        """
+        configs = {
+            ckpt: self.model_config.get_layer_quant_config(ckpt)
+            for ckpt in self._checkpoint_linear_names(name)
+        }
+        missing = [ckpt for ckpt, config in configs.items() if config is None]
+        if missing:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint assigns no precision to Linear '{name}' "
+                f"(checkpoint names {missing}) and does not list it under 'ignore'"
+            )
+        precisions = {(config.quant_algo, config.group_size) for config in configs.values()}
+        if len(precisions) != 1:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint gives the fused Linear '{name}' several precisions: "
+                + ", ".join(f"{ckpt}={config.quant_algo.name}" for ckpt, config in configs.items())
+            )
+        return next(iter(configs.values()))
+
+    def apply_layer_quant_configs(self) -> Counter:
+        """Give every Linear the quant config the checkpoint assigns it, before weights load.
+
+        Every Linear is constructed with the model-wide ``quant_config``. Two kinds of module
+        need another one: the modules ``exclude_modules`` lists keep high precision, and under
+        a MIXED_PRECISION export each quantized Linear takes its group's recipe (NVFP4 or
+        per-tensor FP8). Without this an excluded module would build quantized buffers while
+        ``DynamicLinearWeightLoader`` hands it a high-precision weight (an FP8 buffer left at its
+        default scale of 1.0, or an NVFP4 shape mismatch), and an FP8 Linear would receive an
+        NVFP4 layout.
+
+        ModelOpt writes both lists in the checkpoint's names (``attn.to_q``, ``ff.net.0.proj``),
+        so a fused TRT-LLM Linear is excluded when all of its checkpoint members are; a partial
+        exclusion of one fused Linear is an error.
+
+        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights`` caches
+        ``quant_method`` and allocates the quantized parameters, and it early-returns once
+        ``_weights_created`` is set. With the default ``skip_create_weights_in_init=False`` that
+        has already happened by the time this runs, so the module is rebuilt with the new config.
+
+        Returns the census of Linears per precision (``NVFP4`` / ``FP8`` / ``BF16``), logged once
+        for mixed-precision checkpoints.
         """
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.exclude_modules is None:
-            return
+        census: Counter = Counter()
+        layered = self.model_config.quant_config_dict is not None
+        if quant_config is None or (quant_config.exclude_modules is None and not layered):
+            return census
 
         no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                if quant_config.is_module_excluded_from_quantization(name):
-                    if getattr(module, "quant_config", None) is not None:
-                        module.quant_config = no_quant_config
-                        if getattr(module, "_weights_created", False):
-                            module._weights_created = False
-                            module._parameters.clear()
-                            module._buffers.clear()
-                            module.create_weights()
+            if not isinstance(module, Linear) or getattr(module, "quant_config", None) is None:
+                continue
+            members = self._checkpoint_linear_names(name)
+            excluded = [quant_config.is_module_excluded_from_quantization(m) for m in members]
+            if quant_config.is_module_excluded_from_quantization(name) or all(excluded):
+                target = no_quant_config
+            elif any(excluded):
+                raise ValueError(
+                    f"quant_config.exclude_modules covers only part of the fused Linear '{name}': "
+                    + ", ".join(
+                        f"{m} {'excluded' if e else 'quantized'}" for m, e in zip(members, excluded)
+                    )
+                )
+            elif layered:
+                target = self._layer_quant_config(name)
+                if target.quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.FP8):
+                    raise NotImplementedError(
+                        f"MiniMax-H3 MIXED_PRECISION supports NVFP4 and per-tensor FP8 Linears; "
+                        f"'{name}' asks for {target.quant_algo.name}"
+                    )
+            else:
+                census[quant_config.quant_algo.name if quant_config.quant_algo else "BF16"] += 1
+                continue
+            census[target.quant_algo.name if target.quant_algo else "BF16"] += 1
+            current = module.quant_config
+            if (current.quant_algo, current.group_size) == (target.quant_algo, target.group_size):
+                continue
+            module.quant_config = target
+            if getattr(module, "_weights_created", False):
+                module._weights_created = False
+                module._parameters.clear()
+                module._buffers.clear()
+                module.create_weights()
+        if layered:
+            logger.info(
+                "MiniMax-H3 MIXED_PRECISION checkpoint: "
+                + ", ".join(f"{count} {algo}" for algo, count in sorted(census.items()))
+                + f" Linears ({sum(census.values())} total)"
+            )
+        return census
 
     @property
     def device(self) -> torch.device:

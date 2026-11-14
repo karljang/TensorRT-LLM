@@ -43,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.logger import logger
 
+from ..fused_adaln import h3_gate_res_norm_mod, h3_norm_mod
 from ..transformer_minimax_h3 import (
     MiniMaxH3Attention,
     MiniMaxH3Transformer3DModel,
@@ -286,7 +287,8 @@ class ScenarioAttention(MiniMaxH3Attention):
 
 
 class ScenarioBlock(MiniMaxH3TransformerBlock):
-    """The family block with the norm and SwiGLU producers emitting the Linears' NVFP4 inputs."""
+    """The family block with the norm and SwiGLU producers emitting the NVFP4 inputs of the Linears
+    that take them; under a MIXED_PRECISION checkpoint this is decided per consumer Linear."""
 
     attention_cls = ScenarioAttention
 
@@ -300,86 +302,102 @@ class ScenarioBlock(MiniMaxH3TransformerBlock):
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
     ) -> torch.Tensor:
-        if self._fuse_nvfp4_quantize():
-            mod = self.adaln_proj.table(temb)
-            return self._forward_fused_adaln_nvfp4(
+        fuse_qkv, fuse_gate_up, fuse_down = self._nvfp4_producers()
+        if not (fuse_qkv or fuse_gate_up or fuse_down):
+            return super()._forward_fused_adaln(
                 hidden_states,
-                mod,
+                temb,
                 adaln_indices,
                 rotary_emb,
                 key_padding_mask,
                 timestep,
                 valid_seq_len,
             )
-        return super()._forward_fused_adaln(
-            hidden_states,
-            temb,
-            adaln_indices,
-            rotary_emb,
-            key_padding_mask,
-            timestep,
-            valid_seq_len,
-        )
-
-    def _fuse_nvfp4_quantize(self) -> bool:
-        """Whether the norm and SwiGLU producers quantize straight into their NVFP4 Linears: needs
-        the fused-QKV attention and the fused gate / up MLP over static-NVFP4 Linears."""
-        if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
-            return False
-        qkv_proj = getattr(self.attn, "qkv_proj", None)
-        return (
-            qkv_proj is not None
-            and static_nvfp4_input(qkv_proj)
-            and static_nvfp4_input(self.ff.gate_up_proj)
-            and static_nvfp4_input(self.ff.down_proj)
-        )
-
-    def _forward_fused_adaln_nvfp4(
-        self,
-        hidden_states: torch.Tensor,
-        mod: torch.Tensor,
-        adaln_indices: torch.Tensor,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        key_padding_mask: Optional[torch.Tensor],
-        timestep: Optional[torch.Tensor],
-        valid_seq_len: Optional[int],
-    ) -> torch.Tensor:
-        """``_forward_fused_adaln`` with the producers emitting the Linears' NVFP4 inputs directly."""
         hidden_size = hidden_states.shape[-1]
-        codes, scales = h3_norm_mod_fp4(
-            hidden_states,
-            self.norm1.weight,
-            mod,
-            adaln_indices,
-            self.attn.qkv_proj.input_scale,
-            self.norm1.variance_epsilon,
-            1,
-            0,
-        )
-        attn_output = self.attn(
-            Fp4QuantizedTensor(codes, scales), rotary_emb, key_padding_mask, timestep, valid_seq_len
-        )
-        hidden_states, codes, scales = h3_gate_res_norm_mod_fp4(
-            hidden_states,
-            attn_output,
-            self.norm2.weight,
-            mod,
-            adaln_indices,
-            self.ff.gate_up_proj.input_scale,
-            self.norm2.variance_epsilon,
-            2,
-            4,
-            3,
-        )
-        gate_up = self.ff.gate_up_proj(
-            Fp4QuantizedTensor(codes.reshape(-1, codes.shape[-1]), scales)
-        )
-        codes, scales = h3_swiglu_fp4(gate_up, self.ff.down_proj.input_scale)
-        ff_output = self.ff.down_proj(
-            Fp4QuantizedTensor(codes, scales), layer_idx=self.ff.layer_idx
-        ).reshape_as(hidden_states)
+        mod = self.adaln_proj.table(temb)
+        if fuse_qkv:
+            codes, scales = h3_norm_mod_fp4(
+                hidden_states,
+                self.norm1.weight,
+                mod,
+                adaln_indices,
+                self.attn.qkv_proj.input_scale,
+                self.norm1.variance_epsilon,
+                1,
+                0,
+            )
+            attn_input = Fp4QuantizedTensor(codes, scales)
+        else:
+            attn_input = h3_norm_mod(
+                hidden_states,
+                self.norm1.weight,
+                mod,
+                adaln_indices,
+                self.norm1.variance_epsilon,
+                1,
+                0,
+            )
+        attn_output = self.attn(attn_input, rotary_emb, key_padding_mask, timestep, valid_seq_len)
+        if fuse_gate_up:
+            hidden_states, codes, scales = h3_gate_res_norm_mod_fp4(
+                hidden_states,
+                attn_output,
+                self.norm2.weight,
+                mod,
+                adaln_indices,
+                self.ff.gate_up_proj.input_scale,
+                self.norm2.variance_epsilon,
+                2,
+                4,
+                3,
+            )
+            ff_input = Fp4QuantizedTensor(codes.reshape(-1, codes.shape[-1]), scales)
+        else:
+            hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+                hidden_states,
+                attn_output,
+                self.norm2.weight,
+                mod,
+                adaln_indices,
+                self.norm2.variance_epsilon,
+                2,
+                4,
+                3,
+            )
+            ff_input = norm_hidden_states.reshape(-1, hidden_size)
+        if fuse_gate_up or fuse_down:
+            gate_up = self.ff.gate_up_proj(ff_input)
+            if fuse_down:
+                codes, scales = h3_swiglu_fp4(gate_up, self.ff.down_proj.input_scale)
+                activation = Fp4QuantizedTensor(codes, scales)
+            else:
+                # GatedMLP's own SwiGLU; emits FP8 when down_proj is a static-FP8 Linear.
+                activation = self.ff._apply_activation(gate_up)
+            ff_output = self.ff.down_proj(activation, layer_idx=self.ff.layer_idx)
+        else:
+            ff_output = self.ff(ff_input)
+        ff_output = ff_output.reshape_as(hidden_states)
         gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
         return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def _nvfp4_producers(self) -> tuple[bool, bool, bool]:
+        """Which producers quantize straight into their consumer Linear: (norm1 -> qkv_proj,
+        gated residual + norm2 -> gate_up_proj, SwiGLU -> down_proj).
+
+        Each is decided per Linear (``fused_quant.static_nvfp4_input``: the plain static-NVFP4
+        method with its calibrated input scale), so under a MIXED_PRECISION checkpoint an FP8
+        Linear gets the BF16 producer and quantizes its input itself while its NVFP4 neighbours
+        keep the fused producer. Needs the fused-QKV attention and the fused gate / up MLP; the
+        scenario's ``fused_quant`` switch off keeps every producer unfused.
+        """
+        if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
+            return False, False, False
+        qkv_proj = getattr(self.attn, "qkv_proj", None)
+        return (
+            qkv_proj is not None and static_nvfp4_input(qkv_proj),
+            static_nvfp4_input(self.ff.gate_up_proj),
+            static_nvfp4_input(self.ff.down_proj),
+        )
 
 
 class ScenarioTransformer(MiniMaxH3Transformer3DModel):

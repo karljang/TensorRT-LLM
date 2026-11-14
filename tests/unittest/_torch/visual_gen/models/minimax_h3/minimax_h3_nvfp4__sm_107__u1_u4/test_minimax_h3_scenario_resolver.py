@@ -47,6 +47,7 @@ def _config(
     async_ulysses=False,
     mode="auto",
     overrides=None,
+    layer_quant=None,
 ):
     qac = SimpleNamespace(qk_dtype="fp8", v_dtype="fp8") if fp8 else None
     extra = {"visual_gen_scenario": mode}
@@ -54,9 +55,12 @@ def _config(
         extra["minimax_h3_scenario"] = overrides
     return SimpleNamespace(
         model_configs={
-            "transformer": SimpleNamespace(quant_config=SimpleNamespace(quant_algo=quant_algo))
+            "transformer": SimpleNamespace(
+                quant_config=SimpleNamespace(quant_algo=quant_algo), quant_config_dict=layer_quant
+            )
         },
         quant_config=SimpleNamespace(quant_algo=quant_algo),
+        quant_config_dict=layer_quant,
         dynamic_weight_quant=dynamic,
         attention=SimpleNamespace(backend=backend, quant_attention_config=qac),
         visual_gen_mapping=SimpleNamespace(ulysses_size=ulysses),
@@ -99,6 +103,70 @@ def test_route_names_the_failed_requirement(monkeypatch, kwargs, reason):
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
     with pytest.raises(scenarios.NoScenario, match=reason):
         scenarios.route_nvfp4_sm_107_u1_u4(_config(**kwargs))
+
+
+def _layers(*algos):
+    """A per-layer table as the MIXED_PRECISION parser returns it: name -> config with a quant_algo."""
+    return {
+        f"transformer_blocks.{i}.ff.net.2": SimpleNamespace(quant_algo=a)
+        for i, a in enumerate(algos)
+    }
+
+
+def _stub_scenario_package(monkeypatch):
+    """Keep the route from importing the scenario's SM 107 modules on a CPU host."""
+    pipeline = ModuleType(f"{_PACKAGE}.pipeline")
+    pipeline.MiniMaxH3Nvfp4Sm107U1U4Pipeline = type("MiniMaxH3Nvfp4Sm107U1U4Pipeline", (), {})
+    monkeypatch.setitem(sys.modules, f"{_PACKAGE}.pipeline", pipeline)
+    return pipeline.MiniMaxH3Nvfp4Sm107U1U4Pipeline
+
+
+@pytest.mark.parametrize("global_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_route_admits_a_mixed_nvfp4_fp8_checkpoint_at_ulysses_1(monkeypatch, global_algo):
+    """Admission reads the per-layer table, not the global algorithm (the largest group)."""
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    cls = _stub_scenario_package(monkeypatch)
+    config = _config(quant_algo=global_algo, layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8))
+    assert scenarios.route_nvfp4_sm_107_u1_u4(config) is cls
+
+
+def test_route_keeps_the_uniform_nvfp4_checkpoint_at_ulysses_4(monkeypatch):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    cls = _stub_scenario_package(monkeypatch)
+    assert scenarios.route_nvfp4_sm_107_u1_u4(_config(ulysses=4)) is cls
+
+
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        (dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=4), "Ulysses 1 only"),
+        (
+            dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), dynamic=True),
+            "dynamic_weight_quant",
+        ),
+        (
+            dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8_BLOCK_SCALES)),
+            "FP8_BLOCK_SCALES",
+        ),
+        (dict(layer_quant=_layers(QuantAlgo.NVFP4, None)), "None"),
+        (dict(layer_quant={}), "no layers"),
+    ],
+)
+def test_route_names_why_a_mixed_checkpoint_is_declined(monkeypatch, kwargs, reason):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    with pytest.raises(scenarios.NoScenario, match=reason):
+        scenarios.route_nvfp4_sm_107_u1_u4(_config(**kwargs))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_declined_mixed_checkpoint_falls_to_the_family_or_raises(monkeypatch, mode):
+    monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    config = _config(mode=mode, layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=4)
+    if mode == "auto":
+        assert scenarios.resolve_scenario(_Family, config) is _Family
+    else:
+        with pytest.raises(RuntimeError, match="Ulysses 1 only"):
+            scenarios.resolve_scenario(_Family, config)
 
 
 def test_bad_mode_raises():
