@@ -196,8 +196,15 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
         "FastVideo/FastVideo-FastH3-8-Step-V2",
     ],
     # pipeline_config keys: the workflow, and the scenario selection read by scenarios.resolve_scenario
-    # (visual_gen_scenario = off | auto | require; minimax_h3_scenario = a mapping of overrides).
-    defaults={"workflow": "fl2va", "visual_gen_scenario": "off", "minimax_h3_scenario": None},
+    # (visual_gen_scenario = off | auto | require; minimax_h3_scenario = a mapping of overrides),
+    # and the attention modules kept on BF16 operands for a checkpoint that does not carry the
+    # entry itself (minimax_h3_attention_precision, see attention_precision.py).
+    defaults={
+        "workflow": "fl2va",
+        "visual_gen_scenario": "off",
+        "minimax_h3_scenario": None,
+        "minimax_h3_attention_precision": None,
+    },
     download_patterns=[
         "modular_model_index.json",
         "fastvideo_inference.json",

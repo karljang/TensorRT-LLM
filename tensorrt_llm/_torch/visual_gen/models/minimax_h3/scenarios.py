@@ -41,6 +41,8 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .attention_precision import resolve_attention_precision
+
 if TYPE_CHECKING:
     from ...config import DiffusionPipelineConfig
     from ...pipeline import BasePipeline
@@ -66,6 +68,17 @@ def _transformer_quant_algo(config: "DiffusionPipelineConfig") -> Optional[Quant
     return getattr(quant_config, "quant_algo", None)
 
 
+def _transformer_layer_quant(config: "DiffusionPipelineConfig") -> Optional[dict]:
+    """The per-layer quant table of a MIXED_PRECISION transformer checkpoint, else None."""
+    model_config = config.model_configs.get("transformer")
+    layer_quant = (
+        getattr(model_config, "quant_config_dict", None) if model_config is not None else None
+    )
+    if layer_quant is None:
+        layer_quant = getattr(config, "quant_config_dict", None)
+    return layer_quant
+
+
 def _ulysses_size(config: "DiffusionPipelineConfig") -> int:
     vgm = config.visual_gen_mapping
     return int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1
@@ -73,12 +86,33 @@ def _ulysses_size(config: "DiffusionPipelineConfig") -> int:
 
 def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
     """``minimax_h3_nvfp4__sm_107__u1_u4``: a pre-quantized NVFP4 checkpoint, SM 107, Ulysses 1 or 4,
-    the cuDNN attention backend with the per-tensor FP8 recipe, no tensor parallelism."""
+    the cuDNN attention backend with the per-tensor FP8 recipe, no tensor parallelism.
+
+    A MIXED_PRECISION checkpoint whose Linears are all static NVFP4 or static per-tensor FP8 is
+    admitted explicitly, at Ulysses 1 only; the global algorithm of such a checkpoint (its largest
+    group) is not what admits it."""
     capability = _device_capability()
     if capability != (10, 7):
         raise NoScenario(f"needs an SM 107 device, found {capability}")
     quant_algo = _transformer_quant_algo(config)
-    if quant_algo != QuantAlgo.NVFP4 or config.dynamic_weight_quant:
+    layer_quant = _transformer_layer_quant(config)
+    mixed = layer_quant is not None
+    if mixed:
+        if config.dynamic_weight_quant:
+            raise NoScenario("a MIXED_PRECISION checkpoint needs dynamic_weight_quant=False")
+        other = sorted(
+            {
+                getattr(getattr(layer, "quant_algo", None), "name", str(None))
+                for layer in layer_quant.values()
+                if getattr(layer, "quant_algo", None) not in (QuantAlgo.NVFP4, QuantAlgo.FP8)
+            }
+        )
+        if other or not layer_quant:
+            raise NoScenario(
+                "a MIXED_PRECISION checkpoint is served only when every Linear is static NVFP4 or "
+                f"static per-tensor FP8; found {other or 'no layers'}"
+            )
+    elif quant_algo != QuantAlgo.NVFP4 or config.dynamic_weight_quant:
         raise NoScenario(
             f"needs a pre-quantized NVFP4 transformer checkpoint (dynamic_weight_quant=False); "
             f"found quant_algo={quant_algo}, dynamic_weight_quant={config.dynamic_weight_quant}"
@@ -96,6 +130,14 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
     ulysses = _ulysses_size(config)
     if ulysses not in (1, 4):
         raise NoScenario(f"serves Ulysses 1 or 4, found {ulysses}")
+    if mixed and ulysses != 1:
+        raise NoScenario(f"serves a MIXED_PRECISION checkpoint at Ulysses 1 only, found {ulysses}")
+    model_config = config.model_configs.get("transformer")
+    attention_precision = resolve_attention_precision(
+        getattr(model_config, "pretrained_config", None), config.extra_attrs
+    )
+    if attention_precision and ulysses != 1:
+        raise NoScenario(f"serves attention_precision at Ulysses 1 only, found {ulysses}")
     if config.mapping.tp_size > 1:
         raise NoScenario("serves tp_size=1")
     if getattr(config.parallel, "async_ulysses", False):
@@ -104,6 +146,11 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
     from . import minimax_h3_nvfp4__sm_107__u1_u4 as pkg  # the config is applied before this import
 
     pkg.config.apply(config.extra_attrs.get("minimax_h3_scenario"))
+    if mixed:
+        logger.info(
+            "MiniMax-H3 scenario minimax_h3_nvfp4__sm_107__u1_u4: admitting a MIXED_PRECISION "
+            "checkpoint (static NVFP4 and static FP8 Linears)"
+        )
     from .minimax_h3_nvfp4__sm_107__u1_u4.pipeline import MiniMaxH3Nvfp4Sm107U1U4Pipeline
 
     return MiniMaxH3Nvfp4Sm107U1U4Pipeline
